@@ -15,11 +15,17 @@ sleep 5
 
 # 1. 下载并解压项目到当前目录
 echo -e "\n${YELLOW}[1/3] 正在下载并解压项目文件...${NC}"
-curl -L https://github.com/Nexavor/webdav-server/archive/refs/heads/master.tar.gz | tar -xz --strip-components=1 || { echo -e "${RED}错误：下载或解压失败。${NC}"; exit 1; }
+curl -L https://github.com/Limkon/webdav-server/archive/refs/heads/master.tar.gz | tar -xz --strip-components=1 || {
+  echo -e "${RED}错误：下载或解压失败。${NC}"
+  exit 1
+}
 
 # 2. 安装依赖
 echo -e "\n${YELLOW}[2/3] 正在安装 Node.js 依赖...${NC}"
-npm install || { echo -e "${RED}错误：'npm install' 失败。${NC}"; exit 1; }
+npm install || {
+  echo -e "${RED}错误：'npm install' 失败。${NC}"
+  exit 1
+}
 
 # 3. 修复安全漏洞
 echo -e "\n${YELLOW}[3/3] 正在修复 Multer 安全漏洞...${NC}"
