@@ -1029,31 +1029,45 @@ app.post('/api/scan/local', requireAdmin, async (req, res) => {
 });
 
 app.post('/api/scan/webdav', requireAdmin, async (req, res) => {
-    const { userId } = req.body;
+    // *** 修改：接收 webdavId ***
+    const { userId, webdavId } = req.body;
     const log = [];
     try {
         if (!userId) throw new Error('未提供使用者 ID');
+        if (!webdavId) throw new Error('未提供 WebDAV 设定 ID');
 
         const { createClient } = require('webdav');
         const config = storageManager.readConfig();
-        if (!config.webdav || !config.webdav.url) {
-            throw new Error('WebDAV 设定不完整');
+        
+        // *** 修改：根据 ID 寻找特定的 WebDAV 设定 ***
+        const webdavConfig = config.webdav.find(c => c.id == webdavId);
+        if (!webdavConfig) {
+            throw new Error(`找不到 ID 为 ${webdavId} 的 WebDAV 设定`);
         }
-        const client = createClient(config.webdav.url, {
-            username: config.webdav.username,
-            password: config.webdav.password
+
+        log.push({ message: `正在使用设定 [${webdavConfig.name}] 连接到 ${webdavConfig.url}`, type: 'info' });
+
+        const client = createClient(webdavConfig.url, {
+            username: webdavConfig.username,
+            password: webdavConfig.password
         });
         
         async function scanWebdavDirectory(remotePath) {
             const contents = await client.getDirectoryContents(remotePath, { deep: true });
             for (const item of contents) {
                 if (item.type === 'file') {
-                    const existing = await data.findFileByFileId(item.filename, userId);
+                    // *** 修改：file_id 现在需要包含挂载点名称以确保唯一性 ***
+                    const fileIdForDb = path.posix.join(webdavConfig.name, item.filename);
+
+                    const existing = await data.findFileByFileId(fileIdForDb, userId);
                      if (existing) {
                         log.push({ message: `已存在: ${item.filename}，跳过。`, type: 'info' });
                     } else {
+                        // 在数据库中建立对应的虚拟资料夹结构
                         const folderPath = path.dirname(item.filename).replace(/\\/g, '/');
-                        const folderId = await data.findOrCreateFolderByPath(folderPath, userId);
+                        // *** 修改：虚拟路径包含挂载点名称 ***
+                        const fullVirtualPath = path.posix.join(webdavConfig.name, folderPath);
+                        const folderId = await data.findOrCreateFolderByPath(fullVirtualPath, userId);
                         
                         const messageId = BigInt(Date.now()) * 1000000n + BigInt(crypto.randomInt(1000000));
                         await data.addFile({
@@ -1061,7 +1075,7 @@ app.post('/api/scan/webdav', requireAdmin, async (req, res) => {
                             fileName: item.basename,
                             mimetype: item.mime || 'application/octet-stream',
                             size: item.size,
-                            file_id: item.filename,
+                            file_id: fileIdForDb, // 存入包含挂载点名称的完整 ID
                             date: new Date(item.lastmod).getTime(),
                         }, folderId, userId, 'webdav');
                         log.push({ message: `已汇入: ${item.filename}`, type: 'success' });
