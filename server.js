@@ -265,25 +265,32 @@ app.post('/api/admin/delete-user', requireAdmin, async (req, res) => {
     }
 });
 
+// *** 修改: WebDAV API 现在处理多个设定 ***
 app.get('/api/admin/webdav', requireAdmin, (req, res) => {
     const config = storageManager.readConfig();
-    const webdavConfig = config.webdav || {};
-    // 为了前端兼容性，即使只有一个设定，也以阵列形式回传
-    res.json(webdavConfig.url ? [{ id: 1, ...webdavConfig }] : []);
+    res.json(config.webdav || []);
 });
 
 app.post('/api/admin/webdav', requireAdmin, (req, res) => {
-    const { url, username, password } = req.body;
-    if (!url || !username) { 
-        return res.status(400).json({ success: false, message: '缺少必要参数' });
+    const { id, name, url, username, password } = req.body;
+    if (!name || !url || !username) { 
+        return res.status(400).json({ success: false, message: '名称、URL和使用者名称为必填项' });
     }
     const config = storageManager.readConfig();
     
-    // 简化为只管理一个 WebDAV 配置
-    config.webdav = { url, username };
-    // 只有当提供了新密码时才更新它
-    if (password) {
-        config.webdav.password = password;
+    if (id) { // 更新
+        const index = config.webdav.findIndex(c => c.id == id);
+        if (index > -1) {
+            config.webdav[index] = { ...config.webdav[index], name, url, username };
+            if (password) config.webdav[index].password = password;
+        }
+    } else { // 新增
+        // 检查名称是否重复
+        if (config.webdav.some(c => c.name === name)) {
+            return res.status(409).json({ success: false, message: '此挂载名称已被使用。' });
+        }
+        const newId = (config.webdav.length > 0 ? Math.max(...config.webdav.map(c => c.id)) : 0) + 1;
+        config.webdav.push({ id: newId, name, url, username, password });
     }
 
     if (storageManager.writeConfig(config)) {
@@ -295,13 +302,15 @@ app.post('/api/admin/webdav', requireAdmin, (req, res) => {
 
 app.delete('/api/admin/webdav/:id', requireAdmin, (req, res) => {
     const config = storageManager.readConfig();
-    config.webdav = {}; // 直接清空设定
+    const idToDelete = parseInt(req.params.id, 10);
+    config.webdav = config.webdav.filter(c => c.id !== idToDelete);
     if (storageManager.writeConfig(config)) {
         res.json({ success: true, message: 'WebDAV 设定已删除' });
     } else {
         res.status(500).json({ success: false, message: '删除设定失败' });
     }
 });
+
 
 // 使用 multer 中间件的包装器以进行错误处理
 const uploadMiddleware = (req, res, next) => {
@@ -334,7 +343,6 @@ app.post('/upload', requireLogin, async (req, res, next) => {
 
     const initialFolderId = parseInt(req.body.folderId, 10);
     const userId = req.session.userId;
-    const storage = storageManager.getStorage();
     const overwritePaths = req.body.overwritePaths ? JSON.parse(req.body.overwritePaths) : [];
     let relativePaths = req.body.relativePaths;
 
@@ -350,6 +358,14 @@ app.post('/upload', requireLogin, async (req, res, next) => {
 
     const results = [];
     try {
+        // *** 修改：上传前先确定储存类型 ***
+        const folderPath = await data.getFolderPath(initialFolderId, userId);
+        const rootFolderName = folderPath.length > 1 ? folderPath[1].name : null;
+        const webdavConfigs = storageManager.readConfig().webdav;
+        const webdavMount = webdavConfigs.find(c => c.name === rootFolderName);
+        
+        const storage = storageManager.getStorage(webdavMount ? 'webdav' : null);
+
         for (let i = 0; i < req.files.length; i++) {
             const file = req.files[i];
             const tempFilePath = file.path;
@@ -408,7 +424,13 @@ app.post('/upload', requireLogin, async (req, res, next) => {
 app.post('/api/text-file', requireLogin, async (req, res) => {
     const { mode, fileId, folderId, fileName, content } = req.body;
     const userId = req.session.userId;
-    const storage = storageManager.getStorage();
+    
+    // *** 修改：同样需要判断储存类型 ***
+    const folderPath = await data.getFolderPath(folderId, userId);
+    const rootFolderName = folderPath.length > 1 ? folderPath[1].name : null;
+    const webdavConfigs = storageManager.readConfig().webdav;
+    const webdavMount = webdavConfigs.find(c => c.name === rootFolderName);
+    const storage = storageManager.getStorage(webdavMount ? 'webdav' : null);
 
     if (!fileName || !fileName.endsWith('.txt')) {
         return res.status(400).json({ success: false, message: '档名无效或不是 .txt 档案' });
@@ -573,7 +595,23 @@ app.get('/api/search', requireLogin, async (req, res) => {
 app.get('/api/folder/:id', requireLogin, async (req, res) => {
     try {
         const folderId = parseInt(req.params.id, 10);
+        
+        // 如果是根目录，则加入 WebDAV 挂载点
+        const isRoot = await data.isRootFolder(folderId, req.session.userId);
+        let webdavFolders = [];
+        if (isRoot) {
+            const config = storageManager.readConfig();
+            webdavFolders = config.webdav.map(wd => ({
+                id: `webdav-${wd.name}`, // 特殊 ID 格式
+                name: wd.name,
+                type: 'folder',
+                isWebdav: true
+            }));
+        }
+
         const contents = await data.getFolderContents(folderId, req.session.userId);
+        contents.folders = [...webdavFolders, ...contents.folders]; // 将 WebDAV 文件夹放在最前面
+
         const path = await data.getFolderPath(folderId, req.session.userId);
         res.json({ contents, path });
     } catch (error) { res.status(500).json({ success: false, message: '读取资料夹内容失败。' }); }
@@ -591,6 +629,19 @@ app.post('/api/folder', requireLogin, async (req, res) => {
         const conflict = await data.checkFullConflict(name, parentId, userId);
         if (conflict) {
             return res.status(409).json({ success: false, message: '同目录下已存在同名档案或资料夹。' });
+        }
+
+        // *** 新增：如果是在 WebDAV 挂载点下建立资料夹 ***
+        const parentPath = await data.getFolderPath(parentId, userId);
+        const rootFolderName = parentPath.length > 1 ? parentPath[1].name : null;
+        const webdavConfigs = storageManager.readConfig().webdav;
+        const webdavMount = webdavConfigs.find(c => c.name === rootFolderName);
+
+        if (webdavMount) {
+            const webdav = storageManager.getStorage('webdav');
+            // 在 WebDAV 上实际建立目录
+            const remotePath = path.posix.join(parentPath.slice(2).map(p => p.name).join('/'), name);
+            await webdav.createDirectory(webdavMount.name, remotePath);
         }
 
         const result = await data.createFolder(name, parentId, userId);
@@ -637,34 +688,54 @@ async function unifiedDeleteHandler(req, res) {
     }
 
     try {
-        const storage = storageManager.getStorage();
-        let filesForStorage = [];
-        let foldersForStorage = [];
+        // *** 修改：需要根据每个文件/文件夹的位置来决定使用哪个 storage ***
+        const filesForStorage = {
+            'telegram': [], 'local': [], 'webdav': []
+        };
+        const foldersForStorage = {
+            'webdav': [] // 只有 webdav 需要处理文件夹物理删除
+        };
         
         // 1. 收集所有要删除的项目信息
         if (folderIds.length > 0) {
             for (const folderId of folderIds) {
                 const deletionData = await data.getFolderDeletionData(folderId, userId);
-                filesForStorage.push(...deletionData.files);
-                foldersForStorage.push(...deletionData.folders);
+
+                const folderPath = await data.getFolderPath(folderId, userId);
+                const rootFolderName = folderPath.length > 1 ? folderPath[1].name : null;
+                const webdavConfigs = storageManager.readConfig().webdav;
+                const webdavMount = webdavConfigs.find(c => c.name === rootFolderName);
+                
+                const storageType = webdavMount ? 'webdav' : storageManager.readConfig().storageMode;
+                
+                filesForStorage[storageType].push(...deletionData.files);
+                if (storageType === 'webdav') {
+                    foldersForStorage.webdav.push(...deletionData.folders);
+                }
             }
         }
         
         if (messageIds.length > 0) {
             const directFiles = await data.getFilesByIds(messageIds, userId);
-            filesForStorage.push(...directFiles);
+             for(const file of directFiles) {
+                if(filesForStorage[file.storage_type]) {
+                    filesForStorage[file.storage_type].push(file);
+                }
+            }
         }
         
         // 2. 执行物理删除
-        const storageResult = await storage.remove(filesForStorage, foldersForStorage, userId);
-        
-        if (!storageResult.success) {
-            console.warn("部分档案在储存端删除失败:", storageResult.errors);
+        for (const type of ['telegram', 'local', 'webdav']) {
+            if (filesForStorage[type].length > 0 || (type === 'webdav' && foldersForStorage.webdav.length > 0)) {
+                const storage = storageManager.getStorage(type);
+                await storage.remove(filesForStorage[type], foldersForStorage.webdav || [], userId);
+            }
         }
+        
 
         // 3. 执行数据库删除
-        const allFileIdsToDelete = filesForStorage.map(f => f.message_id);
-        const allFolderIdsToDelete = foldersForStorage.map(f => f.id);
+        const allFileIdsToDelete = [].concat(...Object.values(filesForStorage)).map(f => f.message_id);
+        const allFolderIdsToDelete = folderIds; // 数据库会级联删除子文件夹
         await data.executeDeletion(allFileIdsToDelete, allFolderIdsToDelete, userId);
 
         res.json({ success: true, message: '删除操作已完成。' });
@@ -735,7 +806,7 @@ app.get('/download/proxy/:message_id', requireLogin, async (req, res) => {
             return res.status(404).send('文件信息未找到');
         }
 
-        const storage = storageManager.getStorage();
+        const storage = storageManager.getStorage(fileInfo.storage_type);
         
         if (req.headers.range) { 
             res.setHeader('Accept-Ranges', 'bytes');
@@ -780,7 +851,7 @@ app.get('/file/content/:message_id', requireLogin, async (req, res) => {
             return res.status(404).send('文件信息未找到');
         }
         
-        const storage = storageManager.getStorage();
+        const storage = storageManager.getStorage(fileInfo.storage_type);
         res.setHeader('Content-Type', 'text/plain; charset=utf-8');
 
         if (fileInfo.storage_type === 'telegram') {
@@ -811,8 +882,7 @@ app.post('/api/download-archive', requireLogin, async (req, res) => {
     try {
         const { messageIds = [], folderIds = [] } = req.body;
         const userId = req.session.userId;
-        const storage = storageManager.getStorage();
-
+        
         if (messageIds.length === 0 && folderIds.length === 0) {
             return res.status(400).send('未提供任何项目 ID');
         }
@@ -836,6 +906,7 @@ app.post('/api/download-archive', requireLogin, async (req, res) => {
         archive.pipe(res);
 
         for (const file of filesToArchive) {
+             const storage = storageManager.getStorage(file.storage_type);
              if (file.storage_type === 'telegram') {
                 const link = await storage.getUrl(file.file_id);
                 if (link) {
@@ -1021,7 +1092,7 @@ app.get('/share/view/file/:token', async (req, res) => {
             const downloadUrl = `/share/download/file/${token}`;
             let textContent = null;
             if (fileInfo.mimetype && fileInfo.mimetype.startsWith('text/')) {
-                const storage = storageManager.getStorage();
+                const storage = storageManager.getStorage(fileInfo.storage_type);
                  if (fileInfo.storage_type === 'telegram') {
                     const link = await storage.getUrl(fileInfo.file_id);
                     if (link) {
@@ -1083,7 +1154,7 @@ app.get('/share/download/file/:token', async (req, res) => {
              return res.status(404).send('文件信息未找到或分享链接已过期');
         }
 
-        const storage = storageManager.getStorage();
+        const storage = storageManager.getStorage(fileInfo.storage_type);
         res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(fileInfo.fileName)}`);
 
         if (fileInfo.storage_type === 'telegram') {
@@ -1131,7 +1202,7 @@ app.get('/share/download/:folderToken/:fileId', async (req, res) => {
              return res.status(404).send('文件信息未找到或权限不足');
         }
         
-        const storage = storageManager.getStorage();
+        const storage = storageManager.getStorage(fileInfo.storage_type);
         res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(fileInfo.fileName)}`);
 
         if (fileInfo.storage_type === 'telegram') {
