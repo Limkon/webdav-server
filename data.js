@@ -104,6 +104,17 @@ function searchItems(query, userId) {
 }
 
 // --- 资料夹与档案操作 ---
+// **新生：判断是否为根目录**
+function isRootFolder(folderId, userId) {
+    return new Promise((resolve, reject) => {
+        const sql = "SELECT id FROM folders WHERE id = ? AND user_id = ? AND parent_id IS NULL";
+        db.get(sql, [folderId, userId], (err, row) => {
+            if (err) return reject(err);
+            resolve(!!row);
+        });
+    });
+}
+
 function getItemsByIds(itemIds, userId) {
     return new Promise((resolve, reject) => {
         if (!itemIds || itemIds.length === 0) return resolve([]);
@@ -420,7 +431,7 @@ function executeDeletion(fileIds, folderIds, userId) {
             
             if (fileIds.length > 0) {
                 const filePlaceholders = fileIds.map(() => '?').join(',');
-                const sql = `DELETE FROM files WHERE message_id IN (${filePlaceholders}) AND user_id = ?`;
+                const sql = `DELETE FROM files WHERE message_id IN (${placeholders}) AND user_id = ?`;
                 promises.push(new Promise((res, rej) => db.run(sql, [...fileIds, userId], (err) => err ? rej(err) : res())));
             }
             if (folderIds.length > 0) {
@@ -760,6 +771,7 @@ module.exports = {
     getFolderContents,
     getFilesRecursive,
     getFolderPath,
+    isRootFolder,
     createFolder,
     findFolderByName,
     getAllFolders,
