@@ -2,23 +2,39 @@ const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
 const fs = require('fs');
 
-// --- 请加入这两行 ---
-const absoluteDataDir = path.join(__dirname, 'data');
-console.log(`[侦错资讯] 程式执行的绝对路径 (__dirname): ${__dirname}`);
-console.log(`[侦错资讯] 资料库应该位于这个资料夹: ${absoluteDataDir}`);
-// --- 侦错程式码结束 ---
-
-const DATA_DIR = path.join(__dirname, 'data'); // 将这里原本的路径改掉
+// --- 关键修正：使用 __dirname 确保路径总是相对于目前档案，而不是执行指令的位置 ---
+const DATA_DIR = path.join(__dirname, '..', 'data');
 const DB_PATH = path.join(DATA_DIR, 'database.db');
 
-// 确保资料资料夹存在
-if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
+// --- 启动前的诊断检查 ---
+console.log(`[诊断] 检查路径: ${DATA_DIR}`);
+try {
+    // 1. 确保资料夹存在，如果不存在就建立它
+    if (!fs.existsSync(DATA_DIR)) {
+        console.log(`[诊断] 'data' 资料夹不存在，正在尝试建立...`);
+        fs.mkdirSync(DATA_DIR, { recursive: true });
+        console.log(`[诊断] 'data' 资料夹已建立。`);
+    }
+
+    // 2. 尝试测试写入权限
+    const testFilePath = path.join(DATA_DIR, 'test_write.tmp');
+    console.log(`[诊断] 正在测试写入权限: ${testFilePath}`);
+    fs.writeFileSync(testFilePath, 'test');
+    fs.unlinkSync(testFilePath);
+    console.log(`[诊断] 写入权限测试成功。`);
+
+} catch (error) {
+    console.error(`[诊断失败] 在初始化资料库前发生权限错误:`, error);
+    // 抛出错误以阻止应用程式继续执行
+    throw new Error(`无法初始化资料库储存路径，请检查伺服器对 ${DATA_DIR} 目录的写入权限。`);
 }
+// --- 诊断结束 ---
+
 
 const db = new sqlite3.Database(DB_PATH, (err) => {
     if (err) {
         console.error("无法连接到资料库:", err.message);
+        // 如果这里出错，通常意味着档案存在但已损坏或被锁定
     } else {
         console.log("成功连接到 SQLite 资料库。");
         initializeDb();
@@ -70,7 +86,7 @@ function initializeDb() {
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
         )`);
         
-        console.log("资料库初始化完成。");
+        console.log("资料库结构初始化完成。");
     });
 }
 
