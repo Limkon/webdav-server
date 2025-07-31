@@ -2,6 +2,38 @@ const db = require('./database.js');
 const crypto = require('crypto');
 const path = require('path');
 
+// --- WebDAV 挂载点管理 (新增) ---
+function saveOrUpdateWebdavMount(mount) {
+    return new Promise((resolve, reject) => {
+        if (mount.id) { // 更新现有挂载点
+            const sql = `UPDATE webdav_mounts SET name = ?, url = ?, username = ?, password = ? WHERE id = ?`;
+            // 只有当提供了新密码时才更新它
+            const params = [mount.name, mount.url, mount.username, mount.password || null, mount.id];
+            db.run(sql, params, function(err) {
+                if (err) return reject(err);
+                // 如果密码是 undefined (未提供)，则不更新密码栏位
+                if (mount.password === undefined) {
+                    const updatePartialSql = `UPDATE webdav_mounts SET name = ?, url = ?, username = ? WHERE id = ?`;
+                    db.run(updatePartialSql, [mount.name, mount.url, mount.username, mount.id], function(err) {
+                        if (err) return reject(err);
+                        resolve({ id: mount.id });
+                    });
+                } else {
+                    resolve({ id: mount.id });
+                }
+            });
+        } else { // 插入新的挂载点
+            const sql = `INSERT INTO webdav_mounts (name, url, username, password) VALUES (?, ?, ?, ?)`;
+            const params = [mount.name, mount.url, mount.username, mount.password || null];
+            db.run(sql, params, function(err) {
+                if (err) return reject(err);
+                resolve({ id: this.lastID }); // 传回新建立的 ID
+            });
+        }
+    });
+}
+
+
 // --- 使用者管理 ---
 function createUser(username, hashedPassword) {
     return new Promise((resolve, reject) => {
@@ -405,10 +437,8 @@ function findFileByFileIdAndMount(fileId, mountId, userId) {
     });
 }
 
-// --- 关键修正 ---
 function getRootFolder(userId) {
     return new Promise((resolve, reject) => {
-        // 同时选择 id 和 user_id
         db.get("SELECT id, user_id FROM folders WHERE user_id = ? AND parent_id IS NULL", [userId], (err, row) => {
             if (err) return reject(err);
             resolve(row);
@@ -473,5 +503,6 @@ module.exports = {
     findFileByFileIdAndMount,
     getRootFolder,
     findOrCreateFolderByPath,
-    getFolderInfo
+    getFolderInfo,
+    saveOrUpdateWebdavMount // 新增导出
 };
