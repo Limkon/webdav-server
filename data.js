@@ -257,7 +257,7 @@ async function findFolderByPath(startFolderId, pathParts, userId) {
         if (folder) {
             currentParentId = folder.id;
         } else {
-            return null; 
+            return null;
         }
     }
     return currentParentId;
@@ -302,9 +302,9 @@ async function moveItem(itemId, itemType, targetFolderId, userId, options = {}) 
     } else { // file
         const fileToMove = (await getFilesByIds([itemId], userId))[0];
         if (!fileToMove) throw new Error(`找不到来源档案 ID: ${itemId}`);
-        
+
         const conflict = await findFileInFolder(fileToMove.fileName, targetFolderId, userId);
-        
+
         if (conflict && overwriteList.includes(fileToMove.fileName)) {
             const storage = require('./storage').getStorage();
             const filesToDelete = await getFilesByIds([conflict.message_id], userId);
@@ -376,10 +376,10 @@ async function getFolderDeletionData(folderId, userId) {
         const sqlFiles = `SELECT * FROM files WHERE folder_id = ? AND user_id = ?`;
         const files = await new Promise((res, rej) => db.all(sqlFiles, [currentFolderId, userId], (err, rows) => err ? rej(err) : res(rows)));
         filesToDelete.push(...files);
-        
+
         const sqlFolders = `SELECT id FROM folders WHERE parent_id = ? AND user_id = ?`;
         const subFolders = await new Promise((res, rej) => db.all(sqlFolders, [currentFolderId, userId], (err, rows) => err ? rej(err) : res(rows)));
-        
+
         for (const subFolder of subFolders) {
             foldersToDeleteIds.push(subFolder.id);
             await findContentsRecursive(subFolder.id);
@@ -390,7 +390,7 @@ async function getFolderDeletionData(folderId, userId) {
 
     const allUserFolders = await getAllFolders(userId);
     const folderMap = new Map(allUserFolders.map(f => [f.id, f]));
-    
+
     function buildPath(fId) {
         let pathParts = [];
         let current = folderMap.get(fId);
@@ -413,11 +413,11 @@ async function getFolderDeletionData(folderId, userId) {
 function executeDeletion(fileIds, folderIds, userId) {
     return new Promise((resolve, reject) => {
         if (fileIds.length === 0 && folderIds.length === 0) return resolve({ success: true });
-        
+
         db.serialize(() => {
             db.run("BEGIN TRANSACTION;");
             const promises = [];
-            
+
             if (fileIds.length > 0) {
                 const filePlaceholders = fileIds.map(() => '?').join(',');
                 const sql = `DELETE FROM files WHERE message_id IN (${filePlaceholders}) AND user_id = ?`;
