@@ -265,7 +265,7 @@ app.post('/api/admin/delete-user', requireAdmin, async (req, res) => {
     }
 });
 
-// *** 修改: WebDAV API 现在处理多个设定 ***
+// *** 已修改: WebDAV API 现在处理多个设定 ***
 app.get('/api/admin/webdav', requireAdmin, (req, res) => {
     const config = storageManager.readConfig();
     res.json(config.webdav || []);
