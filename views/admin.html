@@ -39,8 +39,8 @@
 
         <div class="setting-card">
             <h2>储存设定</h2>
-            <p>目前默认储存模式: <b id="current-mode">加载中...</b></p>
-            <p>警告：切换储存模式不会迁移现有档案。切换后，旧模式下的档案将无法在管理器中存取。WebDAV 挂载点不受此设定影响。</p>
+            <p>目前储存模式: <b id="current-mode">加载中...</b></p>
+            <p>警告：切换储存模式不会迁移现有档案。切换后，旧模式下的档案将无法在管理器中存取。</p>
             <hr>
             <label for="storage-select">选择新的储存模式：</label>
             <select id="storage-select">
@@ -52,15 +52,14 @@
             <p id="save-status" style="color: green;"></p>
         </div>
 
-        <div class="setting-card" id="webdav-settings-card">
-            <h2>WebDAV 挂载点管理</h2>
-            <p>在此处新增的每个 WebDAV 伺服器都会在您的根目录下显示为一个资料夹。对此资料夹的所有操作都将直接在远端 WebDAV 伺服器上执行。</p>
+        <div class="setting-card" id="webdav-settings-card" style="display: none;">
+            <h2>系统共用 WebDAV 设定</h2>
+            <p>此设定将应用于所有使用者。只有在储存模式设定为 "WebDAV" 时才会生效。</p>
             
             <div class="table-container">
                 <table class="user-table" id="webdav-table">
                     <thead>
                         <tr>
-                            <th>挂载名称</th>
                             <th>URL</th>
                             <th>使用者名称</th>
                             <th>操作</th>
@@ -74,8 +73,7 @@
             <h3 style="margin-top: 20px;">新增或编辑 WebDAV 设定</h3>
             <form id="webdav-form">
                 <input type="hidden" id="webdav-id">
-                <div class="form-grid" style="grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));">
-                    <input type="text" id="webdav-name" placeholder="挂载名称 (例如 '我的云端')" required>
+                <div class="form-grid">
                     <input type="url" id="webdav-url" placeholder="WebDAV URL" required>
                     <input type="text" id="webdav-username" placeholder="使用者名称" required>
                     <input type="password" id="webdav-password" placeholder="密码 (留空则不变更)">
@@ -124,7 +122,6 @@
             const webdavTableBody = document.getElementById('webdav-table-body');
             const webdavForm = document.getElementById('webdav-form');
             const webdavIdInput = document.getElementById('webdav-id');
-            const webdavNameInput = document.getElementById('webdav-name');
             const webdavUrlInput = document.getElementById('webdav-url');
             const webdavUsernameInput = document.getElementById('webdav-username');
             const webdavPasswordInput = document.getElementById('webdav-password');
@@ -143,7 +140,8 @@
                     }
                     currentModeEl.textContent = modeText;
                     storageSelect.value = res.data.mode;
-                    loadWebdavSettings(); 
+                    webdavSettingsCard.style.display = res.data.mode === 'webdav' ? 'block' : 'none';
+                    if(res.data.mode === 'webdav') loadWebdavSettings();
                 } catch (error) {
                     currentModeEl.textContent = '读取失败';
                 }
@@ -169,7 +167,6 @@
                 webdavForm.reset();
                 webdavIdInput.value = '';
                 saveWebdavBtn.textContent = '储存设定';
-                webdavPasswordInput.placeholder = "密码";
             }
 
             async function loadWebdavSettings() {
@@ -178,12 +175,11 @@
                     const configs = res.data;
                     webdavTableBody.innerHTML = '';
                     if (configs.length === 0) {
-                         webdavTableBody.innerHTML = '<tr><td colspan="4" style="text-align: center;">尚未设定 WebDAV 挂载点。</td></tr>';
+                         webdavTableBody.innerHTML = '<tr><td colspan="3" style="text-align: center;">尚未设定 WebDAV。</td></tr>';
                     } else {
                         configs.forEach(config => {
                             const row = document.createElement('tr');
                             row.innerHTML = `
-                                <td>${config.name}</td>
                                 <td>${config.url}</td>
                                 <td>${config.username}</td>
                                 <td class="actions">
@@ -195,7 +191,7 @@
                         });
                     }
                 } catch (error) {
-                     webdavTableBody.innerHTML = '<tr><td colspan="4" style="text-align: center;">加载 WebDAV 设定失败。</td></tr>';
+                     webdavTableBody.innerHTML = '<tr><td colspan="3" style="text-align: center;">加载 WebDAV 设定失败。</td></tr>';
                 }
             }
             
@@ -204,13 +200,12 @@
             webdavForm.addEventListener('submit', async (e) => {
                 e.preventDefault();
                 const id = webdavIdInput.value;
-                const name = webdavNameInput.value;
                 const url = webdavUrlInput.value;
                 const username = webdavUsernameInput.value;
                 const password = webdavPasswordInput.value;
 
                 try {
-                    const payload = { name, url, username, password };
+                    const payload = { url, username, password };
                     if (id) payload.id = id;
                     
                     await axios.post('/api/admin/webdav', payload);
@@ -231,7 +226,6 @@
                      const config = res.data.find(c => String(c.id) === id);
                      if (config) {
                          webdavIdInput.value = config.id;
-                         webdavNameInput.value = config.name;
                          webdavUrlInput.value = config.url;
                          webdavUsernameInput.value = config.username;
                          webdavPasswordInput.value = ''; // Don't show old password
@@ -251,6 +245,11 @@
                         }
                     }
                 }
+            });
+            
+            storageSelect.addEventListener('change', () => {
+                webdavSettingsCard.style.display = storageSelect.value === 'webdav' ? 'block' : 'none';
+                 if(storageSelect.value === 'webdav') loadWebdavSettings();
             });
             
             async function loadUsers() {

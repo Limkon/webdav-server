@@ -1,92 +1,137 @@
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
 const fs = require('fs');
+const bcrypt = require('bcrypt');
 
-// --- 关键修正：使用 __dirname 确保路径总是相对于目前档案，而不是执行指令的位置 ---
-const DATA_DIR = path.join(__dirname, '..', 'data');
-const DB_PATH = path.join(DATA_DIR, 'database.db');
+const DATA_DIR = path.join(__dirname, 'data');
+const DB_FILE = path.join(DATA_DIR, 'file-manager.db');
 
-// --- 启动前的诊断检查 ---
-console.log(`[诊断] 检查路径: ${DATA_DIR}`);
+// 确保资料目录存在
 try {
-    // 1. 确保资料夹存在，如果不存在就建立它
     if (!fs.existsSync(DATA_DIR)) {
-        console.log(`[诊断] 'data' 资料夹不存在，正在尝试建立...`);
-        fs.mkdirSync(DATA_DIR, { recursive: true });
-        console.log(`[诊断] 'data' 资料夹已建立。`);
+        fs.mkdirSync(DATA_DIR);
     }
-
-    // 2. 尝试测试写入权限
-    const testFilePath = path.join(DATA_DIR, 'test_write.tmp');
-    console.log(`[诊断] 正在测试写入权限: ${testFilePath}`);
-    fs.writeFileSync(testFilePath, 'test');
-    fs.unlinkSync(testFilePath);
-    console.log(`[诊断] 写入权限测试成功。`);
-
 } catch (error) {
-    console.error(`[诊断失败] 在初始化资料库前发生权限错误:`, error);
-    // 抛出错误以阻止应用程式继续执行
-    throw new Error(`无法初始化资料库储存路径，请检查伺服器对 ${DATA_DIR} 目录的写入权限。`);
+    console.error(`[致命错误] 无法创建资料夹: ${DATA_DIR}。错误: ${error.message}`);
+    process.exit(1);
 }
-// --- 诊断结束 ---
 
-
-const db = new sqlite3.Database(DB_PATH, (err) => {
+const db = new sqlite3.Database(DB_FILE, (err) => {
     if (err) {
-        console.error("无法连接到资料库:", err.message);
-        // 如果这里出错，通常意味着档案存在但已损坏或被锁定
-    } else {
-        console.log("成功连接到 SQLite 资料库。");
-        initializeDb();
+        console.error('无法连接到数据库:', err.message);
+        return;
     }
+    console.log('成功连接到 SQLite 资料库。');
+    initializeDatabase();
 });
 
-function initializeDb() {
+function initializeDatabase() {
     db.serialize(() => {
-        // 启用外键约束
-        db.run("PRAGMA foreign_keys = ON;");
+        console.log('开始初始化资料库结构...');
 
-        // 建立使用者资料表
+        db.run("PRAGMA foreign_keys = ON;", (err) => {
+            if (err) console.error("启用外键约束失败:", err.message);
+        });
+
         db.run(`CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
+            username TEXT NOT NULL UNIQUE,
             password TEXT NOT NULL,
-            is_admin INTEGER NOT NULL DEFAULT 0
-        )`);
+            is_admin BOOLEAN NOT NULL DEFAULT 0
+        )`, (err) => {
+            if (err) {
+                console.error("建立 'users' 表失败:", err.message);
+            } else {
+                console.log("'users' 表已确认存在。");
+                // 在 users 表创建成功后，创建其他表
+                createDependentTables();
+            }
+        });
+    });
+}
 
-        // 建立资料夹资料表
+function createDependentTables() {
+    db.serialize(() => {
         db.run(`CREATE TABLE IF NOT EXISTS folders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
             parent_id INTEGER,
             user_id INTEGER NOT NULL,
-            share_token TEXT UNIQUE,
+            share_token TEXT,
             share_expires_at INTEGER,
-            FOREIGN KEY (parent_id) REFERENCES folders(id) ON DELETE CASCADE,
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY (parent_id) REFERENCES folders (id) ON DELETE CASCADE,
+            FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
             UNIQUE(name, parent_id, user_id)
-        )`);
+        )`, (err) => {
+            if (err) console.error("建立 'folders' 表失败:", err.message);
+            else console.log("'folders' 表已确认存在。");
+        });
 
-        // 建立档案资料表
         db.run(`CREATE TABLE IF NOT EXISTS files (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            message_id INTEGER UNIQUE NOT NULL,
+            message_id INTEGER PRIMARY KEY,
             fileName TEXT NOT NULL,
             mimetype TEXT,
-            size INTEGER,
-            date INTEGER,
             file_id TEXT NOT NULL,
             thumb_file_id TEXT,
-            folder_id INTEGER,
-            user_id INTEGER,
-            storage_type TEXT NOT NULL,
-            share_token TEXT UNIQUE,
+            size INTEGER,
+            date INTEGER NOT NULL,
+            share_token TEXT,
             share_expires_at INTEGER,
+            folder_id INTEGER NOT NULL DEFAULT 1,
+            user_id INTEGER NOT NULL,
+            storage_type TEXT NOT NULL DEFAULT 'telegram',
+            UNIQUE(fileName, folder_id, user_id),
             FOREIGN KEY (folder_id) REFERENCES folders(id) ON DELETE CASCADE,
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-        )`);
-        
-        console.log("资料库结构初始化完成。");
+        )`, (err) => {
+            if (err) console.error("建立 'files' 表失败:", err.message);
+            else {
+                console.log("'files' 表已确认存在。");
+                // 所有表结构都建立完毕后，再检查并建立管理员帐号
+                checkAndCreateAdmin();
+            }
+        });
+    });
+}
+
+function checkAndCreateAdmin() {
+    console.log("检查管理员帐号...");
+    db.get("SELECT * FROM users WHERE is_admin = 1", (err, admin) => {
+        if (err) {
+            console.error("查询管理员时出错:", err.message);
+            return;
+        }
+        if (!admin) {
+            console.log("未找到管理员帐号，正在建立预设管理员...");
+            const adminUser = process.env.ADMIN_USER || 'admin';
+            const adminPass = process.env.ADMIN_PASS || 'admin';
+            const salt = bcrypt.genSaltSync(10);
+            const hashedPassword = bcrypt.hashSync(adminPass, salt);
+
+            db.run("INSERT INTO users (username, password, is_admin) VALUES (?, ?, 1)", [adminUser, hashedPassword], function(err) {
+                if (err) {
+                    console.error("建立管理员帐号失败:", err.message);
+                    return;
+                }
+                const adminId = this.lastID;
+                console.log(`管理员 '${adminUser}' 建立成功。`);
+                
+                db.get("SELECT * FROM folders WHERE user_id = ? AND parent_id IS NULL", [adminId], (err, root) => {
+                    if (err) {
+                        console.error("查询管理员根目录失败:", err.message);
+                        return;
+                    }
+                    if (!root) {
+                        db.run("INSERT INTO folders (name, parent_id, user_id) VALUES (?, NULL, ?)", ['/', adminId], (err) => {
+                            if(err) console.error("为管理员建立根目录失败:", err.message);
+                            else console.log("管理员根目录建立成功。");
+                        });
+                    }
+                });
+            });
+        } else {
+            console.log("管理员帐号已存在。");
+        }
     });
 }
 
