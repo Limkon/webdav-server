@@ -46,6 +46,7 @@
             <select id="storage-select">
                 <option value="telegram">Telegram</option>
                 <option value="local">本地服务器</option>
+                <option value="webdav">WebDAV</option>
             </select>
             <button id="save-btn">储存设定</button>
             <p id="save-status" style="color: green;"></p>
@@ -138,10 +139,11 @@
                     switch (res.data.mode) {
                         case 'local': modeText = '本地服务器'; break;
                         case 'telegram': modeText = 'Telegram'; break;
+                        case 'webdav': modeText = 'WebDAV'; break;
                     }
                     currentModeEl.textContent = modeText;
                     storageSelect.value = res.data.mode;
-                    loadWebdavSettings(); // 始终加载 WebDAV 设置
+                    loadWebdavSettings(); 
                 } catch (error) {
                     currentModeEl.textContent = '读取失败';
                 }
@@ -149,7 +151,7 @@
 
             saveBtn.addEventListener('click', async () => {
                 const newMode = storageSelect.value;
-                if (!confirm(`确定要将默认储存模式切换为 "${storageSelect.options[storageSelect.selectedIndex].text}" 吗？`)) {
+                if (!confirm(`确定要将储存模式切换为 "${storageSelect.options[storageSelect.selectedIndex].text}" 吗？`)) {
                     return;
                 }
                 try {
