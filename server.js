@@ -174,43 +174,57 @@ app.post('/api/admin/webdav', requireAdmin, async (req, res) => {
         return res.status(400).json({ success: false, message: '名称和 URL 为必填项' });
     }
 
-    const config = storageManager.readConfig();
-    if (!config.webdavs) config.webdavs = [];
+    try {
+        // *** 关键修正开始 ***
+        // 1. 先将设定储存到资料库，并取得 ID
+        const dbResult = await data.saveOrUpdateWebdavMount({ 
+            id: id ? parseInt(id) : null, 
+            name, url, username, 
+            password: password || undefined // 如果密码为空则不传递，以避免覆盖旧密码
+        });
+        const mountId = dbResult.id;
 
-    const existing = config.webdavs.find(w => w.id === parseInt(id));
-    if (existing) { // 更新
-        existing.name = name;
-        existing.url = url;
-        existing.username = username;
-        if (password) existing.password = password;
-    } else { // 新增
-        const newId = (config.webdavs.length > 0 ? Math.max(...config.webdavs.map(w => w.id)) : 0) + 1;
-        config.webdavs.push({ id: newId, name, url, username, password });
-    }
+        // 2. 更新 config.json 设定档
+        const config = storageManager.readConfig();
+        if (!config.webdavs) config.webdavs = [];
 
-    if (storageManager.writeConfig(config)) {
-         // 为所有使用者建立对应的根目录挂载点资料夹
-        const allUsers = await data.listAllUsers();
-        const rootFolders = await Promise.all(allUsers.map(u => data.getRootFolder(u.id)));
+        const existingIndex = config.webdavs.findIndex(w => w.id === mountId);
+        const mountConfig = { id: mountId, name, url, username };
+        if (password) {
+            mountConfig.password = password;
+        }
+
+        if (existingIndex > -1) { // 更新
+            // 合并，只更新传入的栏位，特别是密码
+            config.webdavs[existingIndex] = { ...config.webdavs[existingIndex], ...mountConfig };
+        } else { // 新增
+            config.webdavs.push(mountConfig);
+        }
         
-        const mount = config.webdavs.find(w => w.name === name);
+        storageManager.writeConfig(config);
 
-        for (const root of rootFolders) {
+        // 3. 为所有使用者建立对应的根目录挂载点资料夹
+        const allUsers = await data.listAllUsers();
+        for (const user of allUsers) {
+            const root = await data.getRootFolder(user.id);
             if (root) {
                 const mountFolder = await data.findFolderByName(name, root.id, root.user_id);
                 if (!mountFolder) {
-                    await data.createFolder(name, root.id, root.user_id, mount.id);
-                } else if (mountFolder.mount_id !== mount.id) {
-                    // 如果存在同名但 mount_id 不同的情况，进行更新
-                    await db.run('UPDATE folders SET mount_id = ? WHERE id = ?', [mount.id, mountFolder.id]);
+                    await data.createFolder(name, root.id, root.user_id, mountId);
+                } else if (mountFolder.mount_id !== mountId) {
+                    await db.run('UPDATE folders SET mount_id = ? WHERE id = ?', [mountId, mountFolder.id]);
                 }
             }
         }
+        // *** 关键修正结束 ***
+
         res.json({ success: true, message: 'WebDAV 设定已储存' });
-    } else {
-        res.status(500).json({ success: false, message: '写入设定失败' });
+    } catch (error) {
+        console.error("储存 WebDAV 设定时发生错误:", error);
+        res.status(500).json({ success: false, message: '储存设定失败: ' + error.message });
     }
 });
+
 
 app.delete('/api/admin/webdav/:id', requireAdmin, (req, res) => {
     const idToDelete = parseInt(req.params.id);
@@ -457,6 +471,5 @@ app.post('/api/scan/webdav', requireAdmin, async (req, res) => {
         res.status(500).json({ success: false, message: `扫描 WebDAV 时出错: ${error.message}` });
     }
 });
-
 
 app.listen(PORT, () => console.log(`✅ 伺服器已在 http://localhost:${PORT} 上运行`));
