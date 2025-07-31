@@ -1,24 +1,10 @@
 document.addEventListener('DOMContentLoaded', () => {
     const userSelect = document.getElementById('user-select');
-    const mountSelect = document.getElementById('mount-select');
+    const scanLocalBtn = document.getElementById('scan-local-btn');
     const scanWebdavBtn = document.getElementById('scan-webdav-btn');
     const scanLog = document.getElementById('scan-log');
 
-    async function loadMounts() {
-        try {
-            const response = await axios.get('/api/admin/webdav');
-            mountSelect.innerHTML = '<option value="" disabled selected>-- 请选择一个挂载点 --</option>';
-            response.data.forEach(mount => {
-                const option = document.createElement('option');
-                option.value = mount.id;
-                option.textContent = mount.name;
-                mountSelect.appendChild(option);
-            });
-        } catch (error) {
-            logMessage('无法加载挂载点列表: ' + (error.response?.data?.message || error.message), 'error');
-        }
-    }
-
+    // 加载所有使用者到下拉选单
     async function loadUsers() {
         try {
             const response = await axios.get('/api/admin/all-users');
@@ -43,41 +29,37 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function disableButtons(disabled) {
+        scanLocalBtn.disabled = disabled;
         scanWebdavBtn.disabled = disabled;
         userSelect.disabled = disabled;
-        mountSelect.disabled = disabled;
     }
 
-    async function startScan() {
+    async function startScan(storageType) {
         const userId = userSelect.value;
-        const mountId = mountSelect.value;
-        if (!userId || !mountId) {
-            alert('请先选择一个挂载点和一个使用者！');
+        if (!userId) {
+            alert('请先选择一个要汇入的使用者！');
             return;
         }
         
         scanLog.innerHTML = '';
-        logMessage(`开始扫描 WebDAV 挂载点 ID: ${mountId}，汇入到使用者 ID: ${userId}`, 'info');
+        logMessage(`开始扫描 ${storageType.toUpperCase()} 储存，为使用者 ID: ${userId}`, 'info');
         disableButtons(true);
 
         try {
-            const response = await axios.post(`/api/scan/webdav`, { userId, mountId });
+            const response = await axios.post(`/api/scan/${storageType}`, { userId });
             const logs = response.data.log;
             logs.forEach(log => logMessage(log.message, log.type));
             logMessage('扫描完成！', 'success');
 
         } catch (error) {
             logMessage('扫描时发生严重错误: ' + (error.response?.data?.message || error.message), 'error');
-            if (error.response?.data?.log) {
-                error.response.data.log.forEach(log => logMessage(log.message, log.type));
-            }
         } finally {
             disableButtons(false);
         }
     }
 
-    scanWebdavBtn.addEventListener('click', startScan);
+    scanLocalBtn.addEventListener('click', () => startScan('local'));
+    scanWebdavBtn.addEventListener('click', () => startScan('webdav'));
 
     loadUsers();
-    loadMounts();
 });
