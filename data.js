@@ -3,6 +3,47 @@ const crypto = require('crypto');
 const path = require('path');
 
 // --- 使用者管理 ---
+
+// *** 新增：将使用者和根目录建立合并为一个事务 ***
+function createUserWithRootFolder(username, hashedPassword) {
+    return new Promise((resolve, reject) => {
+        db.serialize(() => {
+            db.run("BEGIN TRANSACTION;");
+
+            const userSql = `INSERT INTO users (username, password, is_admin) VALUES (?, ?, 0)`;
+            db.run(userSql, [username, hashedPassword], function(err) {
+                if (err) {
+                    db.run("ROLLBACK;");
+                    // 回传更具体的错误讯息
+                    if (err.message.includes('UNIQUE constraint failed: users.username')) {
+                        return reject(new Error('使用者名称已被使用。'));
+                    }
+                    return reject(err);
+                }
+                
+                const userId = this.lastID;
+                const folderSql = `INSERT INTO folders (name, parent_id, user_id) VALUES (?, NULL, ?)`;
+                
+                db.run(folderSql, ['/', userId], function(err) {
+                    if (err) {
+                        db.run("ROLLBACK;");
+                        return reject(err);
+                    }
+                    
+                    db.run("COMMIT;", (commitErr) => {
+                        if (commitErr) {
+                           return reject(commitErr);
+                        }
+                        resolve({ id: userId, username });
+                    });
+                });
+            });
+        });
+    });
+}
+
+
+// (旧的 createUser 函数可以保留，但不再被注册流程使用)
 function createUser(username, hashedPassword) {
     return new Promise((resolve, reject) => {
         const sql = `INSERT INTO users (username, password, is_admin) VALUES (?, ?, 0)`;
@@ -423,7 +464,7 @@ function executeDeletion(fileIds, folderIds, userId) {
             
             if (fileIds.length > 0) {
                 const filePlaceholders = fileIds.map(() => '?').join(',');
-                const sql = `DELETE FROM files WHERE message_id IN (${placeholders}) AND user_id = ?`;
+                const sql = `DELETE FROM files WHERE message_id IN (${filePlaceholders}) AND user_id = ?`;
                 promises.push(new Promise((res, rej) => db.run(sql, [...fileIds, userId], (err) => err ? rej(err) : res())));
             }
             if (folderIds.length > 0) {
@@ -707,7 +748,6 @@ async function findOrCreateFolderByPath(fullPath, userId) {
     }
 
     const pathParts = fullPath.split('/').filter(p => p);
-    // *** 修正： findOrCreate 和 resolvePath 现在共用此核心逻辑 ***
     return resolvePathToFolderId(rootFolder.id, pathParts, userId, true);
 }
 
@@ -715,7 +755,6 @@ async function findOrCreateFolderByPath(fullPath, userId) {
 async function resolvePathToFolderId(startFolderId, pathParts, userId, createMissing = false) {
     let currentParentId = startFolderId;
 
-    // *** 修正：辨识 WebDAV 挂载点，并从正确的父资料夹开始 ***
     const webdavConfigs = require('./storage').readConfig().webdav;
     const isWebdavPath = pathParts.length > 0 && webdavConfigs.some(c => c.name === pathParts[0]);
 
@@ -724,7 +763,7 @@ async function resolvePathToFolderId(startFolderId, pathParts, userId, createMis
         const webdavRootFolder = await findFolderByName(pathParts[0], rootFolder.id, userId);
         if (webdavRootFolder) {
             currentParentId = webdavRootFolder.id;
-            pathParts.shift(); // 移除路径中的挂载点名称部分
+            pathParts.shift(); 
         }
     }
 
@@ -747,7 +786,8 @@ async function resolvePathToFolderId(startFolderId, pathParts, userId, createMis
 }
 
 module.exports = {
-    createUser,
+    createUser, // 仍然导出旧函数以保持相容性
+    createUserWithRootFolder, // 汇出新函数
     findUserByName,
     findUserById,
     changeUserPassword,
