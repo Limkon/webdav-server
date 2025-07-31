@@ -13,8 +13,8 @@ function parseWebdavPath(filePath) {
     if (!filePath) throw new Error('无效的 WebDAV 路径');
     const parts = filePath.replace(/^\//, '').split('/');
     const mountName = parts.shift();
-    const remotePath = '/' + parts.join('/');
-    return { mountName, remotePath };
+    const relativePath = parts.join('/');
+    return { mountName, relativePath };
 }
 
 
@@ -64,38 +64,44 @@ async function getFolderPath(folderId, userId) {
     return pathParts.slice(1).map(p => p.name).join('/');
 }
 
-
-async function upload(tempFilePath, fileName, mimetype, userId, folderId) {
-    const fullFolderPath = await getFolderPath(folderId, userId);
-    const { mountName, remotePath: folderRemotePath } = parseWebdavPath(fullFolderPath);
-    
-    const { client } = getClientAndConfig(mountName);
-
-    const remotePath = path.posix.join(folderRemotePath, fileName);
-    const remoteDir = path.posix.dirname(remotePath);
-
-    if (remoteDir && remoteDir !== "/") {
+// *** 新增：建立远端目录的核心函数 ***
+async function createRemoteDirectoryRecursive(client, fullRemotePath) {
+    const remoteDir = path.posix.dirname(fullRemotePath);
+    if (remoteDir && remoteDir !== "/" && remoteDir !== ".") {
         try {
-            // WebDAV 创建目录需要递归创建
             await client.createDirectory(remoteDir, { recursive: true });
         } catch (e) {
             // 如果目录已存在，某些服务器会报 405 Method Not Allowed 或 501 Not Implemented，这可以安全地忽略
-            if (e.response && (e.response.status !== 405 && e.response.status !== 501)) {
+            if (e.response && (e.response.status !== 405 && e.response.status !== 501 && e.response.status !== 409)) {
                  throw new Error(`建立 WebDAV 目录失败 (${e.response.status}): ${e.message}`);
             }
         }
     }
+}
+
+
+async function upload(tempFilePath, fileName, mimetype, userId, folderId) {
+    const dbFolderPath = await getFolderPath(folderId, userId);
+    const { mountName, relativePath: folderRelativePath } = parseWebdavPath(dbFolderPath);
+    
+    const { client } = getClientAndConfig(mountName);
+
+    // *** 修改：远端路径包含挂载点名称作为子目录 ***
+    const remoteFilePath = path.posix.join('/', mountName, folderRelativePath, fileName);
+    
+    // 建立远端目录
+    await createRemoteDirectoryRecursive(client, remoteFilePath);
 
     const fileBuffer = await fsp.readFile(tempFilePath);
-    const success = await client.putFileContents(remotePath, fileBuffer, { overwrite: true });
+    const success = await client.putFileContents(remoteFilePath, fileBuffer, { overwrite: true });
 
     if (!success) {
         throw new Error('WebDAV putFileContents 操作失败');
     }
     
-    // file_id 现在储存的是 "挂载点名称/远端路径"
-    const fileIdForDb = path.posix.join(mountName, remotePath);
-    const stat = await client.stat(remotePath);
+    // file_id 储存的是 "挂载点名称/远端相对路径"
+    const fileIdForDb = path.posix.join(mountName, folderRelativePath, fileName);
+    const stat = await client.stat(remoteFilePath);
     const messageId = BigInt(Date.now()) * 1000000n + BigInt(crypto.randomInt(1000000));
 
     const dbResult = await data.addFile({
@@ -115,15 +121,19 @@ async function remove(files, folders, userId) {
     const results = { success: true, errors: [] };
     const itemsByMount = new Map();
 
-    // 1. 按挂载点对所有待删除项进行分组
+    // 按挂载点对所有待删除项进行分组
     const allItems = [
         ...files.map(f => ({ path: f.file_id, type: 'file' })),
-        ...folders.map(f => ({ path: f.path, type: 'folder' }))
+        // *** 修改：资料夹路径现在也包含挂载点 ***
+        ...folders.map(f => ({ path: f.path.startsWith('/') ? f.path.substring(1) : f.path, type: 'folder' }))
     ];
 
     for (const item of allItems) {
         try {
-            const { mountName, remotePath } = parseWebdavPath(item.path);
+            // *** 修改：远端路径现在需要加上挂载点名称作为前缀 ***
+            const { mountName, relativePath } = parseWebdavPath(item.path);
+            const remotePath = path.posix.join('/', mountName, relativePath);
+
             if (!itemsByMount.has(mountName)) {
                 itemsByMount.set(mountName, []);
             }
@@ -134,12 +144,10 @@ async function remove(files, folders, userId) {
         }
     }
 
-    // 2. 遍历每个挂载点，执行删除操作
+    // 遍历每个挂载点，执行删除操作
     for (const [mountName, itemsToDelete] of itemsByMount.entries()) {
         try {
             const { client } = getClientAndConfig(mountName);
-
-            // 按路径深度降序排序，确保先删除子项
             itemsToDelete.sort((a, b) => b.path.length - a.path.length);
 
             for (const item of itemsToDelete) {
@@ -163,24 +171,33 @@ async function remove(files, folders, userId) {
     return results;
 }
 
+// *** 新生：在 WebDAV 上建立资料夹的独立函数 ***
+async function createDirectory(mountName, relativePath) {
+    const { client } = getClientAndConfig(mountName);
+    const remotePath = path.posix.join('/', mountName, relativePath);
+    await createRemoteDirectoryRecursive(client, remotePath + '/'); // 加斜线确保是目录
+}
 
 async function stream(file_id, userId) {
-    const { mountName, remotePath } = parseWebdavPath(file_id);
+    const { mountName, relativePath } = parseWebdavPath(file_id);
     const { config } = getClientAndConfig(mountName);
     
-    // 为每个流操作创建一个独立的客户端实例以避免冲突
     const streamClient = createClient(config.url, {
         username: config.username,
         password: config.password
     });
-
+    
+    // *** 修改：串流也需要完整的远端路径 ***
+    const remotePath = path.posix.join('/', mountName, relativePath);
     return streamClient.createReadStream(remotePath);
 }
 
 
 async function getUrl(file_id, userId) {
-    const { mountName, remotePath } = parseWebdavPath(file_id);
+    const { mountName, relativePath } = parseWebdavPath(file_id);
     const { client } = getClientAndConfig(mountName);
+    // *** 修改：获取URL也需要完整的远端路径 ***
+    const remotePath = path.posix.join('/', mountName, relativePath);
     return client.getFileDownloadLink(remotePath);
 }
 
@@ -189,6 +206,7 @@ module.exports = {
     remove, 
     getUrl, 
     stream, 
-    resetClients, // 导出重置函数
+    resetClients,
+    createDirectory, // 导出新函数
     type: 'webdav' 
 };
