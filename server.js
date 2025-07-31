@@ -115,11 +115,14 @@ app.post('/register', async (req, res) => {
     try {
         const salt = await bcrypt.genSalt(10);
         const hashedPassword = await bcrypt.hash(password, salt);
-        const newUser = await data.createUser(username, hashedPassword); 
-        await data.createFolder('/', null, newUser.id); 
+        
+        // *** 修改：使用单一事务函数来建立使用者和其根目录 ***
+        await data.createUserWithRootFolder(username, hashedPassword); 
+        
         res.redirect('/login');
     } catch (error) {
-        res.status(500).send('注册失败，使用者名称可能已被使用。');
+        // 现在可以从 data.js 收到更明确的错误讯息
+        res.status(500).send(error.message || '注册失败，请稍后再试。');
     }
 });
 
@@ -136,7 +139,7 @@ app.get('/logout', (req, res) => {
 app.get('/', requireLogin, (req, res) => {
     db.get("SELECT id FROM folders WHERE user_id = ? AND parent_id IS NULL", [req.session.userId], (err, rootFolder) => {
         if (err || !rootFolder) {
-            return res.status(500).send("找不到您的根目录");
+            return res.status(500).send("找不到您的根目录。这可能是个错误，请联络管理员。");
         }
         res.redirect(`/folder/${rootFolder.id}`);
     });
@@ -227,11 +230,10 @@ app.post('/api/admin/add-user', requireAdmin, async (req, res) => {
     try {
         const salt = await bcrypt.genSalt(10);
         const hashedPassword = await bcrypt.hash(password, salt);
-        const newUser = await data.createUser(username, hashedPassword);
-        await data.createFolder('/', null, newUser.id);
+        const newUser = await data.createUserWithRootFolder(username, hashedPassword);
         res.json({ success: true, user: newUser });
     } catch (error) {
-        res.status(500).json({ success: false, message: '建立使用者失败，可能使用者名称已被使用。' });
+        res.status(500).json({ success: false, message: error.message || '建立使用者失败。' });
     }
 });
 
@@ -367,7 +369,6 @@ app.post('/upload', requireLogin, async (req, res, next) => {
                 const fileName = pathParts.pop() || file.originalname;
                 const folderPathParts = pathParts;
 
-                // *** 修正：使用 createMissing=true 来呼叫 resolvePathToFolderId ***
                 const targetFolderId = await data.resolvePathToFolderId(initialFolderId, folderPathParts, userId, true);
                 
                 const isOverwrite = overwritePaths.includes(relativePath);
@@ -516,7 +517,6 @@ app.post('/api/check-move-conflict', requireLogin, async (req, res) => {
             return res.status(400).json({ success: false, message: '无效的请求参数。' });
         }
         
-        // *** 新增：移动冲突检查 ***
         const { sourceMount } = await getMoveMountPointInfo(itemIds, null, userId);
         const { targetMount } = await getMoveMountPointInfo([], targetFolderId, userId);
 
@@ -597,7 +597,6 @@ app.get('/api/folder/:id', requireLogin, async (req, res) => {
         let webdavFolders = [];
         if (isRoot) {
             const config = storageManager.readConfig();
-            // *** 修改：为每个挂载点建立一个真正的资料夹，如果它不存在 ***
             for(const wd of config.webdav) {
                 let folder = await data.findFolderByName(wd.name, folderId, req.session.userId);
                 if (!folder) {
@@ -614,7 +613,6 @@ app.get('/api/folder/:id', requireLogin, async (req, res) => {
 
         const contents = await data.getFolderContents(folderId, req.session.userId);
         
-        // 确保 WebDAV 虚拟资料夹在列表中
         if (isRoot) {
             const existingFolderIds = new Set(contents.folders.map(f => f.id));
             const missingWebdavFolders = webdavFolders.filter(wf => !existingFolderIds.has(wf.id));
@@ -648,7 +646,6 @@ app.post('/api/folder', requireLogin, async (req, res) => {
         const webdavConfigs = storageManager.readConfig().webdav;
         const webdavMount = webdavConfigs.find(c => c.name === rootFolderName);
 
-        // 如果在 WebDAV 挂载点下建立资料夹，则在远端也建立
         if (webdavMount) {
             const webdav = storageManager.getStorage('webdav');
             const relativePath = path.posix.join(...parentPath.slice(2).map(p => p.name), name);
@@ -668,7 +665,6 @@ app.get('/api/folders', requireLogin, async (req, res) => {
     res.json(folders);
 });
 
-// *** 新增：用于判断移动来源和目标的辅助函数 ***
 async function getMoveMountPointInfo(itemIds, targetFolderId, userId) {
     const webdavConfigs = storageManager.readConfig().webdav;
     
@@ -676,7 +672,13 @@ async function getMoveMountPointInfo(itemIds, targetFolderId, userId) {
     if (itemIds && itemIds.length > 0) {
         const firstItem = (await data.getItemsByIds([itemIds[0]], userId))[0];
         if (firstItem) {
-            const itemFolderId = firstItem.type === 'folder' ? (await data.getFolderPath(firstItem.id, userId))[0].id : (await data.getFilesByIds([firstItem.id], userId))[0].folder_id;
+            let itemFolderId;
+            if (firstItem.type === 'folder') {
+                 itemFolderId = firstItem.id;
+            } else {
+                 const fileInfo = (await data.getFilesByIds([firstItem.id], userId))[0];
+                 itemFolderId = fileInfo.folder_id;
+            }
             const sourcePath = await data.getFolderPath(itemFolderId, userId);
             if (sourcePath.length > 1) {
                 const mount = webdavConfigs.find(c => c.name === sourcePath[1].name);
@@ -706,7 +708,6 @@ app.post('/api/move', requireLogin, async (req, res) => {
             return res.status(400).json({ success: false, message: '无效的请求参数。' });
         }
         
-        // *** 新增：移动限制检查 ***
         const { sourceMount, targetMount } = await getMoveMountPointInfo(itemIds, targetFolderId, userId);
         if (sourceMount && targetMount && sourceMount !== targetMount) {
             return res.status(403).json({ success: false, message: '不允许跨 WebDAV 挂载点移动。' });
@@ -728,7 +729,6 @@ app.post('/api/move', requireLogin, async (req, res) => {
     }
 });
 
-// 统一的删除处理器
 async function unifiedDeleteHandler(req, res) {
     const { messageIds = [], folderIds = [] } = req.body;
     const userId = req.session.userId;
@@ -744,7 +744,6 @@ async function unifiedDeleteHandler(req, res) {
         const allFileIds = new Set(messageIds);
         const allFolderIds = new Set(folderIds);
 
-        // 收集资料夹中的档案
         for (const folderId of folderIds) {
             const deletionData = await data.getFolderDeletionData(folderId, userId);
             deletionData.files.forEach(f => allFileIds.add(f.message_id));
@@ -758,7 +757,6 @@ async function unifiedDeleteHandler(req, res) {
             foldersByStorage[storageType].push(...deletionData.folders);
         }
 
-        // 按储存类型分组所有档案
         if (allFileIds.size > 0) {
             const allFiles = await data.getFilesByIds([...allFileIds], userId);
             for (const file of allFiles) {
@@ -767,12 +765,10 @@ async function unifiedDeleteHandler(req, res) {
             }
         }
 
-        // 执行物理删除
         for (const type in filesByStorage) {
             await storageManager.getStorage(type).remove(filesByStorage[type], foldersByStorage[type] || [], userId);
         }
 
-        // 执行数据库删除
         await data.executeDeletion([...allFileIds], [...allFolderIds], userId);
 
         res.json({ success: true, message: '删除操作已完成。' });
