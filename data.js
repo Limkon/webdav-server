@@ -2,7 +2,7 @@ const db = require('./database.js');
 const crypto = require('crypto');
 const path = require('path');
 
-// --- 使用者管理 ---
+// --- 使用者管理 (基本不变) ---
 function createUser(username, hashedPassword) {
     return new Promise((resolve, reject) => {
         const sql = `INSERT INTO users (username, password, is_admin) VALUES (?, ?, 0)`;
@@ -41,16 +41,6 @@ function changeUserPassword(userId, newHashedPassword) {
     });
 }
 
-function listNormalUsers() {
-    return new Promise((resolve, reject) => {
-        const sql = `SELECT id, username FROM users WHERE is_admin = 0 ORDER BY username ASC`;
-        db.all(sql, [], (err, rows) => {
-            if (err) return reject(err);
-            resolve(rows);
-        });
-    });
-}
-
 function listAllUsers() {
     return new Promise((resolve, reject) => {
         const sql = `SELECT id, username FROM users ORDER BY username ASC`;
@@ -61,9 +51,9 @@ function listAllUsers() {
     });
 }
 
-
 function deleteUser(userId) {
     return new Promise((resolve, reject) => {
+        // 删除使用者会透过外键 CASCADE 自动删除其所有资料夹和档案
         const sql = `DELETE FROM users WHERE id = ? AND is_admin = 0`;
         db.run(sql, [userId], function(err) {
             if (err) return reject(err);
@@ -78,7 +68,7 @@ function searchItems(query, userId) {
     return new Promise((resolve, reject) => {
         const searchQuery = `%${query}%`;
         const sqlFolders = `
-            SELECT id, name, parent_id, 'folder' as type
+            SELECT id, name, parent_id, mount_id, 'folder' as type
             FROM folders
             WHERE name LIKE ? AND user_id = ? AND parent_id IS NOT NULL
             ORDER BY name ASC`;
@@ -109,9 +99,9 @@ function getItemsByIds(itemIds, userId) {
         if (!itemIds || itemIds.length === 0) return resolve([]);
         const placeholders = itemIds.map(() => '?').join(',');
         const sql = `
-            SELECT id, name, 'folder' as type FROM folders WHERE id IN (${placeholders}) AND user_id = ?
+            SELECT id, name, mount_id, 'folder' as type FROM folders WHERE id IN (${placeholders}) AND user_id = ?
             UNION ALL
-            SELECT message_id as id, fileName as name, 'file' as type FROM files WHERE message_id IN (${placeholders}) AND user_id = ?
+            SELECT message_id as id, fileName as name, mount_id, 'file' as type FROM files WHERE message_id IN (${placeholders}) AND user_id = ?
         `;
         db.all(sql, [...itemIds, userId, ...itemIds, userId], (err, rows) => {
             if (err) return reject(err);
@@ -120,49 +110,35 @@ function getItemsByIds(itemIds, userId) {
     });
 }
 
-function getChildrenOfFolder(folderId, userId) {
-    return new Promise((resolve, reject) => {
-        const sql = `
-            SELECT id, name, 'folder' as type FROM folders WHERE parent_id = ? AND user_id = ?
-            UNION ALL
-            SELECT message_id as id, fileName as name, 'file' as type FROM files WHERE folder_id = ? AND user_id = ?
-        `;
-        db.all(sql, [folderId, userId, folderId, userId], (err, rows) => {
-            if (err) return reject(err);
-            resolve(rows);
-        });
-    });
-}
+async function getFolderContents(folderId, userId) {
+    const root = await getRootFolder(userId);
 
-async function getAllDescendantFolderIds(folderId, userId) {
-    let descendants = [];
-    let queue = [folderId];
-    const visited = new Set(queue);
-
-    while (queue.length > 0) {
-        const currentId = queue.shift();
-        const sql = `SELECT id FROM folders WHERE parent_id = ? AND user_id = ?`;
-        const children = await new Promise((resolve, reject) => {
-            db.all(sql, [currentId, userId], (err, rows) => {
-                if (err) reject(err);
-                else resolve(rows);
+    // 如果是根目录，则显示 WebDAV 挂载点
+    if (folderId === root.id) {
+        const mounts = await new Promise((resolve, reject) => {
+            db.all("SELECT id, name FROM webdav_mounts ORDER BY name ASC", [], (err, rows) => {
+                if (err) return reject(err);
+                resolve(rows);
             });
         });
 
-        for (const child of children) {
-            if (!visited.has(child.id)) {
-                visited.add(child.id);
-                descendants.push(child.id);
-                queue.push(child.id);
-            }
-        }
+        const virtualFolders = await Promise.all(mounts.map(async mount => {
+            const folder = await findFolderByName(mount.name, folderId, userId);
+            return {
+                id: folder ? folder.id : -1, // 如果资料库中还未建立对应目录，给个假ID
+                name: mount.name,
+                parent_id: folderId,
+                mount_id: mount.id,
+                type: 'folder'
+            };
+        }));
+        
+        return { folders: virtualFolders, files: [] }; // 根目录没有档案
     }
-    return descendants;
-}
 
-function getFolderContents(folderId, userId) {
+    // 如果是子目录
     return new Promise((resolve, reject) => {
-        const sqlFolders = `SELECT id, name, parent_id, 'folder' as type FROM folders WHERE parent_id = ? AND user_id = ? ORDER BY name ASC`;
+        const sqlFolders = `SELECT id, name, parent_id, mount_id, 'folder' as type FROM folders WHERE parent_id = ? AND user_id = ? ORDER BY name ASC`;
         const sqlFiles = `SELECT *, message_id as id, fileName as name, 'file' as type FROM files WHERE folder_id = ? AND user_id = ? ORDER BY name ASC`;
         let contents = { folders: [], files: [] };
         db.all(sqlFolders, [folderId, userId], (err, folders) => {
@@ -175,32 +151,6 @@ function getFolderContents(folderId, userId) {
             });
         });
     });
-}
-
-async function getFilesRecursive(folderId, userId, currentPath = '') {
-    let allFiles = [];
-    const sqlFiles = "SELECT * FROM files WHERE folder_id = ? AND user_id = ?";
-    const files = await new Promise((res, rej) => db.all(sqlFiles, [folderId, userId], (err, rows) => err ? rej(err) : res(rows)));
-    for (const file of files) {
-        allFiles.push({ ...file, path: path.join(currentPath, file.fileName) });
-    }
-
-    const sqlFolders = "SELECT id, name FROM folders WHERE parent_id = ? AND user_id = ?";
-    const subFolders = await new Promise((res, rej) => db.all(sqlFolders, [folderId, userId], (err, rows) => err ? rej(err) : res(rows)));
-    for (const subFolder of subFolders) {
-        const nestedFiles = await getFilesRecursive(subFolder.id, userId, path.join(currentPath, subFolder.name));
-        allFiles.push(...nestedFiles);
-    }
-    return allFiles;
-}
-
-async function getDescendantFiles(folderIds, userId) {
-    let allFiles = [];
-    for (const folderId of folderIds) {
-        const nestedFiles = await getFilesRecursive(folderId, userId);
-        allFiles.push(...nestedFiles);
-    }
-    return allFiles;
 }
 
 function getFolderPath(folderId, userId) {
@@ -222,10 +172,10 @@ function getFolderPath(folderId, userId) {
     });
 }
 
-function createFolder(name, parentId, userId) {
-    const sql = `INSERT INTO folders (name, parent_id, user_id) VALUES (?, ?, ?)`;
+function createFolder(name, parentId, userId, mountId = null) {
+    const sql = `INSERT INTO folders (name, parent_id, user_id, mount_id) VALUES (?, ?, ?, ?)`;
     return new Promise((resolve, reject) => {
-        db.run(sql, [name, parentId, userId], function (err) {
+        db.run(sql, [name, parentId, userId, mountId], function (err) {
             if (err) {
                 if (err.message.includes('UNIQUE')) return reject(new Error('同目录下已存在同名资料夹。'));
                 return reject(err);
@@ -237,7 +187,7 @@ function createFolder(name, parentId, userId) {
 
 function findFolderByName(name, parentId, userId) {
     return new Promise((resolve, reject) => {
-        const sql = `SELECT id FROM folders WHERE name = ? AND parent_id = ? AND user_id = ?`;
+        const sql = `SELECT * FROM folders WHERE name = ? AND parent_id = ? AND user_id = ?`;
         db.get(sql, [name, parentId, userId], (err, row) => {
             if (err) return reject(err);
             resolve(row);
@@ -245,80 +195,13 @@ function findFolderByName(name, parentId, userId) {
     });
 }
 
-async function findFolderByPath(startFolderId, pathParts, userId) {
-    let currentParentId = startFolderId;
-    for (const part of pathParts) {
-        if (!part) continue;
-        const folder = await new Promise((resolve, reject) => {
-            const sql = `SELECT id FROM folders WHERE name = ? AND parent_id = ? AND user_id = ?`;
-            db.get(sql, [part, currentParentId, userId], (err, row) => err ? reject(err) : resolve(row));
-        });
-
-        if (folder) {
-            currentParentId = folder.id;
-        } else {
-            return null; 
-        }
-    }
-    return currentParentId;
-}
-
-
-function getAllFolders(userId) {
+function getFolderInfo(folderId, userId) {
     return new Promise((resolve, reject) => {
-        const sql = "SELECT id, name, parent_id FROM folders WHERE user_id = ? ORDER BY parent_id, name ASC";
-        db.all(sql, [userId], (err, rows) => {
-            if (err) reject(err);
-            else resolve(rows);
+        db.get("SELECT * FROM folders WHERE id = ? AND user_id = ?", [folderId, userId], (err, row) => {
+            if (err) return reject(err);
+            resolve(row);
         });
     });
-}
-
-async function moveItem(itemId, itemType, targetFolderId, userId, options = {}) {
-    const { overwriteList = [], mergeList = [] } = options;
-
-    if (itemType === 'folder') {
-        const folderToMove = (await getItemsByIds([itemId], userId))[0];
-        if (!folderToMove) throw new Error(`找不到来源资料夹 ID: ${itemId}`);
-
-        const existingFolder = await findFolderByName(folderToMove.name, targetFolderId, userId);
-
-        if (existingFolder) {
-            if (mergeList.includes(folderToMove.name)) {
-                // 合并逻辑
-                const children = await getChildrenOfFolder(itemId, userId);
-                for (const child of children) {
-                    await moveItem(child.id, child.type, existingFolder.id, userId, options);
-                }
-                const remainingChildren = await getChildrenOfFolder(itemId, userId);
-                if (remainingChildren.length === 0) {
-                    await deleteSingleFolder(itemId, userId);
-                }
-            }
-        } else {
-            // 没有冲突，直接移动
-            await moveItems([], [itemId], targetFolderId, userId);
-        }
-    } else { // file
-        const fileToMove = (await getFilesByIds([itemId], userId))[0];
-        if (!fileToMove) throw new Error(`找不到来源档案 ID: ${itemId}`);
-        
-        const conflict = await findFileInFolder(fileToMove.fileName, targetFolderId, userId);
-        
-        if (conflict && overwriteList.includes(fileToMove.fileName)) {
-            const storage = require('./storage').getStorage();
-            const filesToDelete = await getFilesByIds([conflict.message_id], userId);
-            // **最终修复：确保在移动前，先删除物理文件，再删除数据库记录**
-            if (filesToDelete.length > 0) {
-                await storage.remove(filesToDelete, [], userId);
-            }
-            await deleteFilesByIds([conflict.message_id], userId);
-
-            await moveItems([itemId], [], targetFolderId, userId);
-        } else if (!conflict) {
-            await moveItems([itemId], [], targetFolderId, userId);
-        }
-    }
 }
 
 function moveItems(fileIds, folderIds, targetFolderId, userId) {
@@ -358,39 +241,14 @@ function moveItems(fileIds, folderIds, targetFolderId, userId) {
     });
 }
 
-function deleteSingleFolder(folderId, userId) {
-    return new Promise((resolve, reject) => {
-        const sql = `DELETE FROM folders WHERE id = ? AND user_id = ?`;
-        db.run(sql, [folderId, userId], function(err) {
-            if (err) return reject(err);
-            resolve({ success: true, changes: this.changes });
-        });
-    });
-}
-
 async function getFolderDeletionData(folderId, userId) {
     let filesToDelete = [];
-    let foldersToDeleteIds = [folderId];
-
-    async function findContentsRecursive(currentFolderId) {
-        const sqlFiles = `SELECT * FROM files WHERE folder_id = ? AND user_id = ?`;
-        const files = await new Promise((res, rej) => db.all(sqlFiles, [currentFolderId, userId], (err, rows) => err ? rej(err) : res(rows)));
-        filesToDelete.push(...files);
-        
-        const sqlFolders = `SELECT id FROM folders WHERE parent_id = ? AND user_id = ?`;
-        const subFolders = await new Promise((res, rej) => db.all(sqlFolders, [currentFolderId, userId], (err, rows) => err ? rej(err) : res(rows)));
-        
-        for (const subFolder of subFolders) {
-            foldersToDeleteIds.push(subFolder.id);
-            await findContentsRecursive(subFolder.id);
-        }
-    }
-
-    await findContentsRecursive(folderId);
-
-    const allUserFolders = await getAllFolders(userId);
+    let foldersToDeleteWithPaths = [];
+    const allUserFolders = await new Promise((resolve, reject) => {
+        db.all("SELECT * FROM folders WHERE user_id = ?", [userId], (err, rows) => err ? reject(err) : resolve(rows));
+    });
     const folderMap = new Map(allUserFolders.map(f => [f.id, f]));
-    
+
     function buildPath(fId) {
         let pathParts = [];
         let current = folderMap.get(fId);
@@ -401,14 +259,26 @@ async function getFolderDeletionData(folderId, userId) {
         return '/' + pathParts.join('/');
     }
 
-    const foldersToDeleteWithPaths = foldersToDeleteIds.map(id => ({
-        id: id,
-        path: buildPath(id)
-    }));
+    async function findContentsRecursive(currentFolderId) {
+        const sqlFiles = `SELECT * FROM files WHERE folder_id = ? AND user_id = ?`;
+        const files = await new Promise((res, rej) => db.all(sqlFiles, [currentFolderId, userId], (err, rows) => err ? rej(err) : res(rows)));
+        filesToDelete.push(...files);
+        
+        foldersToDeleteWithPaths.push({
+            id: currentFolderId,
+            path: buildPath(currentFolderId),
+            mount_id: folderMap.get(currentFolderId)?.mount_id
+        });
 
+        const subFolders = allUserFolders.filter(f => f.parent_id === currentFolderId);
+        for (const subFolder of subFolders) {
+            await findContentsRecursive(subFolder.id);
+        }
+    }
+
+    await findContentsRecursive(folderId);
     return { files: filesToDelete, folders: foldersToDeleteWithPaths };
 }
-
 
 function executeDeletion(fileIds, folderIds, userId) {
     return new Promise((resolve, reject) => {
@@ -436,15 +306,14 @@ function executeDeletion(fileIds, folderIds, userId) {
     });
 }
 
-
-function addFile(fileData, folderId = 1, userId, storageType) {
+function addFile(fileData, folderId, userId, storageType, mountId) {
     const { message_id, fileName, mimetype, file_id, thumb_file_id, date, size } = fileData;
-    const sql = `INSERT INTO files (message_id, fileName, mimetype, file_id, thumb_file_id, date, size, folder_id, user_id, storage_type)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+    const sql = `INSERT INTO files (message_id, fileName, mimetype, file_id, thumb_file_id, date, size, folder_id, user_id, storage_type, mount_id)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
     return new Promise((resolve, reject) => {
-        db.run(sql, [message_id, fileName, mimetype, file_id, thumb_file_id, date, size, folderId, userId, storageType], function(err) {
+        db.run(sql, [message_id, fileName, mimetype, file_id, thumb_file_id, date, size, folderId, userId, storageType, mountId], function(err) {
             if (err) reject(err);
-            else resolve({ success: true, id: this.lastID, fileId: this.lastID });
+            else resolve({ success: true, fileId: this.lastID });
         });
     });
 }
@@ -459,55 +328,6 @@ function getFilesByIds(messageIds, userId) {
         db.all(sql, [...messageIds, userId], (err, rows) => {
             if (err) reject(err);
             else resolve(rows);
-        });
-    });
-}
-
-function getFileByShareToken(token) {
-     return new Promise((resolve, reject) => {
-        const sql = "SELECT * FROM files WHERE share_token = ?";
-        db.get(sql, [token], (err, row) => {
-            if (err) return reject(err);
-            if (!row) return resolve(null);
-            if (row.share_expires_at && Date.now() > row.share_expires_at) {
-                const updateSql = "UPDATE files SET share_token = NULL, share_expires_at = NULL WHERE message_id = ?";
-                db.run(updateSql, [row.message_id]);
-                resolve(null);
-            } else {
-                resolve(row);
-            }
-        });
-    });
-}
-
-function getFolderByShareToken(token) {
-     return new Promise((resolve, reject) => {
-        const sql = "SELECT * FROM folders WHERE share_token = ?";
-        db.get(sql, [token], (err, row) => {
-            if (err) return reject(err);
-            if (!row) return resolve(null);
-            if (row.share_expires_at && Date.now() > row.share_expires_at) {
-                const updateSql = "UPDATE folders SET share_token = NULL, share_expires_at = NULL WHERE id = ?";
-                db.run(updateSql, [row.id]);
-                resolve(null);
-            } else {
-                resolve(row);
-            }
-        });
-    });
-}
-
-function findFileInSharedFolder(fileId, folderToken) {
-    return new Promise((resolve, reject) => {
-        const sql = `
-            SELECT f.*
-            FROM files f
-            JOIN folders fo ON f.folder_id = fo.id
-            WHERE f.message_id = ? AND fo.share_token = ?
-        `;
-        db.get(sql, [fileId, folderToken], (err, row) => {
-            if (err) return reject(err);
-            resolve(row);
         });
     });
 }
@@ -534,36 +354,6 @@ function renameFolder(folderId, newFolderName, userId) {
     });
 }
 
-function createShareLink(itemId, itemType, expiresIn, userId) {
-    const token = crypto.randomBytes(16).toString('hex');
-    let expiresAt = null;
-    const now = Date.now();
-    const hours = (h) => h * 60 * 60 * 1000;
-    const days = (d) => d * 24 * hours(1);
-    switch (expiresIn) {
-        case '1h': expiresAt = now + hours(1); break;
-        case '3h': expiresAt = now + hours(3); break;
-        case '5h': expiresAt = now + hours(5); break;
-        case '7h': expiresAt = now + hours(7); break;
-        case '24h': expiresAt = now + hours(24); break;
-        case '7d': expiresAt = now + days(7); break;
-        case '0': expiresAt = null; break;
-        default: expiresAt = now + hours(24);
-    }
-
-    const table = itemType === 'folder' ? 'folders' : 'files';
-    const idColumn = itemType === 'folder' ? 'id' : 'message_id';
-
-    const sql = `UPDATE ${table} SET share_token = ?, share_expires_at = ? WHERE ${idColumn} = ? AND user_id = ?`;
-
-    return new Promise((resolve, reject) => {
-        db.run(sql, [token, expiresAt, itemId, userId], function(err) {
-            if (err) reject(err);
-            else if (this.changes === 0) resolve({ success: false, message: '项目未找到。' });
-            else resolve({ success: true, token });
-        });
-    });
-}
 
 function deleteFilesByIds(messageIds, userId) {
     if (!messageIds || messageIds.length === 0) {
@@ -578,79 +368,6 @@ function deleteFilesByIds(messageIds, userId) {
         });
     });
 }
-
-function getActiveShares(userId) {
-    return new Promise((resolve, reject) => {
-        const now = Date.now();
-        const sqlFiles = `SELECT message_id as id, fileName as name, 'file' as type, share_token, share_expires_at FROM files WHERE share_token IS NOT NULL AND (share_expires_at IS NULL OR share_expires_at > ?) AND user_id = ?`;
-        const sqlFolders = `SELECT id, name, 'folder' as type, share_token, share_expires_at FROM folders WHERE share_token IS NOT NULL AND (share_expires_at IS NULL OR share_expires_at > ?) AND user_id = ?`;
-
-        let shares = [];
-        db.all(sqlFiles, [now, userId], (err, files) => {
-            if (err) return reject(err);
-            shares = shares.concat(files);
-            db.all(sqlFolders, [now, userId], (err, folders) => {
-                if (err) return reject(err);
-                shares = shares.concat(folders);
-                resolve(shares);
-            });
-        });
-    });
-}
-
-function cancelShare(itemId, itemType, userId) {
-    const table = itemType === 'folder' ? 'folders' : 'files';
-    const idColumn = itemType === 'folder' ? 'id' : 'message_id';
-    const sql = `UPDATE ${table} SET share_token = NULL, share_expires_at = NULL WHERE ${idColumn} = ? AND user_id = ?`;
-
-    return new Promise((resolve, reject) => {
-        db.run(sql, [itemId, userId], function(err) {
-            if (err) reject(err);
-            else if (this.changes === 0) resolve({ success: false, message: '项目未找到或无需取消' });
-            else resolve({ success: true });
-        });
-    });
-}
-
-async function getConflictingItems(itemNames, targetFolderId, userId) {
-    if (!itemNames || itemNames.length === 0) {
-        return [];
-    }
-    const uniqueNames = [...new Set(itemNames)];
-    const placeholders = uniqueNames.map(() => '?').join(',');
-
-    const sqlFiles = `
-        SELECT fileName as name, 'file' as type FROM files
-        WHERE folder_id = ? AND user_id = ? AND fileName IN (${placeholders})
-    `;
-    const sqlFolders = `
-        SELECT name, 'folder' as type FROM folders
-        WHERE parent_id = ? AND user_id = ? AND name IN (${placeholders})
-    `;
-
-    const fileConflictsPromise = new Promise((resolve, reject) => {
-        db.all(sqlFiles, [targetFolderId, userId, ...uniqueNames], (err, rows) => {
-            if (err) return reject(err);
-            resolve(rows);
-        });
-    });
-
-    const folderConflictsPromise = new Promise((resolve, reject) => {
-        db.all(sqlFolders, [targetFolderId, userId, ...uniqueNames], (err, rows) => {
-            if (err) return reject(err);
-            resolve(rows);
-        });
-    });
-
-    try {
-        const [fileConflicts, folderConflicts] = await Promise.all([fileConflictsPromise, folderConflictsPromise]);
-        return [...fileConflicts, ...folderConflicts];
-    } catch (error) {
-        console.error("Error in getConflictingItems:", error);
-        throw error;
-    }
-}
-
 
 function checkFullConflict(name, folderId, userId) {
     return new Promise((resolve, reject) => {
@@ -678,18 +395,16 @@ function findFileInFolder(fileName, folderId, userId) {
     });
 }
 
-// --- 新生：扫描专用函数 ---
-function findFileByFileId(fileId, userId) {
+function findFileByFileIdAndMount(fileId, mountId, userId) {
     return new Promise((resolve, reject) => {
-        const sql = `SELECT message_id FROM files WHERE file_id = ? AND user_id = ?`;
-        db.get(sql, [fileId, userId], (err, row) => {
+        const sql = `SELECT message_id FROM files WHERE file_id = ? AND mount_id = ? AND user_id = ?`;
+        db.get(sql, [fileId, mountId, userId], (err, row) => {
             if (err) return reject(err);
             resolve(row);
         });
     });
 }
 
-// 修：新增函数以直接获取根目录
 function getRootFolder(userId) {
     return new Promise((resolve, reject) => {
         db.get("SELECT id FROM folders WHERE user_id = ? AND parent_id IS NULL", [userId], (err, row) => {
@@ -700,52 +415,34 @@ function getRootFolder(userId) {
 }
 
 async function findOrCreateFolderByPath(fullPath, userId) {
-    // 修：确保能正确处理根目录 (fullPath 为 '/' 或 '')
     if (!fullPath || fullPath === '/') {
         const root = await getRootFolder(userId);
         return root.id;
     }
-
     const pathParts = fullPath.split('/').filter(p => p);
     let parentId = (await getRootFolder(userId)).id;
+    let mountId = null;
 
-    for (const part of pathParts) {
+    for (let i = 0; i < pathParts.length; i++) {
+        const part = pathParts[i];
         let folder = await findFolderByName(part, parentId, userId);
         if (folder) {
             parentId = folder.id;
+            if (i === 0) mountId = folder.mount_id; // 如果是第一层目录（挂载点），记录 mountId
         } else {
-            console.log(`Creating folder '${part}' inside parent folder ${parentId} for user ${userId}`);
-            const result = await createFolder(part, parentId, userId);
+            // 如果是第一层目录（挂载点），它应该已经由系统建立
+            if (i === 0) {
+                 const mount = await new Promise((resolve, reject) => {
+                     db.get("SELECT id FROM webdav_mounts WHERE name = ?", [part], (err, row) => err ? reject(err) : resolve(row));
+                 });
+                 if (!mount) throw new Error(`找不到名为 ${part} 的挂载点设定`);
+                 mountId = mount.id;
+            }
+            const result = await createFolder(part, parentId, userId, mountId);
             parentId = result.id;
         }
     }
     return parentId;
-}
-
-async function resolvePathToFolderId(startFolderId, pathParts, userId) {
-    let currentParentId = startFolderId;
-    for (const part of pathParts) {
-        if (!part) continue;
-
-        let folder = await new Promise((resolve, reject) => {
-            const sql = `SELECT id FROM folders WHERE name = ? AND parent_id = ? AND user_id = ?`;
-            db.get(sql, [part, currentParentId, userId], (err, row) => err ? reject(err) : resolve(row));
-        });
-
-        if (folder) {
-            currentParentId = folder.id;
-        } else {
-            const newFolder = await new Promise((resolve, reject) => {
-                const sql = `INSERT INTO folders (name, parent_id, user_id) VALUES (?, ?, ?)`;
-                db.run(sql, [part, currentParentId, userId], function(err) {
-                    if (err) return reject(err);
-                    resolve({ id: this.lastID });
-                });
-            });
-            currentParentId = newFolder.id;
-        }
-    }
-    return currentParentId;
 }
 
 module.exports = {
@@ -753,43 +450,26 @@ module.exports = {
     findUserByName,
     findUserById,
     changeUserPassword,
-    listNormalUsers,
     listAllUsers,
     deleteUser,
     searchItems,
     getFolderContents,
-    getFilesRecursive,
     getFolderPath,
     createFolder,
     findFolderByName,
-    getAllFolders,
-    getAllDescendantFolderIds,
-    executeDeletion,
+    getItemsByIds,
+    moveItems,
     getFolderDeletionData,
-    deleteSingleFolder,
+    executeDeletion,
     addFile,
     getFilesByIds,
-    getItemsByIds,
-    getChildrenOfFolder,
-    moveItems,
-    moveItem,
-    getFileByShareToken,
-    getFolderByShareToken,
-    findFileInSharedFolder,
-    createShareLink,
-    getActiveShares,
-    cancelShare,
     renameFile,
     renameFolder,
     deleteFilesByIds,
-    findFileInFolder,
-    getConflictingItems,
     checkFullConflict,
-    resolvePathToFolderId,
-    findFolderByPath,
-    getDescendantFiles,
-    // --- 新生导出 ---
-    findFileByFileId,
+    findFileInFolder,
+    findFileByFileIdAndMount,
+    getRootFolder,
     findOrCreateFolderByPath,
-    getRootFolder
+    getFolderInfo
 };
