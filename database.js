@@ -33,7 +33,6 @@ function initializeDatabase() {
             if (err) console.error("启用外键约束失败:", err.message);
         });
 
-        // 建立 users 表
         db.run(`CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT NOT NULL UNIQUE,
@@ -44,27 +43,54 @@ function initializeDatabase() {
                 console.error("建立 'users' 表失败:", err.message);
             } else {
                 console.log("'users' 表已确认存在。");
-                createWebdavConfigsTable();
-                checkAndCreateAdmin();
+                // 在 users 表创建成功后，创建其他表
+                createDependentTables();
             }
         });
     });
 }
 
-// 新增：建立 webdav_configs 表
-function createWebdavConfigsTable() {
-    db.run(`CREATE TABLE IF NOT EXISTS webdav_configs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        name TEXT NOT NULL,
-        url TEXT NOT NULL,
-        username TEXT NOT NULL,
-        password TEXT NOT NULL,
-        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
-        UNIQUE(user_id, name)
-    )`, (err) => {
-        if (err) console.error("建立 'webdav_configs' 表失败:", err.message);
-        else console.log("'webdav_configs' 表已确认存在。");
+function createDependentTables() {
+    db.serialize(() => {
+        db.run(`CREATE TABLE IF NOT EXISTS folders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            parent_id INTEGER,
+            user_id INTEGER NOT NULL,
+            share_token TEXT,
+            share_expires_at INTEGER,
+            FOREIGN KEY (parent_id) REFERENCES folders (id) ON DELETE CASCADE,
+            FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
+            UNIQUE(name, parent_id, user_id)
+        )`, (err) => {
+            if (err) console.error("建立 'folders' 表失败:", err.message);
+            else console.log("'folders' 表已确认存在。");
+        });
+
+        db.run(`CREATE TABLE IF NOT EXISTS files (
+            message_id INTEGER PRIMARY KEY,
+            fileName TEXT NOT NULL,
+            mimetype TEXT,
+            file_id TEXT NOT NULL,
+            thumb_file_id TEXT,
+            size INTEGER,
+            date INTEGER NOT NULL,
+            share_token TEXT,
+            share_expires_at INTEGER,
+            folder_id INTEGER NOT NULL DEFAULT 1,
+            user_id INTEGER NOT NULL,
+            storage_type TEXT NOT NULL DEFAULT 'telegram',
+            UNIQUE(fileName, folder_id, user_id),
+            FOREIGN KEY (folder_id) REFERENCES folders(id) ON DELETE CASCADE,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        )`, (err) => {
+            if (err) console.error("建立 'files' 表失败:", err.message);
+            else {
+                console.log("'files' 表已确认存在。");
+                // 所有表结构都建立完毕后，再检查并建立管理员帐号
+                checkAndCreateAdmin();
+            }
+        });
     });
 }
 
@@ -87,7 +113,21 @@ function checkAndCreateAdmin() {
                     console.error("建立管理员帐号失败:", err.message);
                     return;
                 }
+                const adminId = this.lastID;
                 console.log(`管理员 '${adminUser}' 建立成功。`);
+                
+                db.get("SELECT * FROM folders WHERE user_id = ? AND parent_id IS NULL", [adminId], (err, root) => {
+                    if (err) {
+                        console.error("查询管理员根目录失败:", err.message);
+                        return;
+                    }
+                    if (!root) {
+                        db.run("INSERT INTO folders (name, parent_id, user_id) VALUES (?, NULL, ?)", ['/', adminId], (err) => {
+                            if(err) console.error("为管理员建立根目录失败:", err.message);
+                            else console.log("管理员根目录建立成功。");
+                        });
+                    }
+                });
             });
         } else {
             console.log("管理员帐号已存在。");
