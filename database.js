@@ -2,7 +2,13 @@ const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
 const fs = require('fs');
 
-const DATA_DIR = path.join(__dirname, '..', 'data');
+// --- 请加入这两行 ---
+const absoluteDataDir = path.join(__dirname, 'data');
+console.log(`[侦错资讯] 程式执行的绝对路径 (__dirname): ${__dirname}`);
+console.log(`[侦错资讯] 资料库应该位于这个资料夹: ${absoluteDataDir}`);
+// --- 侦错程式码结束 ---
+
+const DATA_DIR = path.join(__dirname, 'data'); // 将这里原本的路径改掉
 const DB_PATH = path.join(DATA_DIR, 'database.db');
 
 // 确保资料资料夹存在
