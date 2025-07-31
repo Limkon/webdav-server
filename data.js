@@ -104,7 +104,6 @@ function searchItems(query, userId) {
 }
 
 // --- 资料夹与档案操作 ---
-// **新生：判断是否为根目录**
 function isRootFolder(folderId, userId) {
     return new Promise((resolve, reject) => {
         const sql = "SELECT id FROM folders WHERE id = ? AND user_id = ? AND parent_id IS NULL";
@@ -319,7 +318,7 @@ async function moveItem(itemId, itemType, targetFolderId, userId, options = {}) 
         if (conflict && overwriteList.includes(fileToMove.fileName)) {
             const storage = require('./storage').getStorage();
             const filesToDelete = await getFilesByIds([conflict.message_id], userId);
-            // **最终修复：确保在移动前，先删除物理文件，再删除数据库记录**
+            
             if (filesToDelete.length > 0) {
                 await storage.remove(filesToDelete, [], userId);
             }
@@ -382,42 +381,35 @@ function deleteSingleFolder(folderId, userId) {
 async function getFolderDeletionData(folderId, userId) {
     let filesToDelete = [];
     let foldersToDeleteIds = [folderId];
+    const folderPath = await getFolderPath(folderId, userId);
+    const mountName = folderPath.length > 1 ? folderPath[1].name : null;
 
-    async function findContentsRecursive(currentFolderId) {
+
+    async function findContentsRecursive(currentFolderId, currentPath) {
         const sqlFiles = `SELECT * FROM files WHERE folder_id = ? AND user_id = ?`;
         const files = await new Promise((res, rej) => db.all(sqlFiles, [currentFolderId, userId], (err, rows) => err ? rej(err) : res(rows)));
         filesToDelete.push(...files);
         
-        const sqlFolders = `SELECT id FROM folders WHERE parent_id = ? AND user_id = ?`;
+        const sqlFolders = `SELECT id, name FROM folders WHERE parent_id = ? AND user_id = ?`;
         const subFolders = await new Promise((res, rej) => db.all(sqlFolders, [currentFolderId, userId], (err, rows) => err ? rej(err) : res(rows)));
         
         for (const subFolder of subFolders) {
-            foldersToDeleteIds.push(subFolder.id);
-            await findContentsRecursive(subFolder.id);
+            const newPath = path.posix.join(currentPath, subFolder.name);
+            foldersToDeleteIds.push({id: subFolder.id, path: newPath});
+            await findContentsRecursive(subFolder.id, newPath);
         }
     }
-
-    await findContentsRecursive(folderId);
-
-    const allUserFolders = await getAllFolders(userId);
-    const folderMap = new Map(allUserFolders.map(f => [f.id, f]));
     
-    function buildPath(fId) {
-        let pathParts = [];
-        let current = folderMap.get(fId);
-        while(current && current.parent_id) {
-            pathParts.unshift(current.name);
-            current = folderMap.get(current.parent_id);
-        }
-        return '/' + pathParts.join('/');
-    }
+    // 初始路径是WebDAV挂载点下的相对路径
+    const initialRelativePath = folderPath.slice(2).map(p => p.name).join('/');
+    const initialPathForDeletion = path.posix.join(mountName, initialRelativePath);
+    
+    // 把顶层文件夹信息加进去
+    foldersToDeleteIds = [{id: folderId, path: initialPathForDeletion }];
 
-    const foldersToDeleteWithPaths = foldersToDeleteIds.map(id => ({
-        id: id,
-        path: buildPath(id)
-    }));
+    await findContentsRecursive(folderId, initialPathForDeletion);
 
-    return { files: filesToDelete, folders: foldersToDeleteWithPaths };
+    return { files: filesToDelete, folders: foldersToDeleteIds };
 }
 
 
@@ -689,7 +681,6 @@ function findFileInFolder(fileName, folderId, userId) {
     });
 }
 
-// --- 新生：扫描专用函数 ---
 function findFileByFileId(fileId, userId) {
     return new Promise((resolve, reject) => {
         const sql = `SELECT message_id FROM files WHERE file_id = ? AND user_id = ?`;
@@ -700,7 +691,6 @@ function findFileByFileId(fileId, userId) {
     });
 }
 
-// 修：新增函数以直接获取根目录
 function getRootFolder(userId) {
     return new Promise((resolve, reject) => {
         db.get("SELECT id FROM folders WHERE user_id = ? AND parent_id IS NULL", [userId], (err, row) => {
@@ -711,49 +701,46 @@ function getRootFolder(userId) {
 }
 
 async function findOrCreateFolderByPath(fullPath, userId) {
-    // 修：确保能正确处理根目录 (fullPath 为 '/' 或 '')
+    const rootFolder = await getRootFolder(userId);
     if (!fullPath || fullPath === '/') {
-        const root = await getRootFolder(userId);
-        return root.id;
+        return rootFolder.id;
     }
 
     const pathParts = fullPath.split('/').filter(p => p);
-    let parentId = (await getRootFolder(userId)).id;
-
-    for (const part of pathParts) {
-        let folder = await findFolderByName(part, parentId, userId);
-        if (folder) {
-            parentId = folder.id;
-        } else {
-            console.log(`Creating folder '${part}' inside parent folder ${parentId} for user ${userId}`);
-            const result = await createFolder(part, parentId, userId);
-            parentId = result.id;
-        }
-    }
-    return parentId;
+    // *** 修正： findOrCreate 和 resolvePath 现在共用此核心逻辑 ***
+    return resolvePathToFolderId(rootFolder.id, pathParts, userId, true);
 }
 
-async function resolvePathToFolderId(startFolderId, pathParts, userId) {
+
+async function resolvePathToFolderId(startFolderId, pathParts, userId, createMissing = false) {
     let currentParentId = startFolderId;
+
+    // *** 修正：辨识 WebDAV 挂载点，并从正确的父资料夹开始 ***
+    const webdavConfigs = require('./storage').readConfig().webdav;
+    const isWebdavPath = pathParts.length > 0 && webdavConfigs.some(c => c.name === pathParts[0]);
+
+    if(isWebdavPath) {
+        const rootFolder = await getRootFolder(userId);
+        const webdavRootFolder = await findFolderByName(pathParts[0], rootFolder.id, userId);
+        if (webdavRootFolder) {
+            currentParentId = webdavRootFolder.id;
+            pathParts.shift(); // 移除路径中的挂载点名称部分
+        }
+    }
+
+
     for (const part of pathParts) {
         if (!part) continue;
 
-        let folder = await new Promise((resolve, reject) => {
-            const sql = `SELECT id FROM folders WHERE name = ? AND parent_id = ? AND user_id = ?`;
-            db.get(sql, [part, currentParentId, userId], (err, row) => err ? reject(err) : resolve(row));
-        });
+        let folder = await findFolderByName(part, currentParentId, userId);
 
         if (folder) {
             currentParentId = folder.id;
-        } else {
-            const newFolder = await new Promise((resolve, reject) => {
-                const sql = `INSERT INTO folders (name, parent_id, user_id) VALUES (?, ?, ?)`;
-                db.run(sql, [part, currentParentId, userId], function(err) {
-                    if (err) return reject(err);
-                    resolve({ id: this.lastID });
-                });
-            });
+        } else if (createMissing) {
+            const newFolder = await createFolder(part, currentParentId, userId);
             currentParentId = newFolder.id;
+        } else {
+             throw new Error(`路径部分未找到且未设定建立: ${part}`);
         }
     }
     return currentParentId;
@@ -800,7 +787,6 @@ module.exports = {
     resolvePathToFolderId,
     findFolderByPath,
     getDescendantFiles,
-    // --- 新生导出 ---
     findFileByFileId,
     findOrCreateFolderByPath,
     getRootFolder
