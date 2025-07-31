@@ -2,7 +2,7 @@ const db = require('./database.js');
 const crypto = require('crypto');
 const path = require('path');
 
-// --- 使用者管理 (基本不变) ---
+// --- 使用者管理 ---
 function createUser(username, hashedPassword) {
     return new Promise((resolve, reject) => {
         const sql = `INSERT INTO users (username, password, is_admin) VALUES (?, ?, 0)`;
@@ -405,9 +405,11 @@ function findFileByFileIdAndMount(fileId, mountId, userId) {
     });
 }
 
+// --- 关键修正 ---
 function getRootFolder(userId) {
     return new Promise((resolve, reject) => {
-        db.get("SELECT id FROM folders WHERE user_id = ? AND parent_id IS NULL", [userId], (err, row) => {
+        // 同时选择 id 和 user_id
+        db.get("SELECT id, user_id FROM folders WHERE user_id = ? AND parent_id IS NULL", [userId], (err, row) => {
             if (err) return reject(err);
             resolve(row);
         });
