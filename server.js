@@ -175,12 +175,11 @@ app.post('/api/admin/webdav', requireAdmin, async (req, res) => {
     }
 
     try {
-        // *** 关键修正开始 ***
         // 1. 先将设定储存到资料库，并取得 ID
         const dbResult = await data.saveOrUpdateWebdavMount({ 
             id: id ? parseInt(id) : null, 
             name, url, username, 
-            password: password || undefined // 如果密码为空则不传递，以避免覆盖旧密码
+            password: password || undefined 
         });
         const mountId = dbResult.id;
 
@@ -194,10 +193,9 @@ app.post('/api/admin/webdav', requireAdmin, async (req, res) => {
             mountConfig.password = password;
         }
 
-        if (existingIndex > -1) { // 更新
-            // 合并，只更新传入的栏位，特别是密码
+        if (existingIndex > -1) {
             config.webdavs[existingIndex] = { ...config.webdavs[existingIndex], ...mountConfig };
-        } else { // 新增
+        } else {
             config.webdavs.push(mountConfig);
         }
         
@@ -216,8 +214,7 @@ app.post('/api/admin/webdav', requireAdmin, async (req, res) => {
                 }
             }
         }
-        // *** 关键修正结束 ***
-
+        
         res.json({ success: true, message: 'WebDAV 设定已储存' });
     } catch (error) {
         console.error("储存 WebDAV 设定时发生错误:", error);
@@ -226,11 +223,16 @@ app.post('/api/admin/webdav', requireAdmin, async (req, res) => {
 });
 
 
-app.delete('/api/admin/webdav/:id', requireAdmin, (req, res) => {
+app.delete('/api/admin/webdav/:id', requireAdmin, async (req, res) => {
     const idToDelete = parseInt(req.params.id);
+    
+    // 从资料库删除
+    await db.run('DELETE FROM webdav_mounts WHERE id = ?', [idToDelete]);
+
+    // 从 config.json 删除
     const config = storageManager.readConfig();
     config.webdavs = config.webdavs.filter(w => w.id !== idToDelete);
-    // 注意：这里没有删除使用者根目录下对应的虚拟资料夹，以避免误删。
+    
     if (storageManager.writeConfig(config)) {
         res.json({ success: true, message: 'WebDAV 设定已删除' });
     } else {
@@ -274,31 +276,44 @@ app.post('/upload', requireLogin, async (req, res, next) => {
         relativePaths = [relativePaths];
     }
     
-    // 检查是否上传到根目录
     const rootFolder = await data.getRootFolder(userId);
     if (initialFolderId === rootFolder.id) {
         return res.status(403).json({ success: false, message: "无法直接上传到根目录，请选择一个挂载点。" });
     }
 
     try {
+        const initialFolderInfo = await data.getFolderInfo(initialFolderId, userId);
+        if (!initialFolderInfo || !initialFolderInfo.mount_id) {
+            throw new Error(`上传的初始资料夹无效或不属于任何挂载点。`);
+        }
+        const mountId = initialFolderInfo.mount_id;
+        const storage = storageManager.getStorage(mountId);
+
         for (let i = 0; i < req.files.length; i++) {
             const file = req.files[i];
             const tempFilePath = file.path;
             const relativePath = relativePaths[i];
 
             try {
-                const pathParts = (relativePath || file.originalname).split('/');
+                // *** 关键修正开始：重构寻找目标资料夹的逻辑 ***
+                const pathParts = (relativePath || file.originalname).split('/').filter(p => p);
                 const fileName = pathParts.pop() || file.originalname;
-                const folderPathParts = pathParts;
+                const folderPathParts = pathParts; // 档案所在的子目录路径
 
-                const fullFolderPath = '/' + (await data.getFolderPath(initialFolderId, userId)).slice(1).map(p => p.name).join('/') + '/' + folderPathParts.join('/');
-                const targetFolderId = await data.findOrCreateFolderByPath(fullFolderPath, userId);
+                let parentFolderId = initialFolderId;
 
-                const targetFolderInfo = await data.getFolderInfo(targetFolderId, userId);
-                if (!targetFolderInfo || !targetFolderInfo.mount_id) {
-                    throw new Error(`目标资料夹 ${targetFolderId} 无效或不属于任何挂载点。`);
+                // 逐层建立子目录
+                for (const part of folderPathParts) {
+                    let subFolder = await data.findFolderByName(part, parentFolderId, userId);
+                    if (subFolder) {
+                        parentFolderId = subFolder.id;
+                    } else {
+                        const result = await data.createFolder(part, parentFolderId, userId, mountId);
+                        parentFolderId = result.id;
+                    }
                 }
-                const storage = storageManager.getStorage(targetFolderInfo.mount_id);
+                const targetFolderId = parentFolderId;
+                // *** 关键修正结束 ***
                 
                 if (overwritePaths.includes(relativePath)) {
                     const existingFile = await data.findFileInFolder(fileName, targetFolderId, userId);
@@ -311,14 +326,15 @@ app.post('/upload', requireLogin, async (req, res, next) => {
                     }
                 }
 
-                await storage.upload(tempFilePath, fileName, file.mimetype, userId, targetFolderId, req.body.caption || '');
+                await storage.upload(tempFilePath, fileName, file.mimetype, userId, targetFolderId);
+
             } finally {
                 if (fs.existsSync(tempFilePath)) {
                     await fsp.unlink(tempFilePath).catch(err => console.error(`无法删除临时档: ${tempFilePath}`, err));
                 }
             }
         }
-        res.json({ success: true });
+        res.json({ success: true, message: '所有档案已上传成功。' });
     } catch (error) {
         console.error("Upload processing error:", error);
         res.status(500).json({ success: false, message: '处理上传时发生错误: ' + error.message });
