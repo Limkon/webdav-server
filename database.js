@@ -79,7 +79,7 @@ function createDependentTables() {
             share_expires_at INTEGER,
             folder_id INTEGER NOT NULL DEFAULT 1,
             user_id INTEGER NOT NULL,
-            storage_type TEXT NOT NULL DEFAULT 'telegram',
+            storage_type TEXT NOT NULL DEFAULT 'webdav',
             UNIQUE(fileName, folder_id, user_id),
             FOREIGN KEY (folder_id) REFERENCES folders(id) ON DELETE CASCADE,
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
