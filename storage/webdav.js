@@ -5,34 +5,18 @@ const crypto = require('crypto');
 const fsp = require('fs').promises;
 const path = require('path');
 
-// 这个 client 将只用于写入和删除等非流式操作
-let client = null;
+// --- 关键修改：移除单一 client 实例 ---
+// let client = null; // 不再需要
 
-// 封装一个获取配置的函数，避免重复代码
-function getWebdavConfig() {
-    const storageManager = require('./index'); 
-    const config = storageManager.readConfig();
-    const webdavConfig = config.webdav && Array.isArray(config.webdav) ? config.webdav[0] : config.webdav;
+// --- 新增：根据设定动态创建 client ---
+function getClientForConfig(webdavConfig) {
     if (!webdavConfig || !webdavConfig.url) {
-        throw new Error('WebDAV 设定不完整或未设定');
+        throw new Error('WebDAV 设定不完整或未提供');
     }
-    return webdavConfig;
-}
-
-
-function getClient() {
-    if (!client) {
-        const webdavConfig = getWebdavConfig();
-        client = createClient(webdavConfig.url, {
-            username: webdavConfig.username,
-            password: webdavConfig.password
-        });
-    }
-    return client;
-}
-
-function resetClient() {
-    client = null;
+    return createClient(webdavConfig.url, {
+        username: webdavConfig.username,
+        password: webdavConfig.password
+    });
 }
 
 async function getFolderPath(folderId, userId) {
@@ -40,23 +24,29 @@ async function getFolderPath(folderId, userId) {
         db.get("SELECT id FROM folders WHERE user_id = ? AND parent_id IS NULL", [userId], (err, row) => {
             if (err) return reject(err);
             if (!row) return reject(new Error('找不到使用者根目录'));
-            resolve(row);
+            resolve(row.id);
         });
     });
 
-    if (folderId === userRoot.id) return '/';
+    if (folderId === userRoot) return '/';
     
     const pathParts = await data.getFolderPath(folderId, userId);
-    return '/' + pathParts.slice(1).map(p => p.name).join('/');
+    // 移除代表 WebDAV 挂载点的第一层目录
+    return '/' + pathParts.slice(2).map(p => p.name).join('/');
 }
 
+
 async function upload(tempFilePath, fileName, mimetype, userId, folderId) {
-    const client = getClient();
+    const webdavConfig = await data.getWebdavConfigForFolder(folderId, userId);
+    if (!webdavConfig) throw new Error('无法找到此目录关联的 WebDAV 设定');
+
+    const client = getClientForConfig(webdavConfig);
     const folderPath = await getFolderPath(folderId, userId);
-    const remotePath = (folderPath === '/' ? '' : folderPath) + '/' + fileName;
+    const remotePath = path.posix.join(folderPath, fileName);
     
     if (folderPath && folderPath !== "/") {
         try {
+            // WebDAV 远端伺服器上不需要递归创建挂载点名称
             await client.createDirectory(folderPath, { recursive: true });
         } catch (e) {
             if (e.response && (e.response.status !== 405 && e.response.status !== 501)) {
@@ -80,80 +70,76 @@ async function upload(tempFilePath, fileName, mimetype, userId, folderId) {
         fileName,
         mimetype,
         size: stat.size,
-        file_id: remotePath,
+        file_id: remotePath, // 储存相对于 WebDAV 根的路径
         date: new Date(stat.lastmod).getTime(),
-    }, folderId, userId, 'webdav');
+    }, folderId, userId, 'webdav', webdavConfig.id); // 传入 webdav_config_id
     
     return { success: true, message: '档案已上传至 WebDAV。', fileId: dbResult.fileId };
 }
 
-
 async function remove(files, folders, userId) {
-    const client = getClient();
     const results = { success: true, errors: [] };
+    const itemsByConfig = new Map();
 
-    // 1. 创建统一的待删除项目列表
-    const allItemsToDelete = [];
-    
-    files.forEach(file => {
-        let p = file.file_id.startsWith('/') ? file.file_id : '/' + file.file_id;
-        allItemsToDelete.push({ 
-            path: path.posix.normalize(p), 
-            type: 'file' 
-        });
-    });
-    
-    folders.forEach(folder => {
-        if (folder.path && folder.path !== '/') {
-            let p = folder.path.startsWith('/') ? folder.path : '/' + folder.path;
-            if (!p.endsWith('/')) {
-                p += '/';
-            }
-            allItemsToDelete.push({ path: p, type: 'folder' });
+    // 1. 按 webdav_config_id 分组
+    for (const file of files) {
+        if (!itemsByConfig.has(file.webdav_config_id)) {
+            itemsByConfig.set(file.webdav_config_id, []);
         }
-    });
+        itemsByConfig.get(file.webdav_config_id).push({ path: file.file_id, type: 'file' });
+    }
+    for (const folder of folders) {
+         if (!itemsByConfig.has(folder.webdav_config_id)) {
+            itemsByConfig.set(folder.webdav_config_id, []);
+        }
+        itemsByConfig.get(folder.webdav_config_id).push({ path: folder.path, type: 'folder' });
+    }
 
-    // 2. 按路径深度降序排序，确保先删除子项
-    allItemsToDelete.sort((a, b) => b.path.length - a.path.length);
+    // 2. 为每个 WebDAV 设定分别执行删除
+    for (const [configId, items] of itemsByConfig.entries()) {
+        const webdavConfig = await data.getWebdavConfigById(configId, userId);
+        if (!webdavConfig) {
+            results.errors.push(`找不到 ID 为 ${configId} 的 WebDAV 设定`);
+            continue;
+        }
+        const client = getClientForConfig(webdavConfig);
+        items.sort((a, b) => b.path.length - a.path.length); // 确保先删子项
 
-    // 3. 依次执行删除
-    for (const item of allItemsToDelete) {
-        try {
-            // **最终勘误**：无论是档案还是资料夹，都统一使用 `deleteFile` 函数。
-            // WebDAV 服务器会根据路径是否以 '/' 结尾来区分档案和资料夹。
-            await client.deleteFile(item.path);
-        } catch (error) {
-            if (!(error.response && error.response.status === 404)) {
-                const errorMessage = `删除 WebDAV ${item.type} [${item.path}] 失败: ${error.message}`;
-                results.errors.push(errorMessage);
-                results.success = false;
+        for (const item of items) {
+            try {
+                // 如果是资料夹，确保路径以 '/' 结尾
+                let deletePath = item.path;
+                if (item.type === 'folder' && !deletePath.endsWith('/')) {
+                    deletePath += '/';
+                }
+                await client.deleteFile(deletePath);
+            } catch (error) {
+                if (!(error.response && error.response.status === 404)) {
+                    const errorMessage = `从 [${webdavConfig.mount_name}] 删除 [${item.path}] 失败: ${error.message}`;
+                    results.errors.push(errorMessage);
+                    results.success = false;
+                }
             }
         }
     }
-
     return results;
 }
 
-// 为每个流操作创建一个完全独立的客户端实例，以解决文件锁问题
-async function stream(file_id, userId) {
-    const webdavConfig = getWebdavConfig();
-    const streamClient = createClient(webdavConfig.url, {
-        username: webdavConfig.username,
-        password: webdavConfig.password
-    });
+async function stream(file_id, userId, webdavConfigId) {
+    const webdavConfig = await data.getWebdavConfigById(webdavConfigId, userId);
+    const streamClient = getClientForConfig(webdavConfig);
     return streamClient.createReadStream(path.posix.join('/', file_id));
 }
 
-async function getUrl(file_id, userId) {
-    const client = getClient();
+async function getUrl(file_id, userId, webdavConfigId) {
+    const webdavConfig = await data.getWebdavConfigById(webdavConfigId, userId);
+    const client = getClientForConfig(webdavConfig);
     return client.getFileDownloadLink(path.posix.join('/', file_id));
 }
 
-// --- *** 新增函数 *** ---
-async function createDirectory(fullPath) {
-    const client = getClient();
+async function createDirectory(fullPath, webdavConfig) {
+    const client = getClientForConfig(webdavConfig);
     try {
-        // 确保路径以斜线开头且规范化
         const remotePath = path.posix.join('/', fullPath);
         if (await client.exists(remotePath)) {
             return true;
@@ -161,13 +147,12 @@ async function createDirectory(fullPath) {
         await client.createDirectory(remotePath, { recursive: true });
         return true;
     } catch (e) {
-        // 忽略目录已存在的错误 (405 Method Not Allowed 是一个常见响应)
         if (e.response && (e.response.status === 405 || e.response.status === 501)) {
             return true;
         }
         throw new Error(`建立 WebDAV 目录失败: ${e.message}`);
     }
 }
-// --- *** 新增函数结束 *** ---
 
-module.exports = { upload, remove, getUrl, stream, resetClient, getClient, createDirectory, type: 'webdav' };
+// 移除 resetClient 和 getClient，因为 client 是动态的
+module.exports = { upload, remove, getUrl, stream, createDirectory, type: 'webdav' };
