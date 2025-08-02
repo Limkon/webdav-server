@@ -368,7 +368,6 @@ app.post('/upload', requireLogin, async (req, res, next) => {
         res.status(500).json({ success: false, message: '处理上传时发生错误: ' + error.message });
     }
 });
-
 app.post('/api/text-file', requireLogin, async (req, res) => {
     const { mode, fileId, folderId, fileName, content } = req.body;
     const userId = req.session.userId;
@@ -512,14 +511,14 @@ app.get('/api/folder/:id', requireLogin, async (req, res) => {
         const contents = await data.getFolderContents(folderId, req.session.userId);
         const path = await data.getFolderPath(folderId, req.session.userId);
         res.json({ contents, path });
-    } catch (error) { res.status(500).json({ success: false, message: '读取资料夹内容失败。' }); }
+    } catch (error) { res.status(500).json({ success: false, message: '读取资料夾内容失败。' }); }
 });
 
 app.post('/api/folder', requireLogin, async (req, res) => {
     const { name, parentId } = req.body;
     const userId = req.session.userId;
     if (!name || !parentId) {
-        return res.status(400).json({ success: false, message: '缺少资料夹名称或父 ID。' });
+        return res.status(400).json({ success: false, message: '缺少资料夾名称或父 ID。' });
     }
     
     try {
@@ -531,7 +530,7 @@ app.post('/api/folder', requireLogin, async (req, res) => {
         const result = await data.createFolder(name, parentId, userId);
         
         const storage = storageManager.getStorage();
-        if (storage.type === 'webdav' && storage.createDirectory) {
+        if (storage.createDirectory) {
             const newFolderPathParts = await data.getFolderPath(result.id, userId);
             const newFullPath = path.posix.join(...newFolderPathParts.slice(1).map(p => p.name));
             await storage.createDirectory(newFullPath);
@@ -562,6 +561,7 @@ app.post('/api/move', requireLogin, async (req, res) => {
         let totalSkipped = 0;
         const errors = [];
         
+        // This logic is simplified; a more robust solution might handle all items in one transaction.
         for (const itemId of itemIds) {
             try {
                 const items = await data.getItemsByIds([itemId], userId);
@@ -636,6 +636,8 @@ app.post('/rename', requireLogin, async (req, res) => {
     }
 });
 
+// Removed thumbnail route as it was Telegram-specific
+
 app.get('/download/proxy/:message_id', requireLogin, async (req, res) => {
     try {
         const messageId = parseInt(req.params.message_id, 10);
@@ -708,8 +710,8 @@ app.post('/api/download-archive', requireLogin, async (req, res) => {
         archive.pipe(res);
 
         for (const file of filesToArchive) {
-            const stream = await storage.stream(file.file_id, userId);
-            archive.append(stream, { name: file.path });
+             const stream = await storage.stream(file.file_id, userId);
+             archive.append(stream, { name: file.path });
         }
         await archive.finalize();
     } catch (error) {
@@ -881,8 +883,11 @@ app.get('/share/download/file/:token', async (req, res) => {
 
         const stream = await storage.stream(fileInfo.file_id, fileInfo.user_id);
         handleStream(stream, res);
+
     } catch (error) { res.status(500).send('下载失败'); }
 });
+
+// Removed shared thumbnail route
 
 app.get('/share/download/:folderToken/:fileId', async (req, res) => {
     try {
