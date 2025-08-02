@@ -1,129 +1,71 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-Hant">
 <head>
     <meta charset="UTF-8">
-    <title>数据扫描</title>
-    <link rel="stylesheet" href="/css/styles.css">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>文件扫描与汇入</title>
+    <link rel="stylesheet" href="/vendor/fontawesome/css/all.min.css">
+    <link rel="stylesheet" href="/manager.css">
     <style>
-        body { font-family: sans-serif; }
-        .container { max-width: 800px; margin: 2rem auto; padding: 2rem; border: 1px solid #ccc; border-radius: 8px; }
-        .form-container { display: flex; flex-direction: column; gap: 1rem; margin-bottom: 2rem; }
-        .form-group { display: flex; flex-direction: column; }
-        .form-control { padding: 0.5rem; border-radius: 4px; border: 1px solid #ccc; }
-        .btn { padding: 0.75rem; border: none; border-radius: 4px; cursor: pointer; }
-        .btn-primary { background-color: #007bff; color: white; }
-        .btn-primary:disabled { background-color: #ccc; }
-        .log-container { background-color: #f4f4f4; border: 1px solid #ddd; padding: 1rem; min-height: 200px; white-space: pre-wrap; word-wrap: break-word; }
+        .setting-card {
+            margin-bottom: 20px;
+        }
+        #scan-log {
+            background-color: #212529;
+            color: #f8f9fa;
+            font-family: 'Courier New', Courier, monospace;
+            padding: 15px;
+            border-radius: 5px;
+            height: 400px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            font-size: 14px;
+        }
+        #scan-log .log-info { color: #adb5bd; }
+        #scan-log .log-success { color: #28a745; }
+        #scan-log .log-warn { color: #ffc107; }
+        #scan-log .log-error { color: #dc3545; }
+        .scan-controls {
+            display: flex;
+            gap: 15px;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+        .scan-controls select, .scan-controls button {
+            padding: 10px;
+            font-size: 16px;
+        }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>数据扫描与汇入</h1>
-        <div class="form-container">
-            <div class="form-group">
-                <label for="user-select">选择用户:</label>
-                <select id="user-select" class="form-control"></select>
+        <header class="main-header">
+            <h1>文件扫描与汇入</h1>
+            <a href="/admin" class="upload-link-btn"><i class="fas fa-arrow-left"></i> 返回管理后台</a>
+        </header>
+
+        <div class="setting-card">
+            <h2>扫描控制器</h2>
+            <p>选择要将文件汇入的使用者，然后开始扫描 WebDAV 服务器。系统会自动跳过数据库中已存在的记录。</p>
+            <div class="scan-controls">
+                <label for="user-select">汇入到使用者：</label>
+                <select id="user-select">
+                    <option value="">正在加载使用者...</option>
+                </select>
+                <button id="scan-webdav-btn" class="upload-link-btn" style="background-color: #17a2b8;">
+                    <i class="fas fa-server"></i> 扫描 WebDAV
+                </button>
             </div>
-            <div class="form-group">
-                <label for="mount-select">选择要扫描的 WebDAV 挂载点:</label>
-                <select id="mount-select" class="form-control"></select>
-            </div>
-            <button id="scan-btn" class="btn btn-primary">开始扫描</button>
         </div>
-        <div class="log-container">
-            <h3>扫描日志:</h3>
-            <pre id="log-output"></pre>
+        
+        <div class="setting-card">
+            <h2>扫描日志</h2>
+            <div id="scan-log">等待操作...</div>
         </div>
+
     </div>
-    <script>
-        document.addEventListener('DOMContentLoaded', function() {
-            const userSelect = document.getElementById('user-select');
-            const mountSelect = document.getElementById('mount-select');
-            const scanBtn = document.getElementById('scan-btn');
-            const logOutput = document.getElementById('log-output');
-
-            // 获取所有用户
-            fetch('/api/admin/all-users')
-                .then(res => res.json())
-                .then(users => {
-                    if (!users || users.length === 0) {
-                        const option = document.createElement('option');
-                        option.textContent = '没有可用的用户';
-                        option.disabled = true;
-                        userSelect.appendChild(option);
-                        scanBtn.disabled = true;
-                        return;
-                    }
-                    users.forEach(user => {
-                        const option = document.createElement('option');
-                        option.value = user.id;
-                        option.textContent = user.username;
-                        userSelect.appendChild(option);
-                    });
-                })
-                .catch(err => {
-                    logOutput.textContent = '加载用户列表失败: ' + err.message;
-                });
-
-            // 获取所有WebDAV挂载点
-            fetch('/api/admin/webdav')
-                .then(res => res.json())
-                .then(mounts => {
-                    if (!mounts || mounts.length === 0) {
-                        const option = document.createElement('option');
-                        option.textContent = '没有可用的 WebDAV 挂载点';
-                        option.disabled = true;
-                        mountSelect.appendChild(option);
-                        scanBtn.disabled = true;
-                    } else {
-                        mounts.forEach(mount => {
-                            const option = document.createElement('option');
-                            option.value = mount.id;
-                            option.textContent = mount.mount_name;
-                            mountSelect.appendChild(option);
-                        });
-                    }
-                })
-                .catch(err => {
-                    logOutput.textContent = '加载挂载点列表失败: ' + err.message;
-                });
-
-            scanBtn.addEventListener('click', () => {
-                const userId = userSelect.value;
-                const mountId = mountSelect.value;
-                if (!userId || !mountId || userSelect.options[userSelect.selectedIndex]?.disabled || mountSelect.options[mountSelect.selectedIndex]?.disabled) {
-                    alert('请选择有效的用户和挂载点。');
-                    return;
-                }
-
-                logOutput.textContent = '准备开始扫描...\n';
-                scanBtn.disabled = true;
-
-                fetch('/api/scan/webdav', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ userId, mountId })
-                })
-                .then(async (res) => {
-                    const data = await res.json();
-                    if (data.log) {
-                        data.log.forEach(entry => {
-                            logOutput.textContent += `[${entry.type.toUpperCase()}] ${entry.message}\n`;
-                        });
-                    }
-                    if (!res.ok) {
-                       logOutput.textContent += `\n错误: ${data.message || res.statusText}\n`;
-                    }
-                })
-                .catch(err => {
-                    logOutput.textContent += `\n发生严重错误: ${err.message}\n`;
-                })
-                .finally(() => {
-                    logOutput.textContent += '\n操作完成。\n';
-                    scanBtn.disabled = false;
-                });
-            });
-        });
-    </script>
+    <script src="/vendor/axios/axios.min.js"></script>
+    <script src="/scan.js"></script>
 </body>
 </html>
