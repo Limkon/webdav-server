@@ -368,6 +368,7 @@ app.post('/upload', requireLogin, async (req, res, next) => {
         res.status(500).json({ success: false, message: '处理上传时发生错误: ' + error.message });
     }
 });
+
 app.post('/api/text-file', requireLogin, async (req, res) => {
     const { mode, fileId, folderId, fileName, content } = req.body;
     const userId = req.session.userId;
@@ -549,6 +550,7 @@ app.get('/api/folders', requireLogin, async (req, res) => {
 });
 
 app.post('/api/move', requireLogin, async (req, res) => {
+    console.log(`[DEBUG] [server.js /api/move] Received request. Body:`, req.body);
     try {
         const { itemIds, targetFolderId, resolutions = {} } = req.body;
         const userId = req.session.userId;
@@ -561,17 +563,19 @@ app.post('/api/move', requireLogin, async (req, res) => {
         let totalSkipped = 0;
         const errors = [];
         
-        // This logic is simplified; a more robust solution might handle all items in one transaction.
         for (const itemId of itemIds) {
+            console.log(`[DEBUG] [server.js /api/move] Processing item ID: ${itemId}`);
             try {
                 const items = await data.getItemsByIds([itemId], userId);
                 if (items.length === 0) {
+                    console.log(`[DEBUG] [server.js /api/move] Item ID ${itemId} not found. Skipping.`);
                     totalSkipped++;
                     continue; 
                 }
                 
                 const item = items[0];
                 const report = await data.moveItem(item.id, item.type, targetFolderId, userId, { resolutions });
+                console.log(`[DEBUG] [server.js /api/move] Report for item ${itemId}:`, report);
                 totalMoved += report.moved;
                 totalSkipped += report.skipped;
                 if (report.errors > 0) {
@@ -579,6 +583,7 @@ app.post('/api/move', requireLogin, async (req, res) => {
                 }
 
             } catch (err) {
+                console.error(`[DEBUG] [server.js /api/move] CATCH block for item ID ${itemId}:`, err);
                 errors.push(err.message);
             }
         }
@@ -593,10 +598,11 @@ app.post('/api/move', requireLogin, async (req, res) => {
         } else if (totalMoved > 0) {
             message = `${totalMoved} 个项目移动成功。`;
         }
-
+        console.log(`[DEBUG] [server.js /api/move] Final response message: "${message}"`);
         res.json({ success: errors.length === 0, message: message });
 
     } catch (error) { 
+        console.error(`[DEBUG] [server.js /api/move] TOP LEVEL CATCH block:`, error);
         res.status(500).json({ success: false, message: '移动失败：' + error.message }); 
     }
 });
@@ -615,6 +621,7 @@ app.post('/delete-multiple', requireLogin, async (req, res) => {
 
 
 app.post('/rename', requireLogin, async (req, res) => {
+    console.log(`[DEBUG] [server.js /rename] Received request. Body:`, req.body);
     try {
         const { id, newName, type } = req.body;
         const userId = req.session.userId;
@@ -630,8 +637,10 @@ app.post('/rename', requireLogin, async (req, res) => {
         } else {
             return res.status(400).json({ success: false, message: '无效的项目类型。'});
         }
+        console.log(`[DEBUG] [server.js /rename] Operation successful. Result:`, result);
         res.json(result);
     } catch (error) { 
+        console.error(`[DEBUG] [server.js /rename] CATCH block:`, error);
         res.status(500).json({ success: false, message: '重命名失败: ' + error.message }); 
     }
 });
