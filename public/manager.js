@@ -27,8 +27,11 @@ document.addEventListener('DOMContentLoaded', () => {
     const confirmMoveBtn = document.getElementById('confirmMoveBtn');
     const cancelMoveBtn = document.getElementById('cancelMoveBtn');
     const conflictModal = document.getElementById('conflictModal');
+    const conflictModalTitle = document.getElementById('conflictModalTitle');
     const conflictFileName = document.getElementById('conflictFileName');
     const conflictOptions = document.getElementById('conflictOptions');
+    const applyToAllContainer = document.getElementById('applyToAllContainer');
+    const applyToAllCheckbox = document.getElementById('applyToAllCheckbox');
     const folderConflictModal = document.getElementById('folderConflictModal');
     const folderConflictName = document.getElementById('folderConflictName');
     const folderConflictOptions = document.getElementById('folderConflictOptions');
@@ -114,7 +117,11 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (!isDrag) {
                     uploadModal.style.display = 'none';
                 }
-                showNotification('上传成功！', 'success');
+                if (res.data.skippedAll) {
+                    showNotification('没有文件被上传，所有冲突的项目都已被跳过。', 'info');
+                } else {
+                    showNotification('上传成功！', 'success');
+                }
                 fileInput.value = '';
                 folderInput.value = '';
                 loadFolderContents(currentFolderId);
@@ -142,6 +149,7 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
 
+        // 总是上传所有由使用者选择的文件
         const fileObjects = Array.from(files).filter(f => f.name);
         const filesToCheck = fileObjects.map(f => ({
             relativePath: f.webkitRelativePath || f.name
@@ -152,54 +160,30 @@ document.addEventListener('DOMContentLoaded', () => {
             const res = await axios.post('/api/check-existence', { files: filesToCheck, folderId: targetFolderId });
             existenceData = res.data.files;
         } catch (error) {
-            showNotification(error.response?.data?.message || '检查文件是否存在时出错。', 'error', !isDrag ? null : uploadNotificationArea);
+            showNotification(error.response?.data?.message || '检查文件是否存在时出错。', 'error', !isDrag ? uploadNotificationArea : null);
             return;
         }
     
-        let filesToUpload = [];
-        let pathsToOverwrite = [];
-        const conflicts = [];
-        const nonConflicts = [];
-    
-        for (const file of fileObjects) {
-            const relativePath = file.webkitRelativePath || file.name;
-            const existing = existenceData.find(f => f.relativePath === relativePath && f.exists);
-            if (existing) {
-                conflicts.push(file);
-            } else {
-                nonConflicts.push(file);
-            }
-        }
-        
-        filesToUpload.push(...nonConflicts);
+        const resolutions = {};
+        const conflicts = existenceData.filter(f => f.exists).map(f => f.relativePath);
     
         if (conflicts.length > 0) {
-            const conflictNames = conflicts.map(f => f.webkitRelativePath || f.name);
-            const conflictResult = await handleConflict(conflictNames, '上传');
-            if (conflictResult.action === 'abort') {
-                 if (filesToUpload.length === 0) {
-                    showNotification('上传操作已取消。', 'info', !isDrag ? uploadNotificationArea : null);
-                    return;
-                }
-            } else {
-                pathsToOverwrite = conflictResult.overwriteList;
-                const filesToMaybeUpload = conflicts.filter(f => pathsToOverwrite.includes(f.webkitRelativePath || f.name));
-                filesToUpload.push(...filesToMaybeUpload);
+            const conflictResult = await handleConflict(conflicts, '档案');
+            if (conflictResult.aborted) {
+                showNotification('上传操作已取消。', 'info', !isDrag ? uploadNotificationArea : null);
+                return;
             }
-        }
-    
-        if (filesToUpload.length === 0) {
-            showNotification('没有文件被上传。', 'success', !isDrag ? uploadNotificationArea : null);
-            return;
+            Object.assign(resolutions, conflictResult.resolutions);
         }
     
         const formData = new FormData();
-        filesToUpload.forEach(file => {
+        fileObjects.forEach(file => {
             formData.append('files', file);
             formData.append('relativePaths', file.webkitRelativePath || file.name);
         });
+        
         formData.append('folderId', targetFolderId);
-        formData.append('overwritePaths', JSON.stringify(pathsToOverwrite));
+        formData.append('resolutions', JSON.stringify(resolutions)); // 将解决方案发送给服务器
     
         const captionInput = document.getElementById('uploadCaption');
         if (captionInput && captionInput.value && !isDrag) {
@@ -277,8 +261,8 @@ document.addEventListener('DOMContentLoaded', () => {
         const allItems = [...folders, ...files];
         
         if (allItems.length === 0) {
-            if (currentView === 'grid') parentGrid.innerHTML = isSearchMode ? '<p>找不到符合条件的文件。</p>' : '<p>这个资料夹是空的。</p>';
-            else parentList.innerHTML = isSearchMode ? '<div class="list-item"><p>找不到符合条件的文件。</p></div>' : '<div class="list-item"><p>这个资料夹是空的。</p></div>';
+            if (currentView === 'grid') parentGrid.innerHTML = isSearchMode ? '<p>找不到符合条件的文件。</p>' : '<p>这个资料夾是空的。</p>';
+            else parentList.innerHTML = isSearchMode ? '<div class="list-item"><p>找不到符合条件的文件。</p></div>' : '<div class="list-item"><p>这个资料夾是空的。</p></div>';
             return;
         }
 
@@ -411,7 +395,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
             foldersLoaded = true;
         } catch (error) {
-            console.error('加载资料夹列表失败', error);
+            console.error('加载资料夾列表失败', error);
         }
     };
     
@@ -444,6 +428,48 @@ document.addEventListener('DOMContentLoaded', () => {
                 resolve(action);
             };
         });
+    }
+
+    async function handleConflict(conflicts, operationType = '档案') {
+        const resolutions = {};
+        let applyToAllAction = null;
+        let aborted = false;
+
+        for (const conflictName of conflicts) {
+            if (applyToAllAction) {
+                resolutions[conflictName] = applyToAllAction;
+                continue;
+            }
+
+            const action = await new Promise((resolve) => {
+                conflictModalTitle.textContent = `${operationType}冲突`;
+                conflictFileName.textContent = conflictName;
+                applyToAllContainer.style.display = conflicts.length > 1 ? 'block' : 'none';
+                applyToAllCheckbox.checked = false;
+                conflictModal.style.display = 'flex';
+
+                conflictOptions.onclick = (e) => {
+                    const chosenAction = e.target.dataset.action;
+                    if (!chosenAction) return;
+
+                    conflictModal.style.display = 'none';
+                    conflictOptions.onclick = null;
+                    
+                    if (applyToAllCheckbox.checked) {
+                        applyToAllAction = chosenAction;
+                    }
+                    resolve(chosenAction);
+                };
+            });
+
+            if (action === 'abort') {
+                aborted = true;
+                break;
+            }
+            resolutions[conflictName] = action;
+        }
+
+        return { aborted, resolutions };
     }
 
     const checkScreenWidthAndCollapse = () => {
@@ -664,7 +690,8 @@ document.addEventListener('DOMContentLoaded', () => {
             const lastPart = pathParts.filter(p => p).pop();
             let folderId = parseInt(lastPart, 10);
             if (isNaN(folderId)) {
-                folderId = 1; 
+                const rootFolderLink = document.querySelector('.breadcrumb a');
+                folderId = rootFolderLink ? parseInt(rootFolderLink.dataset.folderId) : 1;
             }
             loadFolderContents(folderId);
         }
@@ -675,9 +702,7 @@ document.addEventListener('DOMContentLoaded', () => {
             if (name && name.trim()) {
                 try {
                     await axios.post('/api/folder', { name: name.trim(), parentId: currentFolderId });
-                    
                     foldersLoaded = false; 
-
                     loadFolderContents(currentFolderId);
                 } catch (error) { alert(error.response?.data?.message || '建立失败'); }
             }
@@ -829,10 +854,9 @@ document.addEventListener('DOMContentLoaded', () => {
                 else foldersToDelete.push(parseInt(id));
             });
             try {
-                if (filesToDelete.length > 0) await axios.post('/delete-multiple', { messageIds: filesToDelete });
-                for (const folderId of foldersToDelete) await axios.post('/api/folder/delete', { folderId });
+                await axios.post('/delete-multiple', { messageIds: filesToDelete, folderIds: foldersToDelete });
                 loadFolderContents(currentFolderId);
-            } catch (error) { alert('删除失败，请重试。'); }
+            } catch (error) { alert('删除失败: ' + (error.response?.data?.message || '请重试。')); }
         });
     }
 
@@ -893,7 +917,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 moveModal.style.display = 'flex';
                 moveTargetFolderId = null;
                 confirmMoveBtn.disabled = true;
-            } catch { alert('无法获取资料夹列表。'); }
+            } catch { alert('无法获取资料夾列表。'); }
         });
     }
     if (folderTree) {
@@ -908,130 +932,105 @@ document.addEventListener('DOMContentLoaded', () => {
             confirmMoveBtn.disabled = false;
         });
     }
-
-    async function handleConflict(conflicts, operation = '移动') {
-        let overwriteList = [];
-        let i = 0;
     
-        function showNextConflict() {
-            return new Promise((resolve) => {
-                if (i >= conflicts.length) {
-                    resolve({ action: 'finish', overwriteList });
-                    return;
-                }
-    
-                conflictFileName.textContent = conflicts[i];
-                conflictModal.style.display = 'flex';
-    
-                conflictOptions.onclick = (e) => {
-                    const action = e.target.dataset.action;
-                    if (!action) return;
-    
-                    conflictModal.style.display = 'none';
-                    conflictOptions.onclick = null; 
-    
-                    if (action === 'overwrite') {
-                        overwriteList.push(conflicts[i]);
-                        i++;
-                        resolve(showNextConflict());
-                    } else if (action === 'overwrite_all') {
-                        overwriteList = [...overwriteList, ...conflicts.slice(i)];
-                        resolve({ action: 'finish', overwriteList });
-                    } else if (action === 'skip') {
-                        i++;
-                        resolve(showNextConflict());
-                    } else if (action === 'skip_all') {
-                         resolve({ action: 'finish', overwriteList: overwriteList });
-                    } else if (action === 'abort') {
-                        resolve({ action: 'abort' });
-                    }
-                };
-            });
-        }
-        return showNextConflict();
-    }
-
+    // *** 关键修正：重构移动确认逻辑以处理嵌套冲突 ***
     if (confirmMoveBtn) {
         confirmMoveBtn.addEventListener('click', async () => {
             if (!moveTargetFolderId) return;
     
-            const itemIds = Array.from(selectedItems.keys()).map(id => parseInt(id, 10));
-            
-            try {
+            const resolutions = {};
+            let isAborted = false;
+    
+            // 递归函数，用于检查并解决各层级的冲突
+            async function resolveConflictsRecursively(itemsToMove, currentTargetFolderId, pathPrefix = '') {
+                if (isAborted) return;
+    
+                // 1. 获取当前层级的冲突
                 const conflictCheckRes = await axios.post('/api/check-move-conflict', {
-                    itemIds: itemIds,
-                    targetFolderId: moveTargetFolderId
+                    itemIds: itemsToMove.map(item => item.id),
+                    targetFolderId: currentTargetFolderId
                 });
-    
                 const { fileConflicts, folderConflicts } = conflictCheckRes.data;
-                
-                let fileOverwriteList = [];
-                let folderMergeList = [];
-                const itemsToMove = Array.from(selectedItems.values());
-                let finalItemIds = [...itemIds];
     
-                if (folderConflicts.length > 0) {
-                    for (const folderName of folderConflicts) {
-                        const action = await handleFolderConflict(folderName);
-                        if (action === 'merge') {
-                            folderMergeList.push(folderName);
-                        } else if (action === 'skip') {
-                            const folderToSkip = itemsToMove.find(item => item.name === folderName && item.type === 'folder');
-                            const idToSkip = Array.from(selectedItems.keys())[itemsToMove.indexOf(folderToSkip)];
-                            finalItemIds = finalItemIds.filter(id => id !== parseInt(idToSkip));
-                        } else { // abort
-                            moveModal.style.display = 'none';
-                            return;
-                        }
-                    }
-                }
-                
-                if (fileConflicts.length > 0) {
-                    const result = await handleConflict(fileConflicts, '移动');
-                     if (result.action === 'abort') {
-                        showNotification('移动操作已取消。', 'info');
-                        moveModal.style.display = 'none';
+                // 为了能递归检查，需获取目标资料夹中子资料夹的 ID
+                const destFolderContentsRes = await axios.get(`/api/folder/${currentTargetFolderId}`);
+                const destFolderMap = new Map(destFolderContentsRes.data.contents.folders.map(f => [f.name, f.id]));
+    
+                // 2. 优先处理资料夹冲突
+                for (const folderName of folderConflicts) {
+                    const fullPath = pathPrefix ? `${pathPrefix}/${folderName}` : folderName;
+                    const action = await handleFolderConflict(fullPath);
+    
+                    if (action === 'abort') {
+                        isAborted = true;
                         return;
                     }
-                    fileOverwriteList = result.overwriteList;
+                    resolutions[fullPath] = action;
+    
+                    // 如果使用者选择合并，则递归检查该资料夹内部的冲突
+                    if (action === 'merge') {
+                        const sourceFolder = itemsToMove.find(item => item.name === folderName && item.type === 'folder');
+                        const destSubFolderId = destFolderMap.get(folderName);
+                        if (sourceFolder && destSubFolderId) {
+                            const sourceSubFolderContentsRes = await axios.get(`/api/folder/${sourceFolder.id}`);
+                            const subItemsToMove = [...sourceSubFolderContentsRes.data.contents.folders, ...sourceSubFolderContentsRes.data.contents.files].map(item => ({
+                                id: item.id,
+                                name: item.name,
+                                type: item.type
+                            }));
+                            
+                            if(subItemsToMove.length > 0) {
+                               await resolveConflictsRecursively(subItemsToMove, destSubFolderId, fullPath);
+                            }
+                            if (isAborted) return;
+                        }
+                    }
                 }
     
-                const finalFileItemsToMove = itemsToMove.filter(item => finalItemIds.includes(parseInt(Array.from(selectedItems.keys())[itemsToMove.indexOf(item)])));
+                // 3. 处理当前层级的档案冲突
+                if (fileConflicts.length > 0) {
+                    const prefixedFileConflicts = fileConflicts.map(name => pathPrefix ? `${pathPrefix}/${name}` : name);
+                    const result = await handleConflict(prefixedFileConflicts, '档案');
     
-                finalItemIds = finalFileItemsToMove
-                    .filter(item => {
-                        if (item.type === 'file' && fileConflicts.includes(item.name) && !fileOverwriteList.includes(item.name)) {
-                            return false;
-                        }
-                        return true;
-                    })
-                    .map(item => Array.from(selectedItems.keys())[itemsToMove.indexOf(item)])
-                    .map(id => parseInt(id));
+                    if (result.aborted) {
+                        isAborted = true;
+                        return;
+                    }
+                    // 将解决结果合并到主 resolutions 物件中
+                    Object.assign(resolutions, result.resolutions);
+                }
+            }
     
-                if (finalItemIds.length === 0) {
+            try {
+                // 准备好顶层要移动的项目列表
+                const topLevelItems = Array.from(selectedItems.entries()).map(([id, { type, name }]) => ({ id: parseInt(id), type, name }));
+                
+                // 启动递归冲突解决流程
+                await resolveConflictsRecursively(topLevelItems, moveTargetFolderId);
+    
+                if (isAborted) {
                     moveModal.style.display = 'none';
-                    showNotification('没有项目被移动。', 'success');
-                    loadFolderContents(currentFolderId);
+                    showNotification('移动操作已取消。', 'info');
                     return;
                 }
     
-                await axios.post('/api/move', {
-                    itemIds: finalItemIds,
+                // 4. 发送包含所有冲突解决方案的最终移动请求
+                const response = await axios.post('/api/move', {
+                    itemIds: topLevelItems.map(item => item.id),
                     targetFolderId: moveTargetFolderId,
-                    overwriteList: fileOverwriteList,
-                    mergeList: folderMergeList
+                    resolutions 
                 });
     
                 moveModal.style.display = 'none';
                 loadFolderContents(currentFolderId);
-                showNotification('项目移动成功！', 'success');
+                showNotification(response.data.message, 'success');
     
             } catch (error) {
+                moveModal.style.display = 'none';
                 alert('操作失败：' + (error.response?.data?.message || '服务器错误'));
             }
         });
     }
-    
 
     if (shareBtn && shareModal) {
         const shareOptions = document.getElementById('shareOptions');
@@ -1108,10 +1107,10 @@ document.addEventListener('DOMContentLoaded', () => {
         const lastPart = pathParts.filter(p => p).pop();
         let folderId = parseInt(lastPart, 10);
         if (isNaN(folderId)) {
-            folderId = 1; 
+            const rootFolderLink = document.querySelector('.breadcrumb a');
+            folderId = rootFolderLink ? parseInt(rootFolderLink.dataset.folderId) : 1;
         }
         loadFolderContents(folderId);
-        
         checkScreenWidthAndCollapse();
         window.addEventListener('resize', checkScreenWidthAndCollapse);
     }
