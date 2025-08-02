@@ -3,7 +3,6 @@ const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs').promises;
 
-// ... (所有 createUser, findUser, 等非檔案操作函數保持不變) ...
 function createUser(username, hashedPassword) {
     return new Promise((resolve, reject) => {
         const sql = `INSERT INTO users (username, password, is_admin) VALUES (?, ?, 0)`;
@@ -64,7 +63,6 @@ function listAllUsers() {
 
 
 async function deleteUser(userId) {
-    // 移除了删除本地使用者资料夹的逻辑
     return new Promise((resolve, reject) => {
         const sql = `DELETE FROM users WHERE id = ? AND is_admin = 0`;
         db.run(sql, [userId], function(err) {
@@ -278,54 +276,36 @@ function getAllFolders(userId) {
     });
 }
 
-// =================================================================
-// ===           *** 关键修正的函数 *** ===
-// =================================================================
 async function moveItem(itemId, itemType, targetFolderId, userId, options = {}) {
     const { resolutions = {}, pathPrefix = '' } = options;
-    console.log(`[DEBUG] [data.js moveItem] Called with itemId=${itemId}, itemType=${itemType}, targetFolderId=${targetFolderId}`);
-    console.log(`[DEBUG] [data.js moveItem] PathPrefix: '${pathPrefix}', Resolutions:`, resolutions);
-
     const report = { moved: 0, skipped: 0, errors: 0 };
 
     const sourceItem = (await getItemsByIds([itemId], userId))[0];
     if (!sourceItem) {
-        console.error(`[DEBUG] [data.js moveItem] ERROR: Source item ${itemId} not found.`);
         report.errors++;
         return report;
     }
 
-    // 构建当前处理项目的相对路径，用于在 resolutions 中查找正确的操作
     const currentRelativePath = path.posix.join(pathPrefix, sourceItem.name);
-    console.log(`[DEBUG] [data.js moveItem] Item "${sourceItem.name}" has relative path: ${currentRelativePath}`);
-    
     const existingItemInTarget = await findItemInFolder(sourceItem.name, targetFolderId, userId);
-    
-    // 决定操作：优先使用 `resolutions` 中的具体路径，否则根据是否存在冲突来决定
     const action = resolutions[currentRelativePath] || (existingItemInTarget ? 'skip_default' : 'move');
-    console.log(`[DEBUG] [data.js moveItem] Determined action for "${currentRelativePath}": ${action}`);
 
     try {
         if (action === 'skip' || action === 'skip_default') {
-            console.log(`[DEBUG] [data.js moveItem] Action is '${action}'. Skipping.`);
             report.skipped++;
             return report;
         }
         
         if (action === 'merge') {
-            console.log(`[DEBUG] [data.js moveItem] Action is 'merge'.`);
             if (!existingItemInTarget || existingItemInTarget.type !== 'folder' || itemType !== 'folder') {
-                console.log(`[DEBUG] [data.js moveItem] Merge condition not met. Skipping.`);
                 report.skipped++;
                 return report;
             }
             
-            console.log(`[DEBUG] [data.js moveItem] Merging into existing folder ID: ${existingItemInTarget.id}`);
             const children = await getChildrenOfFolder(itemId, userId);
-            let allChildrenProcessedSuccessfully = true;
+            let allChildrenProcessedWithoutIssues = true;
 
             for (const child of children) {
-                // *** 关键：递归调用 moveItem，并将当前项的相对路径作为新的 pathPrefix ***
                 const childReport = await moveItem(child.id, child.type, existingItemInTarget.id, userId, { 
                     resolutions, 
                     pathPrefix: currentRelativePath 
@@ -334,41 +314,35 @@ async function moveItem(itemId, itemType, targetFolderId, userId, options = {}) 
                 report.moved += childReport.moved;
                 report.skipped += childReport.skipped;
                 report.errors += childReport.errors;
-                if (childReport.errors > 0) { // 只要有任何一个子项移动出错，就认为父文件夹没有完全合并成功
-                    allChildrenProcessedSuccessfully = false;
+                
+                // --- *** 关键修正 *** ---
+                // 如果子项目有任何错误或被跳过，则父文件夹不能被删除
+                if (childReport.errors > 0 || childReport.skipped > 0) {
+                    allChildrenProcessedWithoutIssues = false;
                 }
             }
             
-            // 如果所有子项都成功处理（没有错误），则可以安全地删除原始的空父资料夹
-            if (allChildrenProcessedSuccessfully) {
-                console.log(`[DEBUG] [data.js moveItem] All children of '${sourceItem.name}' merged. Deleting original folder.`);
+            if (allChildrenProcessedWithoutIssues) {
                 await unifiedDelete(itemId, 'folder', userId);
             } else {
-                 console.log(`[DEBUG] [data.js moveItem] Some children of '${sourceItem.name}' failed to merge. Original folder is kept.`);
+                 console.log(`[DEBUG] [data.js moveItem] Some children of '${sourceItem.name}' were skipped or had errors. Original folder is kept.`);
             }
             return report;
         }
 
-        // --- 处理 move, overwrite, rename ---
         let finalTargetFolderId = targetFolderId;
         let finalItemName = sourceItem.name;
         let overwriteFlag = false;
 
         if (action === 'overwrite') {
-            console.log(`[DEBUG] [data.js moveItem] Action is 'overwrite'.`);
             if (existingItemInTarget) {
-                console.log(`[DEBUG] [data.js moveItem] Deleting existing item in target first.`);
                 await unifiedDelete(existingItemInTarget.id, existingItemInTarget.type, userId);
             }
-            overwriteFlag = true; // 即使目标已被删除，也要告诉底层 move 这是个覆盖操作
+            overwriteFlag = true;
         } else if (action === 'rename') {
-            console.log(`[DEBUG] [data.js moveItem] Action is 'rename'. Finding available name.`);
             finalItemName = await findAvailableName(sourceItem.name, targetFolderId, userId, itemType === 'folder');
-            console.log(`[DEBUG] [data.js moveItem] New name will be: ${finalItemName}.`);
         }
 
-        // 最终执行移动操作
-        console.log(`[DEBUG] [data.js moveItem] Calling moveItems for item '${finalItemName}'`);
         await moveItems(
             itemType === 'file' ? [{ id: itemId, name: finalItemName }] : [],
             itemType === 'folder' ? [{ id: itemId, name: finalItemName }] : [],
@@ -378,8 +352,6 @@ async function moveItem(itemId, itemType, targetFolderId, userId, options = {}) 
         );
 
         report.moved++;
-        console.log(`[DEBUG] [data.js moveItem] Move successful for '${finalItemName}'.`);
-
     } catch (e) {
         console.error(`[DEBUG] [data.js moveItem] **** An error occurred for item '${sourceItem.name}' ****`);
         console.error(e);
@@ -389,7 +361,6 @@ async function moveItem(itemId, itemType, targetFolderId, userId, options = {}) 
 }
 
 async function unifiedDelete(itemId, itemType, userId) {
-    console.log(`[DEBUG] [data.js unifiedDelete] Deleting itemId=${itemId}, itemType=${itemType}`);
     const storage = require('./storage').getStorage();
     let filesForStorage = [];
     let foldersForStorage = [];
@@ -403,29 +374,21 @@ async function unifiedDelete(itemId, itemType, userId) {
         filesForStorage.push(...directFiles);
     }
     
-    console.log(`[DEBUG] [data.js unifiedDelete] Items to delete from storage:`, { files: filesForStorage.map(f=>f.file_id), folders: foldersForStorage.map(f=>f.path) });
-
     try {
         await storage.remove(filesForStorage, foldersForStorage, userId);
     } catch (err) {
-        console.error(`[DEBUG] [data.js unifiedDelete] FAILED at storage.remove().`, err);
         throw new Error("实体档案删除失败，操作已中止。");
     }
     
-    console.log(`[DEBUG] [data.js unifiedDelete] Deleting from database.`);
     await executeDeletion(filesForStorage.map(f => f.message_id), foldersForStorage.map(f => f.id), userId);
-    console.log(`[DEBUG] [data.js unifiedDelete] Deletion complete.`);
 }
 
 
 async function moveItems(fileItems = [], folderItems = [], targetFolderId, userId, overwrite = false) {
-    console.log(`[DEBUG] [data.js moveItems] Low-level move called. Overwrite Flag: ${overwrite}`);
     const storage = require('./storage').getStorage();
 
     const targetPathParts = await getFolderPath(targetFolderId, userId);
-    // 移除根目录的'/'，因为它会在 path.posix.join 中被处理
     const targetFullPath = path.posix.join(...targetPathParts.slice(1).map(p => p.name));
-    console.log(`[DEBUG] [data.js moveItems] Target full path: /${targetFullPath}`);
 
     const fileIds = fileItems.map(item => item.id);
     const filesToMove = await getFilesByIds(fileIds, userId);
@@ -435,14 +398,10 @@ async function moveItems(fileItems = [], folderItems = [], targetFolderId, userI
         const newFileName = fileNameMap.get(file.message_id) || file.fileName;
         const oldRelativePath = file.file_id;
         const newRelativePath = path.posix.join('/', targetFullPath, newFileName);
-        console.log(`[DEBUG] [data.js moveItems] Moving FILE from ${oldRelativePath} to ${newRelativePath}`);
         try {
             await storage.move(oldRelativePath, newRelativePath, overwrite);
-            // Now update DB
             await new Promise((res, rej) => db.run('UPDATE files SET fileName = ?, file_id = ?, folder_id = ? WHERE message_id = ?', [newFileName, newRelativePath, targetFolderId, file.message_id], (e) => e ? rej(e) : res()));
-            console.log(`[DEBUG] [data.js moveItems] DB updated for file ${newFileName}.`);
         } catch (err) {
-            console.error(`[DEBUG] [data.js moveItems] FAILED to move file ${newFileName}.`, err);
             throw new Error(`物理移动文件 ${newFileName} 失败`);
         }
     }
@@ -456,24 +415,18 @@ async function moveItems(fileItems = [], folderItems = [], targetFolderId, userI
         const oldPathParts = await getFolderPath(folder.id, userId);
         const oldFullPath = path.posix.join('/', ...oldPathParts.slice(1).map(p => p.name));
         const newFullPath = path.posix.join('/', targetFullPath, newFolderName);
-        console.log(`[DEBUG] [data.js moveItems] Moving FOLDER from ${oldFullPath} to ${newFullPath}`);
 
         try {
             await storage.move(oldFullPath, newFullPath, overwrite);
-            // Update all descendant files' paths
             const descendantFiles = await getFilesRecursive(folder.id, userId);
-            console.log(`[DEBUG] [data.js moveItems] Found ${descendantFiles.length} descendant files to update.`);
             for (const file of descendantFiles) {
                 const updatedFileId = file.file_id.replace(oldFullPath, newFullPath);
                 await new Promise((res, rej) => db.run('UPDATE files SET file_id = ? WHERE message_id = ?', [updatedFileId, file.message_id], (e) => e ? rej(e) : res()));
             }
 
-            // Update folder's own DB record
             await new Promise((res, rej) => db.run(`UPDATE folders SET name = ?, parent_id = ? WHERE id = ?`, [newFolderName, targetFolderId, folder.id], (e) => e ? rej(e) : res()));
-            console.log(`[DEBUG] [data.js moveItems] DB updated for folder ${newFolderName} and its descendants.`);
 
         } catch (err) {
-            console.error(`[DEBUG] [data.js moveItems] FAILED to move folder ${newFolderName}.`, err);
             throw new Error(`物理移动文件夹 ${newFolderName} 失败`);
         }
     }
@@ -481,108 +434,36 @@ async function moveItems(fileItems = [], folderItems = [], targetFolderId, userI
 
 
 async function renameFile(messageId, newFileName, userId) {
-    console.log(`[DEBUG] [data.js renameFile] Renaming fileId ${messageId} to "${newFileName}"`);
     const file = (await getFilesByIds([messageId], userId))[0];
     if (!file) {
-        console.error(`[DEBUG] [data.js renameFile] File ${messageId} not found in DB.`);
         return { success: false, message: '文件未找到。' };
     }
 
-    console.log(`[DEBUG] [data.js renameFile] Checking for conflict.`);
     const conflict = await checkFullConflict(newFileName, file.folder_id, userId);
     if (conflict) {
-        console.error(`[DEBUG] [data.js renameFile] Conflict found. Aborting.`);
         throw new Error('目标文件夹中已存在同名项目。');
     }
 
     const storage = require('./storage').getStorage();
     const oldRelativePath = file.file_id;
     const newRelativePath = path.posix.join(path.posix.dirname(oldRelativePath), newFileName);
-    console.log(`[DEBUG] [data.js renameFile] Physical rename from ${oldRelativePath} to ${newRelativePath}`);
 
     try {
-        await storage.move(oldRelativePath, newRelativePath, false); // Rename should not overwrite
+        await storage.move(oldRelativePath, newRelativePath, false);
     } catch(err) {
-        console.error(`[DEBUG] [data.js renameFile] FAILED at storage.move()`, err);
         throw new Error(`实体档案重新命名失败: ${err.message}`);
     }
     
-    console.log(`[DEBUG] [data.js renameFile] Updating DB.`);
     const sql = `UPDATE files SET fileName = ?, file_id = ? WHERE message_id = ? AND user_id = ?`;
     return new Promise((resolve, reject) => {
         db.run(sql, [newFileName, newRelativePath, messageId, userId], function(err) {
-             if (err) {
-                 console.error(`[DEBUG] [data.js renameFile] FAILED to update DB.`, err);
-                 reject(err);
-             }
-             else {
-                console.log(`[DEBUG] [data.js renameFile] Rename complete.`);
-                resolve({ success: true });
-             }
+             if (err) reject(err);
+             else resolve({ success: true });
         });
     });
 }
 
-async function renameFolder(folderId, newFolderName, userId) {
-    console.log(`[DEBUG] [data.js renameFolder] Renaming folderId ${folderId} to "${newFolderName}"`);
-    const folder = await new Promise((res, rej) => db.get("SELECT * FROM folders WHERE id=?", [folderId], (e,r)=>e?rej(e):res(r)));
-    if (!folder) {
-        console.error(`[DEBUG] [data.js renameFolder] Folder ${folderId} not found in DB.`);
-        return { success: false, message: '资料夹未找到。'};
-    }
-    
-    if (folder.parent_id === null) {
-        console.error(`[DEBUG] [data.js renameFolder] Attempt to rename root folder. Aborting.`);
-        throw new Error('无法重新命名根目录。');
-    }
-
-    console.log(`[DEBUG] [data.js renameFolder] Checking for conflict.`);
-    const conflict = await checkFullConflict(newFolderName, folder.parent_id, userId);
-    if (conflict) {
-        console.error(`[DEBUG] [data.js renameFolder] Conflict found. Aborting.`);
-        throw new Error('目标文件夹中已存在同名项目。');
-    }
-    
-    const storage = require('./storage').getStorage();
-    const oldPathParts = await getFolderPath(folderId, userId);
-    const oldFullPath = path.posix.join('/', ...oldPathParts.slice(1).map(p => p.name));
-    const newFullPath = path.posix.join(path.posix.dirname(oldFullPath), newFolderName);
-    console.log(`[DEBUG] [data.js renameFolder] Physical rename from ${oldFullPath} to ${newFullPath}`);
-
-    try {
-        await storage.move(oldFullPath, newFullPath, false); // Rename should not overwrite
-        
-        console.log(`[DEBUG] [data.js renameFolder] Physical move successful. Updating descendant file paths in DB.`);
-        const descendantFiles = await getFilesRecursive(folderId, userId);
-        console.log(`[DEBUG] [data.js renameFolder] Found ${descendantFiles.length} descendants to update.`);
-        for (const file of descendantFiles) {
-            const updatedFileId = file.file_id.replace(oldFullPath, newFullPath);
-            await new Promise((res, rej) => db.run('UPDATE files SET file_id = ? WHERE message_id = ?', [updatedFileId, file.message_id], (e) => e ? rej(e) : res()));
-        }
-    } catch(e) {
-        console.error(`[DEBUG] [data.js renameFolder] FAILED at storage.move()`, e);
-        throw new Error(`物理资料夹重新命名失败: ${e.message}`);
-    }
-
-    console.log(`[DEBUG] [data.js renameFolder] Updating folder name in DB.`);
-    const sql = `UPDATE folders SET name = ? WHERE id = ? AND user_id = ?`;
-    return new Promise((resolve, reject) => {
-        db.run(sql, [newFolderName, folderId, userId], function(err) {
-            if (err) {
-                 console.error(`[DEBUG] [data.js renameFolder] FAILED to update DB.`, err);
-                reject(err);
-            }
-            else if (this.changes === 0) resolve({ success: false, message: '资料夹未找到。' });
-            else {
-                console.log(`[DEBUG] [data.js renameFolder] Rename complete.`);
-                resolve({ success: true });
-            }
-        });
-    });
-}
-// ... (所有其他非檔案操作函數，如 shares, etc. 保持不變)
 async function renameAndMoveFile(messageId, newFileName, targetFolderId, userId) {
-    console.log(`[DEBUG] [data.js renameAndMoveFile] Called.`);
     const file = (await getFilesByIds([messageId], userId))[0];
     if (!file) throw new Error('File not found for rename and move');
 
@@ -591,28 +472,58 @@ async function renameAndMoveFile(messageId, newFileName, targetFolderId, userId)
     const targetRelativePath = path.posix.join(...targetPathParts.slice(1).map(p => p.name));
     const newRelativePath = path.posix.join('/', targetRelativePath, newFileName);
     const oldRelativePath = file.file_id;
-    console.log(`[DEBUG] [data.js renameAndMoveFile] Physical move from ${oldRelativePath} to ${newRelativePath}`);
     
     try {
-        await storage.move(oldRelativePath, newRelativePath, false); // Renaming should not overwrite
+        await storage.move(oldRelativePath, newRelativePath, false);
     } catch(err) {
-        console.error(`[DEBUG] [data.js renameAndMoveFile] FAILED at storage.move()`, err);
         throw new Error(`实体档案移动并重命名失败`);
     }
     
-    console.log(`[DEBUG] [data.js renameAndMoveFile] Updating DB.`);
     const sql = `UPDATE files SET fileName = ?, file_id = ?, folder_id = ? WHERE message_id = ? AND user_id = ?`;
     return new Promise((resolve, reject) => {
         db.run(sql, [newFileName, newRelativePath, targetFolderId, messageId, userId], (err) => err ? reject(err) : resolve({ success: true }));
     });
 }
 
-function deleteSingleFolder(folderId, userId) {
+
+async function renameFolder(folderId, newFolderName, userId) {
+    const folder = await new Promise((res, rej) => db.get("SELECT * FROM folders WHERE id=?", [folderId], (e,r)=>e?rej(e):res(r)));
+    if (!folder) {
+        return { success: false, message: '资料夹未找到。'};
+    }
+    
+    if (folder.parent_id === null) {
+        throw new Error('无法重新命名根目录。');
+    }
+
+    const conflict = await checkFullConflict(newFolderName, folder.parent_id, userId);
+    if (conflict) {
+        throw new Error('目标文件夹中已存在同名项目。');
+    }
+    
+    const storage = require('./storage').getStorage();
+    const oldPathParts = await getFolderPath(folderId, userId);
+    const oldFullPath = path.posix.join('/', ...oldPathParts.slice(1).map(p => p.name));
+    const newFullPath = path.posix.join(path.posix.dirname(oldFullPath), newFolderName);
+
+    try {
+        await storage.move(oldFullPath, newFullPath, false);
+        
+        const descendantFiles = await getFilesRecursive(folderId, userId);
+        for (const file of descendantFiles) {
+            const updatedFileId = file.file_id.replace(oldFullPath, newFullPath);
+            await new Promise((res, rej) => db.run('UPDATE files SET file_id = ? WHERE message_id = ?', [updatedFileId, file.message_id], (e) => e ? rej(e) : res()));
+        }
+    } catch(e) {
+        throw new Error(`物理资料夹重新命名失败: ${e.message}`);
+    }
+
+    const sql = `UPDATE folders SET name = ? WHERE id = ? AND user_id = ?`;
     return new Promise((resolve, reject) => {
-        const sql = `DELETE FROM folders WHERE id = ? AND user_id = ?`;
-        db.run(sql, [folderId, userId], function(err) {
-            if (err) return reject(err);
-            resolve({ success: true, changes: this.changes });
+        db.run(sql, [newFolderName, folderId, userId], function(err) {
+            if (err) reject(err);
+            else if (this.changes === 0) resolve({ success: false, message: '资料夹未找到。' });
+            else resolve({ success: true });
         });
     });
 }
@@ -786,20 +697,6 @@ function createShareLink(itemId, itemType, expiresIn, userId) {
             if (err) reject(err);
             else if (this.changes === 0) resolve({ success: false, message: '项目未找到。' });
             else resolve({ success: true, token });
-        });
-    });
-}
-
-function deleteFilesByIds(messageIds, userId) {
-    if (!messageIds || messageIds.length === 0) {
-        return Promise.resolve({ success: true, changes: 0 });
-    }
-    const placeholders = messageIds.map(() => '?').join(',');
-    const sql = `DELETE FROM files WHERE message_id IN (${placeholders}) AND user_id = ?`;
-    return new Promise((resolve, reject) => {
-        db.run(sql, [...messageIds, userId], function(err) {
-            if (err) reject(err);
-            else resolve({ success: true, changes: this.changes });
         });
     });
 }
@@ -1002,7 +899,6 @@ module.exports = {
     getAllDescendantFolderIds,
     executeDeletion,
     getFolderDeletionData,
-    deleteSingleFolder,
     addFile,
     getFilesByIds,
     getItemsByIds,
@@ -1017,7 +913,6 @@ module.exports = {
     cancelShare,
     renameFile,
     renameFolder,
-    deleteFilesByIds,
     findFileInFolder,
     getConflictingItems,
     checkFullConflict,
