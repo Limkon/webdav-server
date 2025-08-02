@@ -277,14 +277,23 @@ function getAllFolders(userId) {
 }
 
 async function moveItem(itemId, itemType, targetFolderId, userId, options = {}) {
-    const { resolutions = {}, pathPrefix = '' } = options;
     const report = { moved: 0, skipped: 0, errors: 0 };
-
+    const { resolutions = {}, pathPrefix = '' } = options;
+    
+    // --- *** 最终修正：增加根目录检查 *** ---
     const sourceItem = (await getItemsByIds([itemId], userId))[0];
     if (!sourceItem) {
         report.errors++;
         return report;
     }
+
+    if (itemType === 'folder' && sourceItem.parent_id === null) {
+        console.error(`[DEBUG] [data.js moveItem] Attempted to move the root folder (ID: ${itemId}). This is not allowed.`);
+        report.errors++;
+        // 直接抛出错误，让上层知道这是一个无效操作
+        throw new Error("无法移动根目录。");
+    }
+    // --- *** 修正结束 *** ---
 
     const currentRelativePath = path.posix.join(pathPrefix, sourceItem.name);
     const existingItemInTarget = await findItemInFolder(sourceItem.name, targetFolderId, userId);
@@ -315,8 +324,6 @@ async function moveItem(itemId, itemType, targetFolderId, userId, options = {}) 
                 report.skipped += childReport.skipped;
                 report.errors += childReport.errors;
                 
-                // --- *** 关键修正 *** ---
-                // 如果子项目有任何错误或被跳过，则父文件夹不能被删除
                 if (childReport.errors > 0 || childReport.skipped > 0) {
                     allChildrenProcessedWithoutIssues = false;
                 }
