@@ -5,22 +5,43 @@ const fsp = require('fs').promises;
 const fs = require('fs');
 const path = require('path');
 
-// 从 storage/index.js 引入配置读取函数，避免循环依赖
-const { readConfig } = require('./index');
+const CONFIG_FILE = path.join(__dirname, '..', 'data', 'config.json');
 
 let clients = {};
 let webdavConfigs = [];
 
+// 独立加载配置的函数，不再依赖 index.js
 function loadWebdavConfigs() {
-    webdavConfigs = readConfig().webdav || [];
+    try {
+        if (fs.existsSync(CONFIG_FILE)) {
+            const rawData = fs.readFileSync(CONFIG_FILE);
+            const config = JSON.parse(rawData);
+            
+            if (config.webdav && Array.isArray(config.webdav)) {
+                webdavConfigs = config.webdav;
+            } else if (config.webdav && !Array.isArray(config.webdav)) {
+                 webdavConfigs = [{
+                    id: crypto.randomBytes(4).toString('hex'),
+                    mount_name: 'webdav',
+                    ...config.webdav
+                }];
+            } else {
+                webdavConfigs = [];
+            }
+        } else {
+            webdavConfigs = [];
+        }
+    } catch (error) {
+        console.error("在 webdav.js 中读取设置文件失败:", error);
+        webdavConfigs = [];
+    }
 }
 
-// 首次加载
 loadWebdavConfigs();
 
 function getClient(config) {
     if (!config || !config.id) {
-        throw new Error('无效的 WebDAV 配置傳入 getClient');
+        throw new Error('无效的 WebDAV 配置传入 getClient');
     }
     if (!clients[config.id]) {
         if (!config.url || !config.username) throw new Error(`WebDAV 设置不完整 (ID: ${config.id})。`);
@@ -66,7 +87,6 @@ async function upload(tempFilePath, fileName, mimetype, userId, folderPathInfo) 
     const stat = await client.stat(remoteFilePath);
     const messageId = BigInt(Date.now()) * 1000000n + BigInt(crypto.randomInt(1000000));
     
-    // 储存包含挂载点的完整相对路径
     const fullDbPath = path.posix.join('/', mountName, remoteFilePath);
 
     return {
@@ -86,7 +106,6 @@ async function remove(itemsToRemove) {
     const results = { success: true, errors: [] };
     const itemsByMount = {};
 
-    // 按挂载点对项目进行分组
     for (const item of itemsToRemove) {
         if (!itemsByMount[item.mountName]) {
             itemsByMount[item.mountName] = [];
@@ -94,14 +113,12 @@ async function remove(itemsToRemove) {
         itemsByMount[item.mountName].push(item);
     }
     
-    // 对每个挂载点分别执行操作
     for (const mountName in itemsByMount) {
         try {
             const config = getConfigForMount(mountName);
             const client = getClient(config);
             const allItems = itemsByMount[mountName];
 
-            // 优先删除文件和子目录
             allItems.sort((a, b) => b.remotePath.length - a.remotePath.length);
 
             for (const item of allItems) {
@@ -132,7 +149,6 @@ async function stream(fileDbPath) {
     const remotePath = '/' + parts.slice(1).join('/');
 
     const config = getConfigForMount(mountName);
-    // 为 stream 创建独立的 client，避免潜在的并发问题
     const streamClient = createClient(config.url, {
         username: config.username,
         password: config.password
@@ -172,7 +188,6 @@ async function createDirectory(folderPathInfo) {
         }
         return true;
     } catch (e) {
-        // 405 (Method Not Allowed) or 501 (Not Implemented) might mean directory already exists.
         if (e.response && (e.response.status === 405 || e.response.status === 501)) {
             return true; 
         }
@@ -180,12 +195,12 @@ async function createDirectory(folderPathInfo) {
     }
 }
 
-module.exports = {
+module.exports = { 
     type: 'webdav',
-    upload,
-    remove,
-    stream,
+    upload, 
+    remove, 
+    stream, 
     moveFile,
     createDirectory,
-    resetClient,
+    resetClient, 
 };
