@@ -3,6 +3,7 @@ const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs').promises;
 const fsSync = require('fs');
+const { getStorage } = require('./storage');
 
 const UPLOAD_DIR = path.resolve(__dirname, 'data', 'uploads');
 
@@ -196,13 +197,13 @@ async function getFilesRecursive(folderId, userId, currentPath = '') {
     const sqlFiles = "SELECT * FROM files WHERE folder_id = ? AND user_id = ?";
     const files = await new Promise((res, rej) => db.all(sqlFiles, [folderId, userId], (err, rows) => err ? rej(err) : res(rows)));
     for (const file of files) {
-        allFiles.push({ ...file, path: path.join(currentPath, file.fileName) });
+        allFiles.push({ ...file, path: path.posix.join(currentPath, file.fileName) });
     }
 
     const sqlFolders = "SELECT id, name FROM folders WHERE parent_id = ? AND user_id = ?";
     const subFolders = await new Promise((res, rej) => db.all(sqlFolders, [folderId, userId], (err, rows) => err ? rej(err) : res(rows)));
     for (const subFolder of subFolders) {
-        const nestedFiles = await getFilesRecursive(subFolder.id, userId, path.join(currentPath, subFolder.name));
+        const nestedFiles = await getFilesRecursive(subFolder.id, userId, path.posix.join(currentPath, subFolder.name));
         allFiles.push(...nestedFiles);
     }
     return allFiles;
@@ -288,17 +289,54 @@ function getAllFolders(userId) {
     });
 }
 
+// --- 主要修改开始 ---
+// 辅助函数：根据 ID 获取其所属的挂载点名称
+async function getMountNameForId(itemId, itemType, userId) {
+    let folderIdToCheck;
+    if (itemType === 'folder') {
+        folderIdToCheck = itemId;
+    } else { // file
+        const file = (await getFilesByIds([itemId], userId))[0];
+        folderIdToCheck = file ? file.folder_id : null;
+    }
+
+    if (!folderIdToCheck) return null;
+
+    const path = await getFolderPath(folderIdToCheck, userId);
+    // path[0] 是根目录，path[1] 是挂载点目录
+    if (path.length > 1) {
+        return path[1].name;
+    }
+    
+    // 如果路径长度不大于1，说明它就在根目录下
+    const folder = await new Promise((res, rej) => db.get("SELECT * FROM folders WHERE id = ?", [folderIdToCheck], (e, r) => e ? rej(e) : res(r)));
+    if (folder && folder.parent_id === 1) { // 假设根目录ID为1
+         return folder.name;
+    }
+
+    return null;
+}
+
 async function moveItem(itemId, itemType, targetFolderId, userId, options = {}) {
     const { resolutions = {}, pathPrefix = '' } = options;
     const report = { moved: 0, skipped: 0, errors: 0 };
     
+    // 1. 检查跨 WebDAV 移动
+    const sourceMount = await getMountNameForId(itemId, itemType, userId);
+    const targetMount = await getMountNameForId(targetFolderId, 'folder', userId);
+
+    if (sourceMount && targetMount && sourceMount !== targetMount) {
+        throw new Error(`跨 WebDAV 挂载点的移动操作是不被允许的 (从 "${sourceMount}" 到 "${targetMount}")。`);
+    }
+    // --- 关键修改结束 ---
+
     const sourceItem = (await getItemsByIds([itemId], userId))[0];
     if (!sourceItem) {
         report.errors++;
         return report;
     }
     
-    const currentPath = path.join(pathPrefix, sourceItem.name).replace(/\\/g, '/');
+    const currentPath = path.posix.join(pathPrefix, sourceItem.name).replace(/\\/g, '/');
     const existingItemInTarget = await findItemInFolder(sourceItem.name, targetFolderId, userId);
     const resolutionAction = resolutions[currentPath] || (existingItemInTarget ? 'skip_default' : 'move');
 
@@ -388,28 +426,29 @@ async function unifiedDelete(itemId, itemType, userId) {
 async function moveItems(fileIds = [], folderIds = [], targetFolderId, userId) {
     const storage = require('./storage').getStorage();
 
-    if (storage.type === 'local' || storage.type === 'webdav') {
-        const client = storage.type === 'webdav' ? storage.getClient() : null;
+    if (storage.type === 'webdav') {
+        const {getConfigForPath, getClient} = storage;
         
+        // 移动操作只会在同一个 webdav client 内部进行，所以我们只需要一个 client
+        // moveItem 已经确保了 source 和 target 在同一个挂载点
+        const sampleId = fileIds.length > 0 ? fileIds[0] : folderIds[0];
+        const sampleType = fileIds.length > 0 ? 'file' : 'folder';
+        const { config } = await getConfigForPath(sampleId, sampleType, userId);
+        const client = getClient(config);
+
         const targetPathParts = await getFolderPath(targetFolderId, userId);
-        const targetFullPath = path.posix.join(...targetPathParts.map(p => p.name));
+        const targetRemotePath = path.posix.join(...targetPathParts.slice(1).map(p => p.name));
 
         const filesToMove = await getFilesByIds(fileIds, userId);
         for (const file of filesToMove) {
-            const oldRelativePath = file.file_id;
-            const newRelativePath = path.posix.join(targetFullPath, file.fileName);
+            const oldRelativePath = file.file_id.replace(`/${config.mount_name}`, '');
+            const newRelativePath = path.posix.join(targetRemotePath, file.fileName);
             
             try {
-                if (storage.type === 'local') {
-                    const oldFullPath = path.join(UPLOAD_DIR, String(userId), oldRelativePath);
-                    const newFullPath = path.join(UPLOAD_DIR, String(userId), newRelativePath);
-                    await fs.mkdir(path.dirname(newFullPath), { recursive: true });
-                    await fs.rename(oldFullPath, newFullPath);
-                } else if (client) {
-                    await client.moveFile(oldRelativePath, newRelativePath);
-                }
+                await client.moveFile(oldRelativePath, newRelativePath);
                 
-                await new Promise((res, rej) => db.run('UPDATE files SET file_id = ? WHERE message_id = ?', [newRelativePath, file.message_id], (e) => e ? rej(e) : res()));
+                const fullNewPath = path.posix.join('/', config.mount_name, newRelativePath);
+                await new Promise((res, rej) => db.run('UPDATE files SET file_id = ? WHERE message_id = ?', [fullNewPath, file.message_id], (e) => e ? rej(e) : res()));
 
             } catch (err) {
                 throw new Error(`物理移动文件 ${file.fileName} 失败`);
@@ -419,27 +458,23 @@ async function moveItems(fileIds = [], folderIds = [], targetFolderId, userId) {
         const foldersToMove = (await getItemsByIds(folderIds, userId)).filter(i => i.type === 'folder');
         for (const folder of foldersToMove) {
             const oldPathParts = await getFolderPath(folder.id, userId);
-            const oldFullPath = path.posix.join(...oldPathParts.map(p => p.name));
-            const newFullPath = path.posix.join(targetFullPath, folder.name);
+            const oldRemotePath = path.posix.join(...oldPathParts.slice(1).map(p => p.name));
+            const newRemotePath = path.posix.join(targetRemotePath, folder.name);
 
             try {
-                 if (storage.type === 'local') {
-                    const oldAbsPath = path.join(UPLOAD_DIR, String(userId), oldFullPath);
-                    const newAbsPath = path.join(UPLOAD_DIR, String(userId), newFullPath);
-                    if (fsSync.existsSync(oldAbsPath)) {
-                       await fs.rename(oldAbsPath, newAbsPath);
-                    }
-                 } else if (client) {
-                    await client.moveFile(oldFullPath, newFullPath);
-                 }
+                if (await client.exists(oldRemotePath)) {
+                    await client.moveFile(oldRemotePath, newRemotePath);
+                }
 
                 const descendantFiles = await getFilesRecursive(folder.id, userId);
                 for (const file of descendantFiles) {
-                    const updatedFileId = file.file_id.replace(oldFullPath, newFullPath);
+                    const updatedFileId = file.file_id.replace(oldRemotePath, newRemotePath);
                     await new Promise((res, rej) => db.run('UPDATE files SET file_id = ? WHERE message_id = ?', [updatedFileId, file.message_id], (e) => e ? rej(e) : res()));
                 }
             } catch (err) {
-                throw new Error(`物理移动文件夹 ${folder.name} 失败`);
+                 if (err.response && err.response.status !== 404) {
+                    throw new Error(`物理移动文件夹 ${folder.name} 失败`);
+                 }
             }
         }
     }
@@ -495,24 +530,16 @@ async function getFolderDeletionData(folderId, userId) {
     }
 
     await findContentsRecursive(folderId);
-
-    const allUserFolders = await getAllFolders(userId);
-    const folderMap = new Map(allUserFolders.map(f => [f.id, f]));
     
-    function buildPath(fId) {
-        let pathParts = [];
-        let current = folderMap.get(fId);
-        while(current && current.parent_id) {
-            pathParts.unshift(current.name);
-            current = folderMap.get(current.parent_id);
-        }
-        return path.join(...pathParts);
+    // 对于 WebDAV，我们需要完整的相对路径
+    const foldersToDeleteWithPaths = [];
+    for (const fId of foldersToDeleteIds) {
+        const folderPath = await getFolderPath(fId, userId);
+        foldersToDeleteWithPaths.push({
+            id: fId,
+            path: path.posix.join(...folderPath.map(p => p.name))
+        });
     }
-
-    const foldersToDeleteWithPaths = foldersToDeleteIds.map(id => ({
-        id: id,
-        path: buildPath(id)
-    }));
 
     return { files: filesToDelete, folders: foldersToDeleteWithPaths };
 }
@@ -624,26 +651,21 @@ async function renameFile(messageId, newFileName, userId) {
 
     const storage = require('./storage').getStorage();
 
-    if (storage.type === 'local' || storage.type === 'webdav') {
-        const oldRelativePath = file.file_id;
-        const newRelativePath = path.posix.join(path.posix.dirname(oldRelativePath), newFileName);
+    if (storage.type === 'webdav') {
+        const { config, remotePath: oldRemotePath } = await storage.getConfigForPath(file.file_id, userId);
+        const newRemotePath = path.posix.join(path.posix.dirname(oldRemotePath), newFileName);
+        const client = storage.getClient(config);
 
         try {
-            if (storage.type === 'local') {
-                const oldFullPath = path.join(UPLOAD_DIR, String(userId), oldRelativePath);
-                const newFullPath = path.join(UPLOAD_DIR, String(userId), newRelativePath);
-                await fs.rename(oldFullPath, newFullPath);
-            } else if (storage.type === 'webdav') {
-                const client = storage.getClient();
-                await client.moveFile(oldRelativePath, newRelativePath);
-            }
+            await client.moveFile(oldRemotePath, newRemotePath);
         } catch(err) {
             throw new Error(`实体档案重新命名失败`);
         }
         
+        const fullNewPath = path.posix.join('/', config.mount_name, newRemotePath);
         const sql = `UPDATE files SET fileName = ?, file_id = ? WHERE message_id = ? AND user_id = ?`;
         return new Promise((resolve, reject) => {
-            db.run(sql, [newFileName, newRelativePath, messageId, userId], function(err) {
+            db.run(sql, [newFileName, fullNewPath, messageId, userId], function(err) {
                  if (err) reject(err);
                  else resolve({ success: true });
             });
@@ -665,29 +687,22 @@ async function renameAndMoveFile(messageId, newFileName, targetFolderId, userId)
     if (!file) throw new Error('File not found for rename and move');
 
     const storage = require('./storage').getStorage();
-    if (storage.type === 'local' || storage.type === 'webdav') {
-        const targetPathParts = await getFolderPath(targetFolderId, userId);
-        const targetRelativePath = path.posix.join(...targetPathParts.map(p => p.name));
-        const newRelativePath = path.posix.join(targetRelativePath, newFileName);
-        const oldRelativePath = file.file_id;
+    if (storage.type === 'webdav') {
+        const { config, remotePath: oldRemotePath } = await storage.getConfigForPath(file.file_id, userId);
+        const { remotePath: targetRemotePath } = await storage.getConfigForPath(targetFolderId, userId);
+        const newRemotePath = path.posix.join(targetRemotePath, newFileName);
+        const client = storage.getClient(config);
         
         try {
-            if (storage.type === 'local') {
-                 const oldFullPath = path.join(UPLOAD_DIR, String(userId), oldRelativePath);
-                 const newFullPath = path.join(UPLOAD_DIR, String(userId), newRelativePath);
-                 await fs.mkdir(path.dirname(newFullPath), { recursive: true });
-                 await fs.rename(oldFullPath, newFullPath);
-            } else if (storage.type === 'webdav') {
-                const client = storage.getClient();
-                await client.moveFile(oldRelativePath, newRelativePath);
-            }
+            await client.moveFile(oldRemotePath, newRemotePath);
         } catch(err) {
             throw new Error(`实体档案移动并重命名失败`);
         }
         
+        const fullNewPath = path.posix.join('/', config.mount_name, newRemotePath);
         const sql = `UPDATE files SET fileName = ?, file_id = ?, folder_id = ? WHERE message_id = ? AND user_id = ?`;
         return new Promise((resolve, reject) => {
-            db.run(sql, [newFileName, newRelativePath, targetFolderId, messageId, userId], (err) => err ? reject(err) : resolve({ success: true }));
+            db.run(sql, [newFileName, fullNewPath, targetFolderId, messageId, userId], (err) => err ? reject(err) : resolve({ success: true }));
         });
     }
 
@@ -704,32 +719,26 @@ async function renameFolder(folderId, newFolderName, userId) {
     
     const storage = require('./storage').getStorage();
 
-    if (storage.type === 'local' || storage.type === 'webdav') {
+    if (storage.type === 'webdav') {
         const oldPathParts = await getFolderPath(folderId, userId);
-        const oldFullPath = path.posix.join(...oldPathParts.map(p => p.name));
-        const newFullPath = path.posix.join(path.posix.dirname(oldFullPath), newFolderName);
+        const { config, remotePath: oldRemotePath } = await storage.getConfigForPath(folderId, userId);
+        const newRemotePath = path.posix.join(path.posix.dirname(oldRemotePath), newFolderName);
+        const client = storage.getClient(config);
 
         try {
-            if (storage.type === 'local') {
-                const oldAbsPath = path.join(UPLOAD_DIR, String(userId), oldFullPath);
-                const newAbsPath = path.join(UPLOAD_DIR, String(userId), newFullPath);
-                if (fsSync.existsSync(oldAbsPath)) {
-                    await fs.rename(oldAbsPath, newAbsPath);
-                }
-            } else if (storage.type === 'webdav') {
-                const client = storage.getClient();
-                await client.moveFile(oldFullPath, newFullPath);
+            if (await client.exists(oldRemotePath)) {
+                await client.moveFile(oldRemotePath, newRemotePath);
             }
 
             const descendantFiles = await getFilesRecursive(folderId, userId);
             for (const file of descendantFiles) {
-                const updatedFileId = file.file_id.replace(oldFullPath, newFullPath);
+                const updatedFileId = file.file_id.replace(oldRemotePath, newRemotePath);
                 await new Promise((res, rej) => db.run('UPDATE files SET file_id = ? WHERE message_id = ?', [updatedFileId, file.message_id], (e) => e ? rej(e) : res()));
             }
 
         } catch(e) {
-            if (e.code !== 'ENOENT') {
-                throw new Error("物理资料夹重新命名失败");
+            if (e.response && e.response.status !== 404) {
+                 throw new Error("物理资料夹重新命名失败");
             }
         }
     }
