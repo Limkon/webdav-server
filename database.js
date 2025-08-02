@@ -5,16 +5,16 @@ const bcrypt = require('bcrypt');
 
 const DATA_DIR = path.join(__dirname, 'data');
 const DB_FILE = path.join(DATA_DIR, 'file-manager.db');
-// --- 新增：讀取設定檔路徑 ---
+// --- 新增：读取设置文件路径 ---
 const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
 
-// 确保资料目录存在
+// 确保数据目录存在
 try {
     if (!fs.existsSync(DATA_DIR)) {
         fs.mkdirSync(DATA_DIR);
     }
 } catch (error) {
-    console.error(`[致命错误] 无法创建资料夹: ${DATA_DIR}。错误: ${error.message}`);
+    console.error(`[致命错误] 无法创建文件夹: ${DATA_DIR}。错误: ${error.message}`);
     process.exit(1);
 }
 
@@ -23,13 +23,13 @@ const db = new sqlite3.Database(DB_FILE, (err) => {
         console.error('无法连接到数据库:', err.message);
         return;
     }
-    console.log('成功连接到 SQLite 资料库。');
+    console.log('成功连接到 SQLite 数据库。');
     initializeDatabase();
 });
 
 function initializeDatabase() {
     db.serialize(() => {
-        console.log('开始初始化资料库结构...');
+        console.log('开始初始化数据库结构...');
 
         db.run("PRAGMA foreign_keys = ON;", (err) => {
             if (err) console.error("启用外键约束失败:", err.message);
@@ -42,7 +42,7 @@ function initializeDatabase() {
             is_admin BOOLEAN NOT NULL DEFAULT 0
         )`, (err) => {
             if (err) {
-                console.error("建立 'users' 表失败:", err.message);
+                console.error("创建 'users' 表失败:", err.message);
             } else {
                 console.log("'users' 表已确认存在。");
                 // 在 users 表创建成功后，创建其他表
@@ -65,7 +65,7 @@ function createDependentTables() {
             FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
             UNIQUE(name, parent_id, user_id)
         )`, (err) => {
-            if (err) console.error("建立 'folders' 表失败:", err.message);
+            if (err) console.error("创建 'folders' 表失败:", err.message);
             else console.log("'folders' 表已确认存在。");
         });
 
@@ -86,10 +86,10 @@ function createDependentTables() {
             FOREIGN KEY (folder_id) REFERENCES folders(id) ON DELETE CASCADE,
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
         )`, (err) => {
-            if (err) console.error("建立 'files' 表失败:", err.message);
+            if (err) console.error("创建 'files' 表失败:", err.message);
             else {
                 console.log("'files' 表已确认存在。");
-                // 所有表结构都建立完毕后，再检查并建立管理员帐号
+                // 所有表结构都创建完毕后，再检查并创建管理员帐号
                 checkAndCreateAdmin();
             }
         });
@@ -104,7 +104,7 @@ function checkAndCreateAdmin() {
             return;
         }
         if (!admin) {
-            console.log("未找到管理员帐号，正在建立预设管理员...");
+            console.log("未找到管理员帐号，正在创建默认管理员...");
             const adminUser = process.env.ADMIN_USER || 'admin';
             const adminPass = process.env.ADMIN_PASS || 'admin';
             const salt = bcrypt.genSaltSync(10);
@@ -112,11 +112,11 @@ function checkAndCreateAdmin() {
 
             db.run("INSERT INTO users (username, password, is_admin) VALUES (?, ?, 1)", [adminUser, hashedPassword], function(err) {
                 if (err) {
-                    console.error("建立管理员帐号失败:", err.message);
+                    console.error("创建管理员帐号失败:", err.message);
                     return;
                 }
                 const adminId = this.lastID;
-                console.log(`管理员 '${adminUser}' 建立成功。`);
+                console.log(`管理员 '${adminUser}' 创建成功。`);
                 
                 db.get("SELECT * FROM folders WHERE user_id = ? AND parent_id IS NULL", [adminId], (err, root) => {
                     if (err) {
@@ -126,31 +126,36 @@ function checkAndCreateAdmin() {
                     if (!root) {
                         db.run("INSERT INTO folders (name, parent_id, user_id) VALUES (?, NULL, ?)", ['/', adminId], function(err) {
                             if(err) {
-                                console.error("为管理员建立根目录失败:", err.message);
+                                console.error("为管理员创建根目录失败:", err.message);
                             } else {
-                                console.log("管理员根目录建立成功。");
+                                console.log("管理员根目录创建成功。");
                                 const rootId = this.lastID;
                                 // --- 主要修改开始 ---
-                                // 建立根目录后，根据设定档为管理员建立挂载点
+                                // 创建根目录后，根据设置文件为管理员创建挂载点
                                 try {
                                     if (fs.existsSync(CONFIG_FILE)) {
                                         const rawData = fs.readFileSync(CONFIG_FILE);
                                         const config = JSON.parse(rawData);
                                         if (config.webdav && Array.isArray(config.webdav)) {
-                                            console.log('正在为管理员建立 WebDAV 挂载点...');
+                                            console.log('正在为管理员创建 WebDAV 挂载点...');
                                             config.webdav.forEach(mount => {
-                                                db.run("INSERT INTO folders (name, parent_id, user_id) VALUES (?, ?, ?)", [mount.mount_name, rootId, adminId], (err) => {
-                                                    if (err) {
-                                                        console.error(`建立挂载点资料夹 "${mount.mount_name}" 失败:`, err.message);
-                                                    } else {
-                                                        console.log(`已为管理员建立挂载点资料夹: ${mount.mount_name}`);
-                                                    }
-                                                });
+                                                if (mount.mount_name) { // 确保挂载点有名字
+                                                    db.run("INSERT INTO folders (name, parent_id, user_id) VALUES (?, ?, ?)", [mount.mount_name, rootId, adminId], (err) => {
+                                                        if (err) {
+                                                            //忽略唯一性错误
+                                                            if (!err.message.includes('UNIQUE constraint failed')) {
+                                                               console.error(`创建挂载点文件夹 "${mount.mount_name}" 失败:`, err.message);
+                                                            }
+                                                        } else {
+                                                            console.log(`已为管理员创建挂载点文件夹: ${mount.mount_name}`);
+                                                        }
+                                                    });
+                                                }
                                             });
                                         }
                                     }
                                 } catch (error) {
-                                    console.error("读取设定档或建立挂载点时出错:", error);
+                                    console.error("读取设置文件或创建挂载点时出错:", error);
                                 }
                                 // --- 主要修改结束 ---
                             }
