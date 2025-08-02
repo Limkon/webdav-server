@@ -591,7 +591,9 @@ document.addEventListener('DOMContentLoaded', () => {
         });
 
         ['dragenter', 'dragover'].forEach(eventName => {
-            if (!currentIsRoot) dropZone.classList.add('dragover');
+             dropZone.addEventListener(eventName, () => {
+                if(!currentIsRoot) dropZone.classList.add('dragover');
+             });
         });
 
         ['dragleave', 'drop'].forEach(eventName => {
@@ -599,7 +601,10 @@ document.addEventListener('DOMContentLoaded', () => {
         });
 
         dropZone.addEventListener('drop', (e) => {
-            if(currentIsRoot) return;
+            if(currentIsRoot) {
+                showNotification('请进入一个挂载点子目录后再上传文件。', 'error');
+                return;
+            }
 
             const files = Array.from(e.dataTransfer.files);
              let hasFolder = false;
@@ -694,10 +699,16 @@ document.addEventListener('DOMContentLoaded', () => {
         if (document.getElementById('itemGrid')) {
             const pathParts = window.location.pathname.split('/');
             const lastPart = pathParts.filter(p => p).pop();
-            let folderId = parseInt(lastPart, 10);
-            if (isNaN(folderId)) {
-                // 如果路径不是数字，则重定向到根目录
-                window.location.href = '/';
+            let folderId;
+
+            if (pathParts[1] === 'folder' && !isNaN(parseInt(lastPart, 10))) {
+                folderId = parseInt(lastPart, 10);
+            } else {
+                axios.get('/').then(res => {
+                    const redirectUrl = res.request.responseURL;
+                    const id = redirectUrl.split('/').pop();
+                    if(!isNaN(parseInt(id,10))) loadFolderContents(parseInt(id, 10));
+                });
                 return;
             }
             loadFolderContents(folderId);
@@ -705,7 +716,7 @@ document.addEventListener('DOMContentLoaded', () => {
     });
     if (createFolderBtn) {
         createFolderBtn.addEventListener('click', async () => {
-            if(currentIsRoot) return;
+            if(createFolderBtn.disabled) return;
             const name = prompt('请输入新资料夹的名称：');
             if (name && name.trim()) {
                 try {
@@ -720,8 +731,16 @@ document.addEventListener('DOMContentLoaded', () => {
         searchForm.addEventListener('submit', (e) => {
             e.preventDefault();
             const query = searchInput.value.trim();
-            if (query) executeSearch(query);
-            else if(isSearchMode) loadFolderContents(currentFolderId);
+            if (query) {
+                executeSearch(query);
+            } else if(isSearchMode) {
+                // 从搜索返回时，需要找到根目录ID
+                 axios.get('/').then(res => {
+                    const redirectUrl = res.request.responseURL;
+                    const id = redirectUrl.split('/').pop();
+                    if(!isNaN(parseInt(id,10))) loadFolderContents(parseInt(id, 10));
+                });
+            }
         });
     }
     if (multiSelectBtn) {
@@ -755,7 +774,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     if (showUploadModalBtn) {
         showUploadModalBtn.addEventListener('click', async () => {
-            if(currentIsRoot) return;
+            if(showUploadModalBtn.disabled) return;
             await loadFoldersForSelect();
             folderSelect.value = currentFolderId;
             uploadNotificationArea.innerHTML = '';
@@ -785,7 +804,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 modalContent.innerHTML = `<img src="${downloadUrl}" alt="图片预览">`;
             } else if (file.mimetype && file.mimetype.startsWith('video/')) {
                 modalContent.innerHTML = `<video src="${downloadUrl}" controls autoplay></video>`;
-            } else if (file.mimetype && (file.mimetype.startsWith('text/') || file.name.endsWith('.txt'))) {
+            } else if (file.mimetype && (file.mimetype.startsWith('text/') || file.fileName.endsWith('.txt'))) {
                 try {
                     const res = await axios.get(`/file/content/${messageId}`);
                     const escapedContent = res.data.replace(/&/g, "&amp;").replace(/</g, "&lt;");
@@ -871,32 +890,30 @@ document.addEventListener('DOMContentLoaded', () => {
 
     if (moveBtn) {
         moveBtn.addEventListener('click', async () => {
-            if (selectedItems.size === 0) return;
-
-            let mountId = null;
+            if (moveBtn.disabled) return;
+    
+            // 客户端预防性检查
+            let firstMountId = null;
             let multipleMounts = false;
             for (const item of selectedItems.values()) {
-                const itemData = [...currentFolderContents.folders, ...currentFolderContents.files].find(i => String(i.id) === String(item.id));
-                const itemMountId = itemData ? itemData.webdav_mount_id : (await data.findFolderById(item.parent_id, userId)).webdav_mount_id;
-
-                if (mountId === null) {
-                    mountId = itemMountId;
-                } else if (mountId !== itemMountId) {
+                if (firstMountId === null) {
+                    firstMountId = item.mountId;
+                } else if (item.mountId !== firstMountId) {
                     multipleMounts = true;
                     break;
                 }
             }
-
+    
             if (multipleMounts) {
-                alert('无法同时移动来自不同 WebDAV 挂载点的项目。');
+                alert("无法同时移动来自不同 WebDAV 挂载点的项目。");
                 return;
             }
-
+    
             try {
                 const res = await axios.get('/api/folders');
                 const folders = res.data;
                 folderTree.innerHTML = '';
-
+    
                 const folderMap = new Map(folders.map(f => [f.id, { ...f, children: [] }]));
                 const tree = [];
                 folderMap.forEach(f => {
@@ -906,7 +923,7 @@ document.addEventListener('DOMContentLoaded', () => {
                         tree.push(f);
                     }
                 });
-
+    
                 const disabledFolderIds = new Set();
                 selectedItems.forEach((item, id) => {
                     if (item.type === 'folder') {
@@ -924,38 +941,41 @@ document.addEventListener('DOMContentLoaded', () => {
                         findDescendants(folderId);
                     }
                 });
-
+    
                 const buildTree = (node, prefix = '') => {
-                    // 只显示属于同一挂载点的文件夹
-                    if (!node.webdav_mount_id || node.webdav_mount_id !== mountId) {
-                        if (node.parent_id === null) { // 根目录特殊处理
-                             node.children.sort((a,b) => a.name.localeCompare(b.name)).forEach(child => buildTree(child, prefix));
-                        }
+                    if (node.webdav_mount_id !== firstMountId && node.parent_id !== null) {
                         return;
                     }
-                    
+    
+                    if (node.parent_id === null) {
+                         node.children.sort((a,b) => a.name.localeCompare(b.name)).forEach(child => buildTree(child, prefix));
+                         return;
+                    }
+    
                     const isDisabled = disabledFolderIds.has(node.id) || node.id === currentFolderId;
                     const item = document.createElement('div');
                     item.className = 'folder-item';
                     item.dataset.folderId = node.id;
-                    item.textContent = prefix + (node.name === '/' ? '根目录' : node.name);
-
+                    item.textContent = prefix + node.name;
+    
                     if (isDisabled) {
                         item.style.color = '#ccc';
                         item.style.cursor = 'not-allowed';
                     }
-
+    
                     folderTree.appendChild(item);
                     node.children.sort((a,b) => a.name.localeCompare(b.name)).forEach(child => buildTree(child, prefix + '　'));
                 };
+                
                 tree.sort((a,b) => a.name.localeCompare(b.name)).forEach(node => buildTree(node));
-
+    
                 moveModal.style.display = 'flex';
                 moveTargetFolderId = null;
                 confirmMoveBtn.disabled = true;
             } catch { alert('无法获取资料夾列表。'); }
         });
     }
+    
     if (folderTree) {
         folderTree.addEventListener('click', e => {
             const target = e.target.closest('.folder-item');
@@ -1132,23 +1152,18 @@ document.addEventListener('DOMContentLoaded', () => {
         const lastPart = pathParts.filter(p => p).pop();
         let folderId;
 
-        // 如果路径是 /folder/123 这种形式
         if (pathParts[1] === 'folder' && !isNaN(parseInt(lastPart, 10))) {
             folderId = parseInt(lastPart, 10);
         } else {
-            // 对于 / 或其他无效路径，都重定向到根目录
-            const rootLink = document.querySelector('.breadcrumb a');
-            if (rootLink && rootLink.dataset.folderId) {
-                folderId = parseInt(rootLink.dataset.folderId, 10);
-            } else {
-                // 如果连面包屑都没有，就去获取根目录ID
-                axios.get('/').catch(err => {
-                    const redirectUrl = err.request.responseURL;
-                    const id = redirectUrl.split('/').pop();
+            axios.get('/').then(res => {
+                const redirectUrl = res.request.responseURL;
+                const id = redirectUrl.split('/').pop();
+                if(!isNaN(parseInt(id,10))) {
+                    window.history.replaceState(null, '', `/folder/${id}`);
                     loadFolderContents(parseInt(id, 10));
-                });
-                return;
-            }
+                }
+            });
+            return;
         }
         loadFolderContents(folderId);
         checkScreenWidthAndCollapse();
