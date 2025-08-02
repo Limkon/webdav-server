@@ -1,31 +1,26 @@
+// data.js
 const db = require('./database.js');
 const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs').promises;
 const fsSync = require('fs');
-// 修改点：现在只从 storage 引入 getStorage
 const { getStorage } = require('./storage');
 
 const UPLOAD_DIR = path.resolve(__dirname, 'data', 'uploads');
 
-// --- 辅助函数：根据 folderId 获取其 WebDAV 路径信息 ---
-// 返回 { mountName: 'webdav1', remotePath: '/movies/action' }
 async function getWebdavPathInfo(folderId, userId) {
     if (!folderId) {
          throw new Error("无效的 folderId");
     }
     const pathParts = await getFolderPath(folderId, userId);
-    if (pathParts.length <= 1) { // 根目录或无效目录
+    if (pathParts.length <= 1) { 
         throw new Error("操作无效：不能直接在根目录进行文件操作。");
     }
     const mountName = pathParts[1].name;
     const remotePath = '/' + pathParts.slice(2).map(p => p.name).join('/');
-    return { mountName, remotePath };
+    return { mountName, remotePath: remotePath || '/' };
 }
 
-// --- 辅助函数：根据 file_id (数据库路径) 获取 WebDAV 路径信息 ---
-// 传入 '/webdav1/movies/action/file.txt'
-// 返回 { mountName: 'webdav1', remotePath: '/movies/action/file.txt' }
 function getWebdavPathInfoFromFileId(file_id) {
     const normalizedPath = path.posix.normalize(String(file_id)).replace(/^\//, '');
     const parts = normalizedPath.split('/');
@@ -99,7 +94,7 @@ async function deleteUser(userId) {
         await fs.rm(userUploadDir, { recursive: true, force: true });
     } catch (error) {
         if (error.code !== 'ENOENT') {
-            // 在生产环境中，可以考虑将此错误记录到专门的日志文件
+            //
         }
     }
     
@@ -316,17 +311,40 @@ function getAllFolders(userId) {
     });
 }
 
-// --- 主要修改开始 (移动逻辑重构) ---
+async function getMountNameForId(itemId, itemType, userId) {
+    let folderIdToCheck;
+    if (itemType === 'folder') {
+        folderIdToCheck = itemId;
+    } else {
+        const file = (await getFilesByIds([itemId], userId))[0];
+        folderIdToCheck = file ? file.folder_id : null;
+    }
+
+    if (!folderIdToCheck) return null;
+
+    const path = await getFolderPath(folderIdToCheck, userId);
+    if (path.length > 1) {
+        return path[1].name;
+    }
+    
+    const rootFolder = await getRootFolder(userId);
+    const folder = await new Promise((res, rej) => db.get("SELECT * FROM folders WHERE id = ? AND user_id = ?", [folderIdToCheck, userId], (e, r) => e ? rej(e) : res(r)));
+    if (folder && folder.parent_id === rootFolder.id) {
+         return folder.name;
+    }
+
+    return null;
+}
+
 async function moveItem(itemId, itemType, targetFolderId, userId, options = {}) {
     const { resolutions = {}, pathPrefix = '' } = options;
     const report = { moved: 0, skipped: 0, errors: 0 };
     
-    // 1. 检查跨 WebDAV 移动
-    const sourcePathInfo = await getWebdavPathInfo(itemType === 'folder' ? itemId : (await getFilesByIds([itemId], userId))[0].folder_id, userId);
-    const targetPathInfo = await getWebdavPathInfo(targetFolderId, 'folder', userId);
+    const sourceMount = await getMountNameForId(itemId, itemType, userId);
+    const targetMount = await getMountNameForId(targetFolderId, 'folder', userId);
 
-    if (sourcePathInfo.mountName !== targetPathInfo.mountName) {
-        throw new Error(`跨 WebDAV 挂载点的移动操作是不被允许的 (从 "${sourcePathInfo.mountName}" 到 "${targetPathInfo.mountName}")。`);
+    if (sourceMount && targetMount && sourceMount !== targetMount) {
+        throw new Error(`跨 WebDAV 挂载点的移动操作是不被允许的 (从 "${sourceMount}" 到 "${targetMount}")。`);
     }
     
     const sourceItem = (await getItemsByIds([itemId], userId))[0];
@@ -393,6 +411,7 @@ async function moveItem(itemId, itemType, targetFolderId, userId, options = {}) 
     }
 }
 
+
 async function unifiedDelete(itemId, itemType, userId) {
     const storage = getStorage();
     if (storage.type !== 'webdav') {
@@ -430,17 +449,14 @@ async function unifiedDelete(itemId, itemType, userId) {
         }
     }
     
-    // 先删除实体文件/文件夹
     try {
         await storage.remove(itemsForStorage);
     } catch (err) {
-        throw new Error(`实体删除失败，操作已中止: ${err.message}`);
+        throw new Error("实体文件删除失败，操作已中止。");
     }
     
-    // 再从数据库中删除记录
     await executeDeletion(fileIdsToDelete, folderIdsToDelete, userId);
 }
-
 
 async function moveSingleItem(itemId, itemType, targetFolderId, userId) {
     const storage = getStorage();
@@ -450,6 +466,7 @@ async function moveSingleItem(itemId, itemType, targetFolderId, userId) {
 
         if (itemType === 'file') {
             const [file] = await getFilesByIds([itemId], userId);
+            if(!file) throw new Error("找不到要移动的文件");
             const oldPathInfo = getWebdavPathInfoFromFileId(file.file_id);
             const newPath = { ...newPathInfo, remotePath: path.posix.join(newPathInfo.remotePath, file.fileName) };
             
@@ -460,6 +477,7 @@ async function moveSingleItem(itemId, itemType, targetFolderId, userId) {
 
         } else { // folder
             const [folder] = await getItemsByIds([itemId], userId);
+            if(!folder) throw new Error("找不到要移动的文件夹");
             const oldPathParts = await getFolderPath(itemId, userId);
             const oldMountName = oldPathParts[1].name;
             const oldRemotePath = '/' + oldPathParts.slice(1).map(p => p.name).join('/');
@@ -476,14 +494,10 @@ async function moveSingleItem(itemId, itemType, targetFolderId, userId) {
             await new Promise((res, rej) => db.run('UPDATE folders SET parent_id = ? WHERE id = ?', [targetFolderId, itemId], (e) => e ? rej(e) : res()));
         }
     } else {
-        // Fallback for non-webdav storage if needed
-        const fileIds = itemType === 'file' ? [itemId] : [];
-        const folderIds = itemType === 'folder' ? [itemId] : [];
-        await moveItemsInDb(fileIds, folderIds, targetFolderId, userId);
+        await moveItemsInDb(itemType === 'file' ? [itemId] : [], itemType === 'folder' ? [itemId] : [], targetFolderId, userId);
     }
 }
 
-// 仅用于数据库记录移动的函数
 function moveItemsInDb(fileIds = [], folderIds = [], targetFolderId, userId) {
     return new Promise((resolve, reject) => {
         db.serialize(() => {
@@ -506,8 +520,6 @@ function moveItemsInDb(fileIds = [], folderIds = [], targetFolderId, userId) {
         });
     });
 }
-// --- 主要修改结束 ---
-
 
 function deleteSingleFolder(folderId, userId) {
     return new Promise((resolve, reject) => {
@@ -539,7 +551,6 @@ async function getFolderDeletionData(folderId, userId) {
 
     await findContentsRecursive(folderId);
     
-    // 仅返回数据库对象
     const foldersToDelete = await Promise.all(foldersToDeleteIds.map(id => 
         new Promise((res, rej) => db.get("SELECT * FROM folders WHERE id=?", [id], (e, r) => e ? rej(e) : res(r)))
     ));
@@ -653,6 +664,7 @@ async function renameFile(messageId, newFileName, userId) {
     if (!file) return { success: false, message: '文件未找到。' };
 
     const storage = getStorage();
+
     if (storage.type === 'webdav') {
         const oldPathInfo = getWebdavPathInfoFromFileId(file.file_id);
         const newRemotePath = path.posix.join(path.posix.dirname(oldPathInfo.remotePath), newFileName);
@@ -669,7 +681,6 @@ async function renameFile(messageId, newFileName, userId) {
         });
     }
 
-    // Fallback for other storage types
     const sql = `UPDATE files SET fileName = ? WHERE message_id = ? AND user_id = ?`;
     return new Promise((resolve, reject) => {
         db.run(sql, [newFileName, messageId, userId], function(err) {
@@ -683,7 +694,7 @@ async function renameFile(messageId, newFileName, userId) {
 async function renameAndMoveItem(itemId, itemType, newName, targetFolderId, userId) {
      if (itemType === 'file') {
         await renameAndMoveFile(itemId, newName, targetFolderId, userId);
-    } else { // folder
+    } else {
         await renameFolder(itemId, newName, userId);
         await moveSingleItem(itemId, itemType, targetFolderId, userId);
     }
@@ -737,6 +748,7 @@ async function renameFolder(folderId, newFolderName, userId) {
                 const updatedFileId = file.file_id.replace(oldPathInfo.remotePath, newRemotePath);
                 await new Promise((res, rej) => db.run('UPDATE files SET file_id = ? WHERE message_id = ?', [updatedFileId, file.message_id], (e) => e ? rej(e) : res()));
             }
+
         }
     }
 
