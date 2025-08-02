@@ -242,7 +242,7 @@ function createFolder(name, parentId, userId) {
     return new Promise((resolve, reject) => {
         db.run(sql, [name, parentId, userId], function (err) {
             if (err) {
-                if (err.message.includes('UNIQUE')) return reject(new Error('同目录下已存在同名资料夹。'));
+                if (err.message.includes('UNIQUE')) return reject(new Error('同目录下已存在同名文件夹。'));
                 return reject(err);
             }
             resolve({ success: true, id: this.lastID });
@@ -417,7 +417,7 @@ async function unifiedDelete(itemId, itemType, userId) {
     try {
         await storage.remove(filesForStorage, foldersForStorage, userId);
     } catch (err) {
-        throw new Error("实体档案删除失败，操作已中止。");
+        throw new Error("实体文件删除失败，操作已中止。");
     }
     
     await executeDeletion(filesForStorage.map(f => f.message_id), foldersForStorage.map(f => f.id), userId);
@@ -431,13 +431,15 @@ async function moveItems(fileIds = [], folderIds = [], targetFolderId, userId) {
         
         // 移动操作只会在同一个 webdav client 内部进行，所以我们只需要一个 client
         // moveItem 已经确保了 source 和 target 在同一个挂载点
+        if(fileIds.length === 0 && folderIds.length === 0) return;
+        
         const sampleId = fileIds.length > 0 ? fileIds[0] : folderIds[0];
         const sampleType = fileIds.length > 0 ? 'file' : 'folder';
-        const { config } = await getConfigForPath(sampleId, sampleType, userId);
+        const { config } = await getConfigForPath(sampleId, sampleType === 'file' ? (await getFilesByIds([sampleId], userId))[0].file_id : sampleId, userId);
         const client = getClient(config);
 
         const targetPathParts = await getFolderPath(targetFolderId, userId);
-        const targetRemotePath = path.posix.join(...targetPathParts.slice(1).map(p => p.name));
+        const targetRemotePath = path.posix.join('/', ...targetPathParts.slice(1).map(p => p.name));
 
         const filesToMove = await getFilesByIds(fileIds, userId);
         for (const file of filesToMove) {
@@ -445,20 +447,22 @@ async function moveItems(fileIds = [], folderIds = [], targetFolderId, userId) {
             const newRelativePath = path.posix.join(targetRemotePath, file.fileName);
             
             try {
-                await client.moveFile(oldRelativePath, newRelativePath);
-                
-                const fullNewPath = path.posix.join('/', config.mount_name, newRelativePath);
-                await new Promise((res, rej) => db.run('UPDATE files SET file_id = ? WHERE message_id = ?', [fullNewPath, file.message_id], (e) => e ? rej(e) : res()));
-
+                if (await client.exists(oldRelativePath)) {
+                    await client.moveFile(oldRelativePath, newRelativePath);
+                    const fullNewPath = path.posix.join('/', config.mount_name, newRelativePath);
+                    await new Promise((res, rej) => db.run('UPDATE files SET file_id = ? WHERE message_id = ?', [fullNewPath, file.message_id], (e) => e ? rej(e) : res()));
+                }
             } catch (err) {
-                throw new Error(`物理移动文件 ${file.fileName} 失败`);
+                 if (err.response && err.response.status !== 404) {
+                    throw new Error(`物理移动文件 ${file.fileName} 失败`);
+                 }
             }
         }
         
         const foldersToMove = (await getItemsByIds(folderIds, userId)).filter(i => i.type === 'folder');
         for (const folder of foldersToMove) {
             const oldPathParts = await getFolderPath(folder.id, userId);
-            const oldRemotePath = path.posix.join(...oldPathParts.slice(1).map(p => p.name));
+            const oldRemotePath = path.posix.join('/', ...oldPathParts.slice(1).map(p => p.name));
             const newRemotePath = path.posix.join(targetRemotePath, folder.name);
 
             try {
@@ -657,9 +661,11 @@ async function renameFile(messageId, newFileName, userId) {
         const client = storage.getClient(config);
 
         try {
-            await client.moveFile(oldRemotePath, newRemotePath);
+            if (await client.exists(oldRemotePath)) {
+                await client.moveFile(oldRemotePath, newRemotePath);
+            }
         } catch(err) {
-            throw new Error(`实体档案重新命名失败`);
+            throw new Error(`实体文件重命名失败`);
         }
         
         const fullNewPath = path.posix.join('/', config.mount_name, newRemotePath);
@@ -689,6 +695,7 @@ async function renameAndMoveFile(messageId, newFileName, targetFolderId, userId)
     const storage = require('./storage').getStorage();
     if (storage.type === 'webdav') {
         const { config, remotePath: oldRemotePath } = await storage.getConfigForPath(file.file_id, userId);
+        const targetPathParts = await getFolderPath(targetFolderId, userId);
         const { remotePath: targetRemotePath } = await storage.getConfigForPath(targetFolderId, userId);
         const newRemotePath = path.posix.join(targetRemotePath, newFileName);
         const client = storage.getClient(config);
@@ -696,7 +703,7 @@ async function renameAndMoveFile(messageId, newFileName, targetFolderId, userId)
         try {
             await client.moveFile(oldRemotePath, newRemotePath);
         } catch(err) {
-            throw new Error(`实体档案移动并重命名失败`);
+            throw new Error(`实体文件移动并重命名失败`);
         }
         
         const fullNewPath = path.posix.join('/', config.mount_name, newRemotePath);
@@ -715,14 +722,16 @@ async function renameAndMoveFile(messageId, newFileName, targetFolderId, userId)
 
 async function renameFolder(folderId, newFolderName, userId) {
     const folder = await new Promise((res, rej) => db.get("SELECT * FROM folders WHERE id=?", [folderId], (e,r)=>e?rej(e):res(r)));
-    if (!folder) return { success: false, message: '资料夹未找到。'};
+    if (!folder) return { success: false, message: '文件夹未找到。'};
     
     const storage = require('./storage').getStorage();
 
     if (storage.type === 'webdav') {
         const oldPathParts = await getFolderPath(folderId, userId);
-        const { config, remotePath: oldRemotePath } = await storage.getConfigForPath(folderId, userId);
+        const oldRemotePath = path.posix.join('/', ...oldPathParts.slice(1).map(p => p.name));
         const newRemotePath = path.posix.join(path.posix.dirname(oldRemotePath), newFolderName);
+
+        const { config } = await storage.getConfigForPath(folderId, userId);
         const client = storage.getClient(config);
 
         try {
@@ -738,7 +747,7 @@ async function renameFolder(folderId, newFolderName, userId) {
 
         } catch(e) {
             if (e.response && e.response.status !== 404) {
-                 throw new Error("物理资料夹重新命名失败");
+                 throw new Error("物理文件夹重命名失败");
             }
         }
     }
@@ -747,7 +756,7 @@ async function renameFolder(folderId, newFolderName, userId) {
     return new Promise((resolve, reject) => {
         db.run(sql, [newFolderName, folderId, userId], function(err) {
             if (err) reject(err);
-            else if (this.changes === 0) resolve({ success: false, message: '资料夹未找到。' });
+            else if (this.changes === 0) resolve({ success: false, message: '文件夹未找到。' });
             else resolve({ success: true });
         });
     });
