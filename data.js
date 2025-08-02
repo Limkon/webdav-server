@@ -61,8 +61,9 @@ function listAllUsers() {
     });
 }
 
+
 async function deleteUser(userId) {
-    // 移除了删除本地资料夹的逻辑
+    // 移除了删除本地使用者资料夹的逻辑
     return new Promise((resolve, reject) => {
         const sql = `DELETE FROM users WHERE id = ? AND is_admin = 0`;
         db.run(sql, [userId], function(err) {
@@ -401,7 +402,7 @@ async function moveItems(fileIds = [], folderIds = [], targetFolderId, userId) {
         const newFullPath = path.posix.join(targetFullPath, folder.name);
 
         try {
-            await client.moveFile(oldFullPath, newFullPath);
+             await client.moveFile(oldFullPath, newFullPath);
 
             const descendantFiles = await getFilesRecursive(folder.id, userId);
             for (const file of descendantFiles) {
@@ -589,10 +590,18 @@ function findFileInSharedFolder(fileId, folderToken) {
 
 async function renameFile(messageId, newFileName, userId) {
     const file = (await getFilesByIds([messageId], userId))[0];
-    if (!file) return { success: false, message: '文件未找到。' };
+    if (!file) {
+        return { success: false, message: '文件未找到。' };
+    }
+
+    // --- *** 关键修正：增加冲突检查 *** ---
+    const conflict = await checkFullConflict(newFileName, file.folder_id, userId);
+    if (conflict) {
+        throw new Error('目标文件夹中已存在同名项目。');
+    }
+    // --- *** 修正结束 *** ---
 
     const storage = require('./storage').getStorage();
-
     const oldRelativePath = file.file_id;
     const newRelativePath = path.posix.join(path.posix.dirname(oldRelativePath), newFileName);
 
@@ -638,7 +647,16 @@ async function renameAndMoveFile(messageId, newFileName, targetFolderId, userId)
 
 async function renameFolder(folderId, newFolderName, userId) {
     const folder = await new Promise((res, rej) => db.get("SELECT * FROM folders WHERE id=?", [folderId], (e,r)=>e?rej(e):res(r)));
-    if (!folder) return { success: false, message: '资料夹未找到。'};
+    if (!folder) {
+        return { success: false, message: '资料夹未找到。'};
+    }
+
+    // --- *** 关键修正：增加冲突检查 *** ---
+    const conflict = await checkFullConflict(newFolderName, folder.parent_id, userId);
+    if (conflict) {
+        throw new Error('目标文件夹中已存在同名项目。');
+    }
+    // --- *** 修正结束 *** ---
     
     const storage = require('./storage').getStorage();
     const oldPathParts = await getFolderPath(folderId, userId);
