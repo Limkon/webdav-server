@@ -933,65 +933,74 @@ app.post('/api/cancel-share', requireLogin, async (req, res) => {
 
 // --- Scanner Endpoints ---
 app.post('/api/scan/webdav', requireAdmin, async (req, res) => {
-    const { userId } = req.body;
-    const log = [];
+    const { userId, mountId } = req.body;
+    const logOutput = [];
     try {
-        if (!userId) throw new Error('未提供用户 ID');
+        log('info', `掃描請求開始: userId=${userId}, mountId=${mountId}`);
+        if (!userId || !mountId) {
+             throw new Error('未提供使用者 ID 或掛載點 ID');
+        }
 
         const { createClient } = require('webdav');
         const config = storageManager.readConfig();
         
         if (!config.webdav || config.webdav.length === 0) {
-            throw new Error('尚未设置任何 WebDAV 挂载点');
+            throw new Error('尚未設置任何 WebDAV 掛載點');
         }
 
-        for (const mountConfig of config.webdav) {
-            log.push({ message: `开始扫描挂载点: ${mountConfig.mount_name}`, type: 'info' });
-            
-            const client = createClient(mountConfig.url, {
-                username: mountConfig.username,
-                password: mountConfig.password
-            });
-            
-            async function scanWebdavDirectory(remotePath) {
-                const contents = await client.getDirectoryContents(remotePath, { deep: true });
-                for (const item of contents) {
-                    if (item.type === 'file') {
-                        const fileIdToFind = path.posix.join('/', mountConfig.mount_name, item.filename);
-                        const existing = await data.findFileByFileId(fileIdToFind, userId);
-                         if (existing) {
-                            log.push({ message: `已存在: ${fileIdToFind}，跳过。`, type: 'info' });
-                        } else {
-                            const folderPathInDb = path.posix.join('/', mountConfig.mount_name, path.dirname(item.filename));
-                            const folderId = await data.findOrCreateFolderByPath(folderPathInDb, userId);
-                            
-                            const messageId = Date.now() * 1000 + crypto.randomInt(1000);
-                            await data.addFile({
-                                message_id: messageId,
-                                fileName: item.basename,
-                                mimetype: item.mime || 'application/octet-stream',
-                                size: item.size,
-                                file_id: fileIdToFind,
-                                date: new Date(item.lastmod).getTime(),
-                            }, folderId, userId, 'webdav');
-                            log.push({ message: `已导入: ${fileIdToFind}`, type: 'success' });
-                        }
+        const mountConfig = config.webdav.find(m => m.id === mountId);
+
+        if (!mountConfig) {
+            throw new Error(`找不到 ID 為 ${mountId} 的掛載點設定`);
+        }
+
+        logOutput.push({ message: `開始掃描掛載點: ${mountConfig.mount_name}`, type: 'info' });
+        
+        const client = createClient(mountConfig.url, {
+            username: mountConfig.username,
+            password: mountConfig.password
+        });
+        
+        async function scanWebdavDirectory(remotePath) {
+            const contents = await client.getDirectoryContents(remotePath, { deep: true });
+            for (const item of contents) {
+                if (item.type === 'file') {
+                    const fileIdToFind = path.posix.join('/', mountConfig.mount_name, item.filename);
+                    const existing = await data.findFileByFileId(fileIdToFind, userId);
+                     if (existing) {
+                        logOutput.push({ message: `已存在: ${fileIdToFind}，跳過。`, type: 'info' });
+                    } else {
+                        const folderPathInDb = path.posix.join('/', mountConfig.mount_name, path.dirname(item.filename));
+                        const folderId = await data.findOrCreateFolderByPath(folderPathInDb, userId);
+                        
+                        const messageId = Date.now() * 1000 + crypto.randomInt(1000);
+                        await data.addFile({
+                            message_id: messageId,
+                            fileName: item.basename,
+                            mimetype: item.mime || 'application/octet-stream',
+                            size: item.size,
+                            file_id: fileIdToFind,
+                            date: new Date(item.lastmod).getTime(),
+                        }, folderId, userId, 'webdav');
+                        logOutput.push({ message: `已導入: ${fileIdToFind}`, type: 'success' });
                     }
                 }
             }
-            await scanWebdavDirectory('/');
-            log.push({ message: `挂载点 ${mountConfig.mount_name} 扫描完成。`, type: 'success' });
         }
-        res.json({ success: true, log });
+        await scanWebdavDirectory('/');
+        logOutput.push({ message: `掛載點 ${mountConfig.mount_name} 掃描完成。`, type: 'success' });
+        
+        res.json({ success: true, log: logOutput });
 
     } catch (error) {
         let errorMessage = error.message;
         if (error.response && error.response.status === 403) {
             errorMessage = '访问被拒绝 (403 Forbidden)。这通常意味着您的 WebDAV 服务器不允许列出目录内容。请检查您帐号的权限，确保它有读取和浏览目录的权限。';
-            log.push({ message: '扫描失败：无法列出远程目录内容。', type: 'error' });
+            logOutput.push({ message: '扫描失败：无法列出远程目录内容。', type: 'error' });
         }
-        log.push({ message: `详细错误: ${errorMessage}`, type: 'error' });
-        res.status(500).json({ success: false, message: errorMessage, log });
+        logOutput.push({ message: `详细错误: ${errorMessage}`, type: 'error' });
+        log('error', '掃描 WebDAV 時出錯:', error);
+        res.status(500).json({ success: false, message: errorMessage, log: logOutput });
     }
 });
 
