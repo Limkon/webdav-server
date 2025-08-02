@@ -932,57 +932,60 @@ app.post('/api/cancel-share', requireLogin, async (req, res) => {
 
 // --- Scanner Endpoints ---
 app.post('/api/scan/webdav', requireAdmin, async (req, res) => {
-    const { userId } = req.body;
+    // --- *** 关键修正 开始 *** ---
+    const { userId, mountId } = req.body;
     const log = [];
     try {
         if (!userId) throw new Error('未提供用户 ID');
+        if (!mountId) throw new Error('未提供 WebDAV 挂载点 ID');
 
         const { createClient } = require('webdav');
         const config = storageManager.readConfig();
         
-        if (!config.webdav || config.webdav.length === 0) {
-            throw new Error('尚未设置任何 WebDAV 挂载点');
+        const mountConfig = config.webdav.find(m => m.id === mountId);
+
+        if (!mountConfig) {
+            throw new Error(`找不到 ID 为 "${mountId}" 的 WebDAV 挂载点`);
         }
 
-        for (const mountConfig of config.webdav) {
-            log.push({ message: `开始扫描挂载点: ${mountConfig.mount_name}`, type: 'info' });
-            
-            const client = createClient(mountConfig.url, {
-                username: mountConfig.username,
-                password: mountConfig.password
-            });
-            
-            async function scanWebdavDirectory(remotePath) {
-                const contents = await client.getDirectoryContents(remotePath, { deep: true });
-                for (const item of contents) {
-                    if (item.type === 'file') {
-                        const fileIdToFind = path.posix.join('/', mountConfig.mount_name, item.filename);
-                        const existing = await data.findFileByFileId(fileIdToFind, userId);
-                         if (existing) {
-                            log.push({ message: `已存在: ${fileIdToFind}，跳过。`, type: 'info' });
-                        } else {
-                            const folderPathInDb = path.posix.join('/', mountConfig.mount_name, path.dirname(item.filename));
-                            const folderId = await data.findOrCreateFolderByPath(folderPathInDb, userId);
-                            
-                            const messageId = Date.now() * 1000 + crypto.randomInt(1000);
-                            await data.addFile({
-                                message_id: messageId,
-                                fileName: item.basename,
-                                mimetype: item.mime || 'application/octet-stream',
-                                size: item.size,
-                                file_id: fileIdToFind,
-                                date: new Date(item.lastmod).getTime(),
-                            }, folderId, userId, 'webdav');
-                            log.push({ message: `已导入: ${fileIdToFind}`, type: 'success' });
-                        }
+        log.push({ message: `开始扫描挂载点: ${mountConfig.mount_name}`, type: 'info' });
+        
+        const client = createClient(mountConfig.url, {
+            username: mountConfig.username,
+            password: mountConfig.password
+        });
+        
+        async function scanWebdavDirectory(remotePath) {
+            const contents = await client.getDirectoryContents(remotePath, { deep: true });
+            for (const item of contents) {
+                if (item.type === 'file') {
+                    const fileIdToFind = path.posix.join('/', mountConfig.mount_name, item.filename);
+                    const existing = await data.findFileByFileId(fileIdToFind, userId);
+                     if (existing) {
+                        log.push({ message: `已存在: ${fileIdToFind}，跳过。`, type: 'info' });
+                    } else {
+                        const folderPathInDb = path.posix.join('/', mountConfig.mount_name, path.dirname(item.filename));
+                        const folderId = await data.findOrCreateFolderByPath(folderPathInDb, userId);
+                        
+                        const messageId = Date.now() * 1000 + crypto.randomInt(1000);
+                        await data.addFile({
+                            message_id: messageId,
+                            fileName: item.basename,
+                            mimetype: item.mime || 'application/octet-stream',
+                            size: item.size,
+                            file_id: fileIdToFind,
+                            date: new Date(item.lastmod).getTime(),
+                        }, folderId, userId, 'webdav');
+                        log.push({ message: `已导入: ${fileIdToFind}`, type: 'success' });
                     }
                 }
             }
-            await scanWebdavDirectory('/');
-            log.push({ message: `挂载点 ${mountConfig.mount_name} 扫描完成。`, type: 'success' });
         }
+        await scanWebdavDirectory('/');
+        log.push({ message: `挂载点 ${mountConfig.mount_name} 扫描完成。`, type: 'success' });
+        
         res.json({ success: true, log });
-
+    // --- *** 关键修正 结束 *** ---
     } catch (error) {
         let errorMessage = error.message;
         if (error.response && error.response.status === 403) {
