@@ -1,5 +1,6 @@
 document.addEventListener('DOMContentLoaded', () => {
     const userSelect = document.getElementById('user-select');
+    const scanLocalBtn = document.getElementById('scan-local-btn');
     const scanWebdavBtn = document.getElementById('scan-webdav-btn');
     const scanLog = document.getElementById('scan-log');
 
@@ -28,6 +29,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function disableButtons(disabled) {
+        scanLocalBtn.disabled = disabled;
         scanWebdavBtn.disabled = disabled;
         userSelect.disabled = disabled;
     }
@@ -56,6 +58,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
+    scanLocalBtn.addEventListener('click', () => startScan('local'));
     scanWebdavBtn.addEventListener('click', () => startScan('webdav'));
 
     loadUsers();

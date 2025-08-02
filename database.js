@@ -32,22 +32,6 @@ function initializeDatabase() {
         db.run("PRAGMA foreign_keys = ON;", (err) => {
             if (err) console.error("启用外键约束失败:", err.message);
         });
-        
-        // 新增 WebDAV 设定表
-        db.run(`CREATE TABLE IF NOT EXISTS webdav_configs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            mount_name TEXT NOT NULL,
-            url TEXT NOT NULL,
-            username TEXT NOT NULL,
-            password TEXT,
-            is_full BOOLEAN NOT NULL DEFAULT 0,
-            UNIQUE(user_id, mount_name),
-            FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
-        )`, (err) => {
-            if (err) console.error("建立 'webdav_configs' 表失败:", err.message);
-            else console.log("'webdav_configs' 表已确认存在。");
-        });
 
         db.run(`CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -59,6 +43,7 @@ function initializeDatabase() {
                 console.error("建立 'users' 表失败:", err.message);
             } else {
                 console.log("'users' 表已确认存在。");
+                // 在 users 表创建成功后，创建其他表
                 createDependentTables();
             }
         });
@@ -72,12 +57,10 @@ function createDependentTables() {
             name TEXT NOT NULL,
             parent_id INTEGER,
             user_id INTEGER NOT NULL,
-            webdav_mount_id INTEGER, -- 新增字段，用于关联 WebDAV 挂载点
             share_token TEXT,
             share_expires_at INTEGER,
             FOREIGN KEY (parent_id) REFERENCES folders (id) ON DELETE CASCADE,
             FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
-            FOREIGN KEY (webdav_mount_id) REFERENCES webdav_configs (id) ON DELETE SET NULL,
             UNIQUE(name, parent_id, user_id)
         )`, (err) => {
             if (err) console.error("建立 'folders' 表失败:", err.message);
@@ -94,18 +77,17 @@ function createDependentTables() {
             date INTEGER NOT NULL,
             share_token TEXT,
             share_expires_at INTEGER,
-            folder_id INTEGER NOT NULL,
+            folder_id INTEGER NOT NULL DEFAULT 1,
             user_id INTEGER NOT NULL,
-            storage_type TEXT NOT NULL DEFAULT 'webdav', -- 默认储存类型改为 'webdav'
-            webdav_mount_id INTEGER, -- 新增字段
+            storage_type TEXT NOT NULL DEFAULT 'telegram',
             UNIQUE(fileName, folder_id, user_id),
             FOREIGN KEY (folder_id) REFERENCES folders(id) ON DELETE CASCADE,
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-            FOREIGN KEY (webdav_mount_id) REFERENCES webdav_configs (id) ON DELETE CASCADE
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
         )`, (err) => {
             if (err) console.error("建立 'files' 表失败:", err.message);
             else {
                 console.log("'files' 表已确认存在。");
+                // 所有表结构都建立完毕后，再检查并建立管理员帐号
                 checkAndCreateAdmin();
             }
         });
