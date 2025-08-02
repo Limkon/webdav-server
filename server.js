@@ -111,7 +111,6 @@ app.post('/register', async (req, res) => {
         const hashedPassword = await bcrypt.hash(password, salt);
         const newUser = await data.createUser(username, hashedPassword); 
         await data.createFolder('/', null, newUser.id); 
-        await fsp.mkdir(path.join(__dirname, 'data', 'uploads', String(newUser.id)), { recursive: true });
         res.redirect('/login');
     } catch (error) {
         res.status(500).send('注册失败，使用者名称可能已被使用。');
@@ -131,7 +130,6 @@ app.get('/logout', (req, res) => {
 app.get('/', requireLogin, (req, res) => {
     db.get("SELECT id FROM folders WHERE user_id = ? AND parent_id IS NULL", [req.session.userId], (err, rootFolder) => {
         if (err || !rootFolder) {
-            // Attempt to create root folder if missing for some reason
             data.createFolder('/', null, req.session.userId)
                 .then(newRoot => res.redirect(`/folder/${newRoot.id}`))
                 .catch(() => res.status(500).send("找不到您的根目录，也无法建立。"));
@@ -143,7 +141,6 @@ app.get('/', requireLogin, (req, res) => {
 app.get('/folder/:id', requireLogin, (req, res) => res.sendFile(path.join(__dirname, 'views/manager.html')));
 app.get('/shares-page', requireLogin, (req, res) => res.sendFile(path.join(__dirname, 'views/shares.html')));
 app.get('/admin', requireAdmin, (req, res) => res.sendFile(path.join(__dirname, 'views/admin.html')));
-
 app.get('/scan', requireAdmin, (req, res) => res.sendFile(path.join(__dirname, 'views/scan.html')));
 
 // --- API Endpoints ---
@@ -174,19 +171,6 @@ app.post('/api/user/change-password', requireLogin, async (req, res) => {
     }
 });
 
-app.get('/api/admin/storage-mode', requireAdmin, (req, res) => {
-    res.json({ mode: storageManager.readConfig().storageMode });
-});
-
-app.post('/api/admin/storage-mode', requireAdmin, (req, res) => {
-    const { mode } = req.body;
-    if (storageManager.setStorageMode(mode)) {
-        res.json({ success: true, message: '设定已储存。' });
-    } else {
-        res.status(400).json({ success: false, message: '无效的模式' });
-    }
-});
-
 app.get('/api/admin/users', requireAdmin, async (req, res) => {
     try {
         const users = await data.listNormalUsers();
@@ -205,7 +189,6 @@ app.get('/api/admin/all-users', requireAdmin, async (req, res) => {
     }
 });
 
-
 app.post('/api/admin/add-user', requireAdmin, async (req, res) => {
     const { username, password } = req.body;
     if (!username || !password || password.length < 4) {
@@ -216,7 +199,6 @@ app.post('/api/admin/add-user', requireAdmin, async (req, res) => {
         const hashedPassword = await bcrypt.hash(password, salt);
         const newUser = await data.createUser(username, hashedPassword);
         await data.createFolder('/', null, newUser.id);
-        await fsp.mkdir(path.join(__dirname, 'data', 'uploads', String(newUser.id)), { recursive: true });
         res.json({ success: true, user: newUser });
     } catch (error) {
         res.status(500).json({ success: false, message: '建立使用者失败，可能使用者名称已被使用。' });
@@ -386,6 +368,7 @@ app.post('/upload', requireLogin, async (req, res, next) => {
         res.status(500).json({ success: false, message: '处理上传时发生错误: ' + error.message });
     }
 });
+
 app.post('/api/text-file', requireLogin, async (req, res) => {
     const { mode, fileId, folderId, fileName, content } = req.body;
     const userId = req.session.userId;
@@ -548,21 +531,15 @@ app.post('/api/folder', requireLogin, async (req, res) => {
         const result = await data.createFolder(name, parentId, userId);
         
         const storage = storageManager.getStorage();
-        if (storage.type === 'local' || storage.type === 'webdav') {
+        if (storage.type === 'webdav' && storage.createDirectory) {
             const newFolderPathParts = await data.getFolderPath(result.id, userId);
             const newFullPath = path.posix.join(...newFolderPathParts.slice(1).map(p => p.name));
-
-            if (storage.type === 'local') {
-                const newLocalPath = path.join(__dirname, 'data', 'uploads', String(userId), newFullPath);
-                await fsp.mkdir(newLocalPath, { recursive: true });
-            } else if (storage.type === 'webdav' && storage.createDirectory) {
-                await storage.createDirectory(newFullPath);
-            }
+            await storage.createDirectory(newFullPath);
         }
 
         res.json(result);
     } catch (error) {
-         res.status(500).json({ success: false, message: error.message || '处理资料夹时发生错误。' });
+         res.status(500).json({ success: false, message: error.message || '处理资料夾时发生错误。' });
     }
 });
 
@@ -659,24 +636,6 @@ app.post('/rename', requireLogin, async (req, res) => {
     }
 });
 
-app.get('/thumbnail/:message_id', requireLogin, async (req, res) => {
-    try {
-        const messageId = parseInt(req.params.message_id, 10);
-        const [fileInfo] = await data.getFilesByIds([messageId], req.session.userId);
-
-        if (fileInfo && fileInfo.storage_type === 'telegram' && fileInfo.thumb_file_id) {
-            const storage = storageManager.getStorage();
-            const link = await storage.getUrl(fileInfo.thumb_file_id);
-            if (link) return res.redirect(link);
-        }
-        
-        const placeholder = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
-        res.writeHead(200, { 'Content-Type': 'image/gif', 'Content-Length': placeholder.length });
-        res.end(placeholder);
-
-    } catch (error) { res.status(500).send('获取缩图失败'); }
-});
-
 app.get('/download/proxy/:message_id', requireLogin, async (req, res) => {
     try {
         const messageId = parseInt(req.params.message_id, 10);
@@ -692,16 +651,8 @@ app.get('/download/proxy/:message_id', requireLogin, async (req, res) => {
         if (fileInfo.mimetype) res.setHeader('Content-Type', fileInfo.mimetype);
         if (fileInfo.size) res.setHeader('Content-Length', fileInfo.size);
 
-        if (fileInfo.storage_type === 'local' || fileInfo.storage_type === 'webdav') {
-            const stream = await storage.stream(fileInfo.file_id, req.session.userId);
-            handleStream(stream, res);
-        } else if (fileInfo.storage_type === 'telegram') {
-            const link = await storage.getUrl(fileInfo.file_id);
-            if (link) {
-                const response = await axios({ method: 'get', url: link, responseType: 'stream' });
-                response.data.pipe(res);
-            } else { res.status(404).send('无法获取文件链接'); }
-        }
+        const stream = await storage.stream(fileInfo.file_id, req.session.userId);
+        handleStream(stream, res);
 
     } catch (error) { 
         res.status(500).send('下载代理失败: ' + error.message); 
@@ -720,16 +671,8 @@ app.get('/file/content/:message_id', requireLogin, async (req, res) => {
         const storage = storageManager.getStorage();
         res.setHeader('Content-Type', 'text/plain; charset=utf-8');
 
-        if (fileInfo.storage_type === 'local' || fileInfo.storage_type === 'webdav') {
-            const stream = await storage.stream(fileInfo.file_id, req.session.userId);
-            handleStream(stream, res);
-        } else if (fileInfo.storage_type === 'telegram') {
-            const link = await storage.getUrl(fileInfo.file_id);
-            if (link) {
-                const response = await axios.get(link, { responseType: 'text' });
-                res.send(response.data);
-            } else { res.status(404).send('无法获取文件链接'); }
-        }
+        const stream = await storage.stream(fileInfo.file_id, req.session.userId);
+        handleStream(stream, res);
     } catch (error) { 
         res.status(500).send('无法获取文件内容'); 
     }
@@ -765,16 +708,8 @@ app.post('/api/download-archive', requireLogin, async (req, res) => {
         archive.pipe(res);
 
         for (const file of filesToArchive) {
-             if (file.storage_type === 'local' || file.storage_type === 'webdav') {
-                const stream = await storage.stream(file.file_id, userId);
-                archive.append(stream, { name: file.path });
-             } else if (file.storage_type === 'telegram') {
-                const link = await storage.getUrl(file.file_id);
-                if (link) {
-                    const response = await axios({ url: link, method: 'GET', responseType: 'stream' });
-                    archive.append(response.data, { name: file.path });
-                }
-            }
+            const stream = await storage.stream(file.file_id, userId);
+            archive.append(stream, { name: file.path });
         }
         await archive.finalize();
     } catch (error) {
@@ -824,62 +759,6 @@ app.post('/api/cancel-share', requireLogin, async (req, res) => {
 });
 
 // --- Scanner Endpoints ---
-app.post('/api/scan/local', requireAdmin, async (req, res) => {
-    const { userId } = req.body;
-    const log = [];
-    try {
-        if (!userId) throw new Error('未提供使用者 ID');
-
-        const userUploadDir = path.join(__dirname, 'data', 'uploads', String(userId));
-        if (!fs.existsSync(userUploadDir)) {
-            log.push({ message: `使用者 ${userId} 的本地储存目录不存在，跳过。`, type: 'warn' });
-            return res.json({ success: true, log });
-        }
-        
-        const rootFolder = await data.getRootFolder(userId);
-        if (!rootFolder) {
-            throw new Error(`找不到使用者 ${userId} 的根目录`);
-        }
-
-        async function scanDirectory(dir) {
-            const entries = await fsp.readdir(dir, { withFileTypes: true });
-            for (const entry of entries) {
-                const fullPath = path.join(dir, entry.name);
-                const relativePath = path.relative(userUploadDir, fullPath).replace(/\\/g, '/');
-                const fileId = relativePath; // file_id is the relative path
-
-                if (entry.isDirectory()) {
-                    await scanDirectory(fullPath);
-                } else {
-                    const existing = await data.findFileByFileId(fileId, userId);
-                    if (existing) {
-                        log.push({ message: `已存在: ${relativePath}，跳过。`, type: 'info' });
-                    } else {
-                        const stats = await fsp.stat(fullPath);
-                        const folderPath = path.dirname(relativePath).replace(/\\/g, '/');
-                        const folderId = await data.findOrCreateFolderByPath(folderPath, userId);
-                        const messageId = BigInt(Date.now()) * 1000000n + BigInt(crypto.randomInt(1000000));
-                        await data.addFile({
-                            message_id: messageId,
-                            fileName: entry.name,
-                            mimetype: 'application/octet-stream',
-                            size: stats.size,
-                            file_id: fileId,
-                            date: stats.mtime.getTime(),
-                        }, folderId, userId, 'local');
-                        log.push({ message: `已汇入: ${relativePath}`, type: 'success' });
-                    }
-                }
-            }
-        }
-        await scanDirectory(userUploadDir);
-        res.json({ success: true, log });
-    } catch (error) {
-        log.push({ message: `扫描本地文件时出错: ${error.message}`, type: 'error' });
-        res.status(500).json({ success: false, message: error.message, log });
-    }
-});
-
 app.post('/api/scan/webdav', requireAdmin, async (req, res) => {
     const { userId } = req.body;
     const log = [];
@@ -946,21 +825,13 @@ app.get('/share/view/file/:token', async (req, res) => {
             let textContent = null;
             if (fileInfo.mimetype && fileInfo.mimetype.startsWith('text/')) {
                 const storage = storageManager.getStorage();
-                if (fileInfo.storage_type === 'local' || fileInfo.storage_type === 'webdav') {
-                    const stream = await storage.stream(fileInfo.file_id, fileInfo.user_id);
-                     textContent = await new Promise((resolve, reject) => {
-                        let data = '';
-                        stream.on('data', chunk => data += chunk);
-                        stream.on('end', () => resolve(data));
-                        stream.on('error', err => reject(err));
-                    });
-                } else if (fileInfo.storage_type === 'telegram') {
-                    const link = await storage.getUrl(fileInfo.file_id);
-                    if (link) {
-                        const response = await axios.get(link, { responseType: 'text' });
-                        textContent = response.data;
-                    }
-                }
+                const stream = await storage.stream(fileInfo.file_id, fileInfo.user_id);
+                 textContent = await new Promise((resolve, reject) => {
+                    let data = '';
+                    stream.on('data', chunk => data += chunk);
+                    stream.on('end', () => resolve(data));
+                    stream.on('error', err => reject(err));
+                });
             }
             res.render('share-view', { file: fileInfo, downloadUrl, textContent });
         } else {
@@ -1008,38 +879,9 @@ app.get('/share/download/file/:token', async (req, res) => {
         const storage = storageManager.getStorage();
         res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(fileInfo.fileName)}`);
 
-        if (fileInfo.storage_type === 'local' || fileInfo.storage_type === 'webdav') {
-            const stream = await storage.stream(fileInfo.file_id, fileInfo.user_id);
-            handleStream(stream, res);
-        } else if (fileInfo.storage_type === 'telegram') {
-            const link = await storage.getUrl(fileInfo.file_id);
-            if (link) {
-                const response = await axios({ method: 'get', url: link, responseType: 'stream' });
-                response.data.pipe(res);
-            } else { res.status(404).send('无法获取文件链接'); }
-        }
-
+        const stream = await storage.stream(fileInfo.file_id, fileInfo.user_id);
+        handleStream(stream, res);
     } catch (error) { res.status(500).send('下载失败'); }
-});
-
-app.get('/share/thumbnail/:folderToken/:fileId', async (req, res) => {
-    try {
-        const { folderToken, fileId } = req.params;
-        const fileInfo = await data.findFileInSharedFolder(parseInt(fileId, 10), folderToken);
-
-        if (fileInfo && fileInfo.storage_type === 'telegram' && fileInfo.thumb_file_id) {
-            const storage = storageManager.getStorage();
-            const link = await storage.getUrl(fileInfo.thumb_file_id);
-            if (link) return res.redirect(link);
-        }
-        
-        const placeholder = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
-        res.writeHead(200, { 'Content-Type': 'image/gif', 'Content-Length': placeholder.length });
-        res.end(placeholder);
-
-    } catch (error) {
-        res.status(500).send('获取缩图失败');
-    }
 });
 
 app.get('/share/download/:folderToken/:fileId', async (req, res) => {
@@ -1054,16 +896,8 @@ app.get('/share/download/:folderToken/:fileId', async (req, res) => {
         const storage = storageManager.getStorage();
         res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(fileInfo.fileName)}`);
 
-        if (fileInfo.storage_type === 'local' || fileInfo.storage_type === 'webdav') {
-            const stream = await storage.stream(fileInfo.file_id, fileInfo.user_id);
-            handleStream(stream, res);
-        } else if (fileInfo.storage_type === 'telegram') {
-            const link = await storage.getUrl(fileInfo.file_id);
-            if (link) {
-                const response = await axios({ method: 'get', url: link, responseType: 'stream' });
-                response.data.pipe(res);
-            } else { res.status(404).send('无法获取文件链接'); }
-        }
+        const stream = await storage.stream(fileInfo.file_id, fileInfo.user_id);
+        handleStream(stream, res);
     } catch (error) {
         res.status(500).send('下载失败');
     }
