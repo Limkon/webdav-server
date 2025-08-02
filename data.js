@@ -2,10 +2,410 @@ const db = require('./database.js');
 const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs').promises;
-const fsSync = require('fs');
 
-const UPLOAD_DIR = path.resolve(__dirname, 'data', 'uploads');
+// --- Helper Functions ---
 
+function getItemsByIds(itemIds, userId) {
+    return new Promise((resolve, reject) => {
+        if (!itemIds || itemIds.length === 0) return resolve([]);
+        const placeholders = itemIds.map(() => '?').join(',');
+        const sql = `
+            SELECT id, name, parent_id, 'folder' as type, null as storage_type, null as file_id
+            FROM folders 
+            WHERE id IN (${placeholders}) AND user_id = ?
+            UNION ALL
+            SELECT message_id as id, fileName as name, folder_id as parent_id, 'file' as type, storage_type, file_id
+            FROM files 
+            WHERE message_id IN (${placeholders}) AND user_id = ?
+        `;
+        db.all(sql, [...itemIds, userId, ...itemIds, userId], (err, rows) => {
+            if (err) return reject(err);
+            resolve(rows);
+        });
+    });
+}
+
+function getFilesByIds(messageIds, userId) {
+    if (!messageIds || messageIds.length === 0) {
+        return Promise.resolve([]);
+    }
+    const placeholders = messageIds.map(() => '?').join(',');
+    const sql = `SELECT * FROM files WHERE message_id IN (${placeholders}) AND user_id = ?`;
+    return new Promise((resolve, reject) => {
+        db.all(sql, [...messageIds, userId], (err, rows) => {
+            if (err) reject(err);
+            else resolve(rows);
+        });
+    });
+}
+
+
+function findItemInFolder(name, folderId, userId) {
+    return new Promise((resolve, reject) => {
+        const sql = `
+            SELECT id, name, 'folder' as type FROM folders WHERE name = ? AND parent_id = ? AND user_id = ?
+            UNION ALL
+            SELECT message_id as id, fileName as name, 'file' as type FROM files WHERE fileName = ? AND folder_id = ? AND user_id = ?
+        `;
+        db.get(sql, [name, folderId, userId, name, folderId, userId], (err, row) => {
+            if (err) return reject(err);
+            resolve(row);
+        });
+    });
+}
+
+function getChildrenOfFolder(folderId, userId) {
+    return new Promise((resolve, reject) => {
+        const sql = `
+            SELECT id, name, 'folder' as type FROM folders WHERE parent_id = ? AND user_id = ?
+            UNION ALL
+            SELECT message_id as id, fileName as name, 'file' as type FROM files WHERE folder_id = ? AND user_id = ?
+        `;
+        db.all(sql, [folderId, userId, folderId, userId], (err, rows) => {
+            if (err) return reject(err);
+            resolve(rows);
+        });
+    });
+}
+
+function getFolderPath(folderId, userId) {
+    let pathArr = [];
+    return new Promise((resolve, reject) => {
+        function findParent(id) {
+            if (!id) return resolve(pathArr.reverse());
+            db.get("SELECT id, name, parent_id FROM folders WHERE id = ? AND user_id = ?", [id, userId], (err, folder) => {
+                if (err) return reject(err);
+                if (folder) {
+                    pathArr.push({ id: folder.id, name: folder.name });
+                    findParent(folder.parent_id);
+                } else {
+                    // 如果找不到父目录（可能是根目录），则返回当前路径
+                    resolve(pathArr.reverse());
+                }
+            });
+        }
+        findParent(folderId);
+    });
+}
+
+async function getFilesRecursive(folderId, userId, currentPath = '') {
+    let allFiles = [];
+    const sqlFiles = "SELECT * FROM files WHERE folder_id = ? AND user_id = ?";
+    const files = await new Promise((res, rej) => db.all(sqlFiles, [folderId, userId], (err, rows) => err ? rej(err) : res(rows)));
+    for (const file of files) {
+        allFiles.push({ ...file, path: path.join(currentPath, file.fileName) });
+    }
+
+    const sqlFolders = "SELECT id, name FROM folders WHERE parent_id = ? AND user_id = ?";
+    const subFolders = await new Promise((res, rej) => db.all(sqlFolders, [folderId, userId], (err, rows) => err ? rej(err) : res(rows)));
+    for (const subFolder of subFolders) {
+        const nestedFiles = await getFilesRecursive(subFolder.id, userId, path.join(currentPath, subFolder.name));
+        allFiles.push(...nestedFiles);
+    }
+    return allFiles;
+}
+
+// --- Atomic Database Operations ---
+
+function dbRun(sql, params) {
+    return new Promise((resolve, reject) => {
+        db.run(sql, params, function(err) {
+            if (err) return reject(err);
+            resolve(this);
+        });
+    });
+}
+
+function dbExec(sql) {
+    return new Promise((resolve, reject) => {
+        db.exec(sql, function(err) {
+            if (err) return reject(err);
+            resolve(this);
+        });
+    });
+}
+
+async function performAtomicMove(sourceFileId, targetFileId, targetFolderId, newFileId, userId) {
+    try {
+        await dbExec("BEGIN TRANSACTION;");
+        await dbRun(`DELETE FROM files WHERE message_id = ? AND user_id = ?`, [targetFileId, userId]);
+        await dbRun(`UPDATE files SET folder_id = ?, file_id = ? WHERE message_id = ? AND user_id = ?`, [targetFolderId, newFileId, sourceFileId, userId]);
+        await dbExec("COMMIT;");
+    } catch (error) {
+        await dbExec("ROLLBACK;");
+        throw error; // Re-throw the error to be caught by the caller
+    }
+}
+
+
+// --- Core Logic ---
+
+async function moveItem(itemId, itemType, targetFolderId, userId, options = {}) {
+    const { resolutions = {}, pathPrefix = '' } = options;
+    const report = { moved: 0, skipped: 0, errors: 0 };
+
+    const sourceItem = (await getItemsByIds([itemId], userId))[0];
+    if (!sourceItem || (itemType === 'folder' && itemId === targetFolderId)) {
+        report.skipped++;
+        return report;
+    }
+
+    const currentPath = path.join(pathPrefix, sourceItem.name).replace(/\\/g, '/');
+    const existingItemInTarget = await findItemInFolder(sourceItem.name, targetFolderId, userId);
+    let resolutionAction = resolutions[currentPath] || (existingItemInTarget ? 'skip_default' : 'move');
+
+    // Prevent moving a folder into itself or its current location
+    if (itemType === 'folder') {
+        if (sourceItem.id === targetFolderId || sourceItem.parent_id === targetFolderId) {
+             if (!existingItemInTarget || resolutions[currentPath] !== 'merge') {
+                resolutionAction = 'skip';
+            }
+        }
+        const descendantIds = await getAllDescendantFolderIds(itemId, userId);
+        if (descendantIds.includes(targetFolderId)) {
+            resolutionAction = 'skip';
+        }
+    }
+
+
+    switch (resolutionAction) {
+        case 'skip':
+        case 'skip_default':
+            report.skipped++;
+            return report;
+            
+        case 'overwrite':
+            if (!existingItemInTarget || sourceItem.type !== existingItemInTarget.type) {
+                report.skipped++;
+                return report;
+            }
+            
+            try {
+                if (sourceItem.type === 'file') {
+                    const storage = require('./storage').getStorage();
+                    const client = storage.getClient();
+                    const sourceFile = (await getFilesByIds([sourceItem.id], userId))[0];
+                    const targetFile = (await getFilesByIds([existingItemInTarget.id], userId))[0];
+
+                    // 1. Physical Operations
+                    await client.removeFile(targetFile.file_id);
+                    await client.moveFile(sourceFile.file_id, targetFile.file_id);
+
+                    // 2. Atomic Database Operation
+                    await performAtomicMove(sourceFile.message_id, targetFile.message_id, targetFolderId, targetFile.file_id, userId);
+                    
+                    report.moved++;
+
+                } else { // Folder overwrite
+                    const children = await getChildrenOfFolder(sourceItem.id, userId);
+                    for (const child of children) {
+                        // Pass 'overwrite' as the default resolution for children
+                        const childResolutions = { ...resolutions };
+                        const childRelativePath = path.join(currentPath, child.name).replace(/\\/g, '/');
+                        if (!childResolutions[childRelativePath]) {
+                            childResolutions[childRelativePath] = 'overwrite';
+                        }
+                        const childReport = await moveItem(child.id, child.type, existingItemInTarget.id, userId, { resolutions: childResolutions, pathPrefix: currentPath });
+                        report.moved += childReport.moved;
+                        report.skipped += childReport.skipped;
+                        report.errors += childReport.errors;
+                    }
+                    if(report.errors === 0){
+                         await unifiedDelete(sourceItem.id, 'folder', userId);
+                    }
+                }
+            } catch (err) {
+                report.errors++;
+                console.error("Critical overwrite error:", err);
+            }
+            return report;
+            
+        case 'merge':
+             if (!existingItemInTarget || existingItemInTarget.type !== 'folder' || itemType !== 'folder') {
+                report.skipped++;
+                return report;
+            }
+            const children = await getChildrenOfFolder(itemId, userId);
+            for (const child of children) {
+                const childReport = await moveItem(child.id, child.type, existingItemInTarget.id, userId, { ...options, pathPrefix: currentPath });
+                report.moved += childReport.moved;
+                report.skipped += childReport.skipped;
+                report.errors += childReport.errors;
+            }
+            if(report.errors === 0){
+                await unifiedDelete(itemId, 'folder', userId);
+            }
+            return report;
+
+        default: // 'move'
+            await moveItems([itemType === 'file' ? itemId : null].filter(Boolean), [itemType === 'folder' ? itemId : null].filter(Boolean), targetFolderId, userId);
+            report.moved++;
+            return report;
+    }
+}
+
+async function unifiedDelete(itemId, itemType, userId) {
+    const storage = require('./storage').getStorage();
+    let filesForStorage = [];
+    let foldersForStorage = [];
+
+    if (itemType === 'folder') {
+        const deletionData = await getFolderDeletionData(itemId, userId);
+        filesForStorage.push(...deletionData.files);
+        foldersForStorage.push(...deletionData.folders);
+    } else {
+        const directFiles = await getFilesByIds([itemId], userId);
+        filesForStorage.push(...directFiles);
+    }
+
+    try {
+        if (storage.remove) {
+            await storage.remove(filesForStorage, foldersForStorage, userId);
+        }
+    } catch (err) {
+        console.error("Storage removal failed, but continuing with DB deletion:", err.message);
+    }
+
+    await executeDeletion(filesForStorage.map(f => f.message_id), foldersForStorage.map(f => f.id), userId);
+}
+
+async function moveItems(fileIds = [], folderIds = [], targetFolderId, userId) {
+    const storage = require('./storage').getStorage();
+    if (storage.type !== 'webdav') return; // Only WebDAV needs physical move
+
+    const client = storage.getClient();
+    if (!client) throw new Error("WebDAV client is not available.");
+
+    const targetPathParts = await getFolderPath(targetFolderId, userId);
+    const targetFullPath = path.posix.join(...targetPathParts.slice(1).map(p => p.name));
+
+    // Physical moves
+    const filesToMove = await getFilesByIds(fileIds, userId);
+    for (const file of filesToMove) {
+        const oldRelativePath = file.file_id;
+        const newRelativePath = path.posix.join(targetFullPath, file.fileName).replace(/\\/g, '/');
+        if (oldRelativePath !== newRelativePath) {
+            await client.moveFile(oldRelativePath, newRelativePath);
+            await dbRun('UPDATE files SET file_id = ? WHERE message_id = ?', [newRelativePath, file.message_id]);
+        }
+    }
+
+    const foldersToMove = (await getItemsByIds(folderIds, userId)).filter(i => i.type === 'folder');
+    for (const folder of foldersToMove) {
+        const oldPathParts = await getFolderPath(folder.id, userId);
+        const oldFullPath = path.posix.join(...oldPathParts.slice(1).map(p => p.name));
+        const newFullPath = path.posix.join(targetFullPath, folder.name).replace(/\\/g, '/');
+        if (oldFullPath !== newFullPath) {
+            await client.moveFile(oldFullPath, newFullPath);
+            const descendantFiles = await getFilesRecursive(folder.id, userId);
+            for (const file of descendantFiles) {
+                const updatedFileId = file.file_id.replace(oldFullPath, newFullPath);
+                await dbRun('UPDATE files SET file_id = ? WHERE message_id = ?', [updatedFileId, file.message_id]);
+            }
+        }
+    }
+
+    // DB transaction for changing parent folder
+    try {
+        await dbExec("BEGIN TRANSACTION;");
+        if (fileIds.length > 0) {
+            await dbRun(`UPDATE files SET folder_id = ? WHERE message_id IN (${fileIds.map(()=>'?').join(',')}) AND user_id = ?`, [targetFolderId, ...fileIds, userId]);
+        }
+        if (folderIds.length > 0) {
+            await dbRun(`UPDATE folders SET parent_id = ? WHERE id IN (${folderIds.map(()=>'?').join(',')}) AND user_id = ?`, [targetFolderId, ...folderIds, userId]);
+        }
+        await dbExec("COMMIT;");
+    } catch(err) {
+        await dbExec("ROLLBACK;");
+        throw err;
+    }
+}
+
+// --- Remaining helper and model functions (unchanged from previous correct versions) ---
+
+async function getFolderDeletionData(folderId, userId) {
+    let filesToDelete = [];
+    let foldersToDeleteIds = [folderId];
+
+    async function findContentsRecursive(currentFolderId) {
+        const sqlFiles = `SELECT * FROM files WHERE folder_id = ? AND user_id = ?`;
+        const files = await new Promise((res, rej) => db.all(sqlFiles, [currentFolderId, userId], (err, rows) => err ? rej(err) : res(rows)));
+        filesToDelete.push(...files);
+        
+        const sqlFolders = `SELECT id FROM folders WHERE parent_id = ? AND user_id = ?`;
+        const subFolders = await new Promise((res, rej) => db.all(sqlFolders, [currentFolderId, userId], (err, rows) => err ? rej(err) : res(rows)));
+        
+        for (const subFolder of subFolders) {
+            foldersToDeleteIds.push(subFolder.id);
+            await findContentsRecursive(subFolder.id);
+        }
+    }
+
+    await findContentsRecursive(folderId);
+
+    const allUserFolders = await getAllFolders(userId);
+    const folderMap = new Map(allUserFolders.map(f => [f.id, f]));
+    
+    function buildPath(fId, currentMap) {
+        let pathParts = [];
+        let current = currentMap.get(fId);
+        while(current && current.parent_id) {
+            pathParts.unshift(current.name);
+            current = currentMap.get(current.parent_id);
+        }
+        return path.posix.join(...pathParts);
+    }
+
+    const foldersToDeleteWithPaths = foldersToDeleteIds.map(id => ({
+        id: id,
+        path: buildPath(id, folderMap)
+    }));
+
+    return { files: filesToDelete, folders: foldersToDeleteWithPaths };
+}
+
+
+async function executeDeletion(fileIds, folderIds, userId) {
+    if (fileIds.length === 0 && folderIds.length === 0) return;
+     try {
+        await dbExec("BEGIN TRANSACTION;");
+        if (fileIds.length > 0) {
+            await dbRun(`DELETE FROM files WHERE message_id IN (${fileIds.map(()=>'?').join(',')}) AND user_id = ?`, [...new Set(fileIds), userId]);
+        }
+        if (folderIds.length > 0) {
+             await dbRun(`DELETE FROM folders WHERE id IN (${folderIds.map(()=>'?').join(',')}) AND user_id = ?`, [...new Set(folderIds), userId]);
+        }
+        await dbExec("COMMIT;");
+    } catch(err) {
+        await dbExec("ROLLBACK;");
+        throw err;
+    }
+}
+async function getAllDescendantFolderIds(folderId, userId) {
+    let descendants = [];
+    let queue = [folderId];
+    const visited = new Set(queue);
+
+    while (queue.length > 0) {
+        const currentId = queue.shift();
+        const sql = `SELECT id FROM folders WHERE parent_id = ? AND user_id = ?`;
+        const children = await new Promise((resolve, reject) => {
+            db.all(sql, [currentId, userId], (err, rows) => {
+                if (err) reject(err);
+                else resolve(rows);
+            });
+        });
+
+        for (const child of children) {
+            if (!visited.has(child.id)) {
+                visited.add(child.id);
+                descendants.push(child.id);
+                queue.push(child.id);
+            }
+        }
+    }
+    return descendants;
+}
 function createUser(username, hashedPassword) {
     return new Promise((resolve, reject) => {
         const sql = `INSERT INTO users (username, password, is_admin) VALUES (?, ?, 0)`;
@@ -66,15 +466,6 @@ function listAllUsers() {
 
 
 async function deleteUser(userId) {
-    const userUploadDir = path.join(UPLOAD_DIR, String(userId));
-    try {
-        await fs.rm(userUploadDir, { recursive: true, force: true });
-    } catch (error) {
-        if (error.code !== 'ENOENT') {
-            // 在生产环境中，可以考虑将此错误记录到专门的日志文件
-        }
-    }
-    
     return new Promise((resolve, reject) => {
         const sql = `DELETE FROM users WHERE id = ? AND is_admin = 0`;
         db.run(sql, [userId], function(err) {
@@ -113,67 +504,6 @@ function searchItems(query, userId) {
         });
     });
 }
-
-function getItemsByIds(itemIds, userId) {
-    return new Promise((resolve, reject) => {
-        if (!itemIds || itemIds.length === 0) return resolve([]);
-        const placeholders = itemIds.map(() => '?').join(',');
-        const sql = `
-            SELECT id, name, parent_id, 'folder' as type, null as storage_type, null as file_id
-            FROM folders 
-            WHERE id IN (${placeholders}) AND user_id = ?
-            UNION ALL
-            SELECT message_id as id, fileName as name, folder_id as parent_id, 'file' as type, storage_type, file_id
-            FROM files 
-            WHERE message_id IN (${placeholders}) AND user_id = ?
-        `;
-        db.all(sql, [...itemIds, userId, ...itemIds, userId], (err, rows) => {
-            if (err) return reject(err);
-            resolve(rows);
-        });
-    });
-}
-
-function getChildrenOfFolder(folderId, userId) {
-    return new Promise((resolve, reject) => {
-        const sql = `
-            SELECT id, name, 'folder' as type FROM folders WHERE parent_id = ? AND user_id = ?
-            UNION ALL
-            SELECT message_id as id, fileName as name, 'file' as type FROM files WHERE folder_id = ? AND user_id = ?
-        `;
-        db.all(sql, [folderId, userId, folderId, userId], (err, rows) => {
-            if (err) return reject(err);
-            resolve(rows);
-        });
-    });
-}
-
-async function getAllDescendantFolderIds(folderId, userId) {
-    let descendants = [];
-    let queue = [folderId];
-    const visited = new Set(queue);
-
-    while (queue.length > 0) {
-        const currentId = queue.shift();
-        const sql = `SELECT id FROM folders WHERE parent_id = ? AND user_id = ?`;
-        const children = await new Promise((resolve, reject) => {
-            db.all(sql, [currentId, userId], (err, rows) => {
-                if (err) reject(err);
-                else resolve(rows);
-            });
-        });
-
-        for (const child of children) {
-            if (!visited.has(child.id)) {
-                visited.add(child.id);
-                descendants.push(child.id);
-                queue.push(child.id);
-            }
-        }
-    }
-    return descendants;
-}
-
 function getFolderContents(folderId, userId) {
     return new Promise((resolve, reject) => {
         const sqlFolders = `SELECT id, name, parent_id, 'folder' as type FROM folders WHERE parent_id = ? AND user_id = ? ORDER BY name ASC`;
@@ -190,24 +520,6 @@ function getFolderContents(folderId, userId) {
         });
     });
 }
-
-async function getFilesRecursive(folderId, userId, currentPath = '') {
-    let allFiles = [];
-    const sqlFiles = "SELECT * FROM files WHERE folder_id = ? AND user_id = ?";
-    const files = await new Promise((res, rej) => db.all(sqlFiles, [folderId, userId], (err, rows) => err ? rej(err) : res(rows)));
-    for (const file of files) {
-        allFiles.push({ ...file, path: path.join(currentPath, file.fileName) });
-    }
-
-    const sqlFolders = "SELECT id, name FROM folders WHERE parent_id = ? AND user_id = ?";
-    const subFolders = await new Promise((res, rej) => db.all(sqlFolders, [folderId, userId], (err, rows) => err ? rej(err) : res(rows)));
-    for (const subFolder of subFolders) {
-        const nestedFiles = await getFilesRecursive(subFolder.id, userId, path.join(currentPath, subFolder.name));
-        allFiles.push(...nestedFiles);
-    }
-    return allFiles;
-}
-
 async function getDescendantFiles(folderIds, userId) {
     let allFiles = [];
     for (const folderId of folderIds) {
@@ -216,26 +528,6 @@ async function getDescendantFiles(folderIds, userId) {
     }
     return allFiles;
 }
-
-function getFolderPath(folderId, userId) {
-    let pathArr = [];
-    return new Promise((resolve, reject) => {
-        function findParent(id) {
-            if (!id) return resolve(pathArr.reverse());
-            db.get("SELECT id, name, parent_id FROM folders WHERE id = ? AND user_id = ?", [id, userId], (err, folder) => {
-                if (err) return reject(err);
-                if (folder) {
-                    pathArr.push({ id: folder.id, name: folder.name });
-                    findParent(folder.parent_id);
-                } else {
-                    resolve(pathArr.reverse());
-                }
-            });
-        }
-        findParent(folderId);
-    });
-}
-
 function createFolder(name, parentId, userId) {
     const sql = `INSERT INTO folders (name, parent_id, user_id) VALUES (?, ?, ?)`;
     return new Promise((resolve, reject) => {
@@ -287,267 +579,6 @@ function getAllFolders(userId) {
         });
     });
 }
-
-// --- *** 逻辑恢复的关键部分 *** ---
-
-async function moveItem(itemId, itemType, targetFolderId, userId, options = {}) {
-    const { resolutions = {}, pathPrefix = '' } = options;
-    const report = { moved: 0, skipped: 0, errors: 0 };
-
-    const sourceItem = (await getItemsByIds([itemId], userId))[0];
-    if (!sourceItem) {
-        report.errors++;
-        return report;
-    }
-
-    const currentPath = path.join(pathPrefix, sourceItem.name).replace(/\\/g, '/');
-    const existingItemInTarget = await findItemInFolder(sourceItem.name, targetFolderId, userId);
-    let resolutionAction = resolutions[currentPath] || (existingItemInTarget ? 'skip_default' : 'move');
-
-    // 如果目标是自己，则跳过
-    if ((itemType === 'folder' && itemId === targetFolderId) || (sourceItem.parent_id === targetFolderId)) {
-        resolutionAction = 'skip';
-    }
-
-    switch (resolutionAction) {
-        case 'skip':
-        case 'skip_default':
-            report.skipped++;
-            return report;
-
-        case 'rename':
-            const newName = await findAvailableName(sourceItem.name, targetFolderId, userId, itemType === 'folder');
-            await moveItemsAndRename(itemId, itemType, newName, targetFolderId, userId);
-            report.moved++;
-            return report;
-
-        case 'overwrite':
-            if (!existingItemInTarget) {
-                report.skipped++;
-                return report;
-            }
-            try {
-                // 删除目标冲突项
-                await unifiedDelete(existingItemInTarget.id, existingItemInTarget.type, userId);
-                // 移动源项
-                await moveItems([itemType === 'file' ? itemId : null].filter(Boolean), [itemType === 'folder' ? itemId : null].filter(Boolean), targetFolderId, userId);
-                report.moved++;
-            } catch (err) {
-                report.errors++;
-                console.error("Overwrite error:", err);
-            }
-            return report;
-
-        case 'merge':
-            if (!existingItemInTarget || existingItemInTarget.type !== 'folder' || itemType !== 'folder') {
-                report.skipped++;
-                return report;
-            }
-            
-            const children = await getChildrenOfFolder(itemId, userId);
-            for (const child of children) {
-                const childReport = await moveItem(child.id, child.type, existingItemInTarget.id, userId, { ...options, pathPrefix: currentPath });
-                report.moved += childReport.moved;
-                report.skipped += childReport.skipped;
-                report.errors += childReport.errors;
-            }
-            
-            // 在所有子项处理完毕后，删除空的源文件夹
-            await unifiedDelete(itemId, 'folder', userId);
-            return report;
-
-        default: // 'move'
-            await moveItems([itemType === 'file' ? itemId : null].filter(Boolean), [itemType === 'folder' ? itemId : null].filter(Boolean), targetFolderId, userId);
-            report.moved++;
-            return report;
-    }
-}
-
-async function unifiedDelete(itemId, itemType, userId) {
-    const storage = require('./storage').getStorage();
-    let filesForStorage = [];
-    let foldersForStorage = [];
-    
-    if (itemType === 'folder') {
-        const deletionData = await getFolderDeletionData(itemId, userId);
-        filesForStorage.push(...deletionData.files);
-        foldersForStorage.push(...deletionData.folders);
-    } else {
-        const directFiles = await getFilesByIds([itemId], userId);
-        filesForStorage.push(...directFiles);
-    }
-    
-    try {
-        if(storage.remove) {
-            await storage.remove(filesForStorage, foldersForStorage, userId);
-        }
-    } catch (err) {
-        // 在生产环境中，可以考虑记录日志，而不是直接抛出错误
-        console.error("Storage removal failed, but continuing with DB deletion:", err.message);
-    }
-    
-    await executeDeletion(filesForStorage.map(f => f.message_id), foldersForStorage.map(f => f.id), userId);
-}
-
-async function moveItemsAndRename(itemId, itemType, newName, targetFolderId, userId) {
-    if (itemType === 'file') {
-        await renameAndMoveFile(itemId, newName, targetFolderId, userId);
-    } else {
-        await renameFolder(itemId, newName, userId);
-        await moveItems([], [itemId], targetFolderId, userId);
-    }
-}
-
-async function moveItems(fileIds = [], folderIds = [], targetFolderId, userId) {
-    const storage = require('./storage').getStorage();
-
-    // 物理移动
-    if (storage.type === 'webdav') {
-        const client = storage.getClient();
-        if (!client) throw new Error("WebDAV client is not available.");
-
-        const targetPathParts = await getFolderPath(targetFolderId, userId);
-        const targetFullPath = path.posix.join(...targetPathParts.slice(1).map(p => p.name));
-
-        if (fileIds.length > 0) {
-            const filesToMove = await getFilesByIds(fileIds, userId);
-            for (const file of filesToMove) {
-                const oldRelativePath = file.file_id;
-                const newRelativePath = path.posix.join(targetFullPath, file.fileName).replace(/\\/g, '/');
-                if (oldRelativePath !== newRelativePath) {
-                    await client.moveFile(oldRelativePath, newRelativePath);
-                    await new Promise((res, rej) => db.run('UPDATE files SET file_id = ? WHERE message_id = ?', [newRelativePath, file.message_id], (e) => e ? rej(e) : res()));
-                }
-            }
-        }
-        
-        if (folderIds.length > 0) {
-            const foldersToMove = (await getItemsByIds(folderIds, userId)).filter(i => i.type === 'folder');
-            for (const folder of foldersToMove) {
-                const oldPathParts = await getFolderPath(folder.id, userId);
-                const oldFullPath = path.posix.join(...oldPathParts.slice(1).map(p => p.name));
-                const newFullPath = path.posix.join(targetFullPath, folder.name).replace(/\\/g, '/');
-
-                if (oldFullPath !== newFullPath) {
-                    await client.moveFile(oldFullPath, newFullPath);
-                    const descendantFiles = await getFilesRecursive(folder.id, userId);
-                    for (const file of descendantFiles) {
-                        const updatedFileId = file.file_id.replace(oldFullPath, newFullPath);
-                        await new Promise((res, rej) => db.run('UPDATE files SET file_id = ? WHERE message_id = ?', [updatedFileId, file.message_id], (e) => e ? rej(e) : res()));
-                    }
-                }
-            }
-        }
-    }
-
-    // 数据库移动
-    return new Promise((resolve, reject) => {
-        db.serialize(() => {
-            db.run("BEGIN TRANSACTION;");
-            
-            const filePlaceholders = fileIds.map(() => '?').join(',');
-            const folderPlaceholders = folderIds.map(() => '?').join(',');
-
-            const promises = [];
-            if (fileIds.length > 0) {
-                const sql = `UPDATE files SET folder_id = ? WHERE message_id IN (${filePlaceholders}) AND user_id = ?`;
-                promises.push(new Promise((res, rej) => db.run(sql, [targetFolderId, ...fileIds, userId], e => e ? rej(e) : res())));
-            }
-            if (folderIds.length > 0) {
-                const sql = `UPDATE folders SET parent_id = ? WHERE id IN (${folderPlaceholders}) AND user_id = ?`;
-                promises.push(new Promise((res, rej) => db.run(sql, [targetFolderId, ...folderIds, userId], e => e ? rej(e) : res())));
-            }
-
-            Promise.all(promises)
-                .then(() => db.run("COMMIT;", e => e ? reject(e) : resolve({ success: true })))
-                .catch(err => db.run("ROLLBACK;", () => reject(err)));
-        });
-    });
-}
-
-
-function deleteSingleFolder(folderId, userId) {
-    return new Promise((resolve, reject) => {
-        const sql = `DELETE FROM folders WHERE id = ? AND user_id = ?`;
-        db.run(sql, [folderId, userId], function(err) {
-            if (err) return reject(err);
-            resolve({ success: true, changes: this.changes });
-        });
-    });
-}
-
-async function getFolderDeletionData(folderId, userId) {
-    let filesToDelete = [];
-    let foldersToDeleteIds = [folderId];
-
-    async function findContentsRecursive(currentFolderId) {
-        const sqlFiles = `SELECT * FROM files WHERE folder_id = ? AND user_id = ?`;
-        const files = await new Promise((res, rej) => db.all(sqlFiles, [currentFolderId, userId], (err, rows) => err ? rej(err) : res(rows)));
-        filesToDelete.push(...files);
-        
-        const sqlFolders = `SELECT id FROM folders WHERE parent_id = ? AND user_id = ?`;
-        const subFolders = await new Promise((res, rej) => db.all(sqlFolders, [currentFolderId, userId], (err, rows) => err ? rej(err) : res(rows)));
-        
-        for (const subFolder of subFolders) {
-            foldersToDeleteIds.push(subFolder.id);
-            await findContentsRecursive(subFolder.id);
-        }
-    }
-
-    await findContentsRecursive(folderId);
-
-    const allUserFolders = await getAllFolders(userId);
-    const folderMap = new Map(allUserFolders.map(f => [f.id, f]));
-    
-    function buildPath(fId) {
-        let pathParts = [];
-        let current = folderMap.get(fId);
-        let rootName = (current && !current.parent_id) ? current.name : '';
-        
-        while(current && current.parent_id) {
-            pathParts.unshift(current.name);
-            current = folderMap.get(current.parent_id);
-        }
-        if (rootName && rootName !== '/') {
-            pathParts.unshift(rootName);
-        }
-        return path.join(...pathParts);
-    }
-
-    const foldersToDeleteWithPaths = foldersToDeleteIds.map(id => ({
-        id: id,
-        path: buildPath(id)
-    }));
-
-    return { files: filesToDelete, folders: foldersToDeleteWithPaths };
-}
-
-
-function executeDeletion(fileIds, folderIds, userId) {
-    return new Promise((resolve, reject) => {
-        if (fileIds.length === 0 && folderIds.length === 0) return resolve({ success: true });
-        
-        db.serialize(() => {
-            db.run("BEGIN TRANSACTION;");
-            const promises = [];
-            
-            if (fileIds.length > 0) {
-                const place = Array.from(new Set(fileIds)).map(() => '?').join(',');
-                promises.push(new Promise((res, rej) => db.run(`DELETE FROM files WHERE message_id IN (${place}) AND user_id = ?`, [...new Set(fileIds), userId], (e) => e ? rej(e) : res())));
-            }
-            if (folderIds.length > 0) {
-                const place = Array.from(new Set(folderIds)).map(() => '?').join(',');
-                promises.push(new Promise((res, rej) => db.run(`DELETE FROM folders WHERE id IN (${place}) AND user_id = ?`, [...new Set(folderIds), userId], (e) => e ? rej(e) : res())));
-            }
-
-            Promise.all(promises)
-                .then(() => db.run("COMMIT;", (e) => e ? reject(e) : resolve({ success: true })))
-                .catch((err) => db.run("ROLLBACK;", () => reject(err)));
-        });
-    });
-}
-
-
 function addFile(fileData, folderId = 1, userId, storageType) {
     const { message_id, fileName, mimetype, file_id, thumb_file_id, date, size } = fileData;
     const sql = `INSERT INTO files (message_id, fileName, mimetype, file_id, thumb_file_id, date, size, folder_id, user_id, storage_type)
@@ -559,21 +590,6 @@ function addFile(fileData, folderId = 1, userId, storageType) {
         });
     });
 }
-
-function getFilesByIds(messageIds, userId) {
-    if (!messageIds || messageIds.length === 0) {
-        return Promise.resolve([]);
-    }
-    const placeholders = messageIds.map(() => '?').join(',');
-    const sql = `SELECT * FROM files WHERE message_id IN (${placeholders}) AND user_id = ?`;
-    return new Promise((resolve, reject) => {
-        db.all(sql, [...messageIds, userId], (err, rows) => {
-            if (err) reject(err);
-            else resolve(rows);
-        });
-    });
-}
-
 function getFileByShareToken(token) {
      return new Promise((resolve, reject) => {
         const sql = "SELECT * FROM files WHERE share_token = ?";
@@ -652,15 +668,6 @@ async function renameFile(messageId, newFileName, userId) {
             });
         });
     }
-
-    const sql = `UPDATE files SET fileName = ? WHERE message_id = ? AND user_id = ?`;
-    return new Promise((resolve, reject) => {
-        db.run(sql, [newFileName, messageId, userId], function(err) {
-            if (err) reject(err);
-            else if (this.changes === 0) resolve({ success: false, message: '文件未找到。' });
-            else resolve({ success: true });
-        });
-    });
 }
 
 async function renameAndMoveFile(messageId, newFileName, targetFolderId, userId) {
@@ -688,11 +695,6 @@ async function renameAndMoveFile(messageId, newFileName, targetFolderId, userId)
             db.run(sql, [newFileName, newRelativePath, targetFolderId, messageId, userId], (err) => err ? reject(err) : resolve({ success: true }));
         });
     }
-
-    const sql = `UPDATE files SET fileName = ?, folder_id = ? WHERE message_id = ? AND user_id = ?`;
-    return new Promise((resolve, reject) => {
-        db.run(sql, [newFileName, targetFolderId, messageId, userId], (err) => err ? reject(err) : resolve({ success: true }));
-    });
 }
 
 
@@ -865,21 +867,6 @@ function findFileInFolder(fileName, folderId, userId) {
         });
     });
 }
-
-function findItemInFolder(name, folderId, userId) {
-    return new Promise((resolve, reject) => {
-        const sql = `
-            SELECT id, name, 'folder' as type FROM folders WHERE name = ? AND parent_id = ? AND user_id = ?
-            UNION ALL
-            SELECT message_id as id, fileName as name, 'file' as type FROM files WHERE fileName = ? AND folder_id = ? AND user_id = ?
-        `;
-        db.get(sql, [name, folderId, userId, name, folderId, userId], (err, row) => {
-            if (err) return reject(err);
-            resolve(row);
-        });
-    });
-}
-
 async function findAvailableName(originalName, folderId, userId, isFolder) {
     let newName = originalName;
     let counter = 1;
@@ -929,7 +916,7 @@ async function findOrCreateFolderByPath(fullPath, userId) {
             parentId = folder.id;
         } else {
             const result = await createFolder(part, parentId, userId);
-            parentId = result.id;
+parentId = result.id;
         }
     }
     return parentId;
@@ -961,6 +948,7 @@ async function resolvePathToFolderId(startFolderId, pathParts, userId) {
     return currentParentId;
 }
 
+
 module.exports = {
     createUser,
     findUserByName,
@@ -979,7 +967,6 @@ module.exports = {
     getAllDescendantFolderIds,
     executeDeletion,
     getFolderDeletionData,
-    deleteSingleFolder,
     addFile,
     getFilesByIds,
     getItemsByIds,
