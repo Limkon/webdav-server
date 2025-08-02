@@ -101,6 +101,7 @@ app.post('/login', async (req, res) => {
     }
 });
 
+// --- 主要修改开始 (註冊邏輯) ---
 app.post('/register', async (req, res) => {
     const { username, password } = req.body;
     if (!username || !password) {
@@ -109,13 +110,25 @@ app.post('/register', async (req, res) => {
     try {
         const salt = await bcrypt.genSalt(10);
         const hashedPassword = await bcrypt.hash(password, salt);
-        const newUser = await data.createUser(username, hashedPassword); 
-        await data.createFolder('/', null, newUser.id); 
+        const newUser = await data.createUser(username, hashedPassword);
+        
+        // 建立根目錄
+        const rootFolder = await data.createFolder('/', null, newUser.id);
+        
+        // 讀取 WebDAV 設定並為新使用者建立掛載點
+        const config = storageManager.readConfig();
+        if (config.webdav && Array.isArray(config.webdav)) {
+            for (const mount of config.webdav) {
+                await data.createFolder(mount.mount_name, rootFolder.id, newUser.id);
+            }
+        }
+        
         res.redirect('/login');
     } catch (error) {
         res.status(500).send('注册失败，使用者名称可能已被使用。');
     }
 });
+// --- 主要修改结束 ---
 
 app.get('/logout', (req, res) => {
     req.session.destroy(err => {
@@ -189,6 +202,7 @@ app.get('/api/admin/all-users', requireAdmin, async (req, res) => {
     }
 });
 
+// --- 主要修改开始 (管理員新增使用者邏輯) ---
 app.post('/api/admin/add-user', requireAdmin, async (req, res) => {
     const { username, password } = req.body;
     if (!username || !password || password.length < 4) {
@@ -198,12 +212,24 @@ app.post('/api/admin/add-user', requireAdmin, async (req, res) => {
         const salt = await bcrypt.genSalt(10);
         const hashedPassword = await bcrypt.hash(password, salt);
         const newUser = await data.createUser(username, hashedPassword);
-        await data.createFolder('/', null, newUser.id);
+        
+        // 建立根目錄
+        const rootFolder = await data.createFolder('/', null, newUser.id);
+
+        // 讀取 WebDAV 設定並為新使用者建立掛載點
+        const config = storageManager.readConfig();
+        if (config.webdav && Array.isArray(config.webdav)) {
+            for (const mount of config.webdav) {
+                await data.createFolder(mount.mount_name, rootFolder.id, newUser.id);
+            }
+        }
+        
         res.json({ success: true, user: newUser });
     } catch (error) {
         res.status(500).json({ success: false, message: '建立使用者失败，可能使用者名称已被使用。' });
     }
 });
+// --- 主要修改结束 ---
 
 app.post('/api/admin/change-password', requireAdmin, async (req, res) => {
     const { userId, newPassword } = req.body;
@@ -233,7 +259,6 @@ app.post('/api/admin/delete-user', requireAdmin, async (req, res) => {
     }
 });
 
-// --- 主要修改开始 (WebDAV 管理 API) ---
 app.get('/api/admin/webdav', requireAdmin, (req, res) => {
     const config = storageManager.readConfig();
     res.json(config.webdav || []);
@@ -340,8 +365,6 @@ app.delete('/api/admin/webdav/:id', requireAdmin, async (req, res) => {
         res.status(500).json({ success: false, message: '删除设定失败' });
     }
 });
-// --- 主要修改结束 ---
-
 
 const uploadMiddleware = (req, res, next) => {
     upload.array('files')(req, res, (err) => {
@@ -480,7 +503,7 @@ app.post('/api/text-file', requireLogin, async (req, res) => {
         } else if (mode === 'create' && folderId) {
              const conflict = await data.checkFullConflict(fileName, folderId, userId);
             if (conflict) {
-                return res.status(409).json({ success: false, message: '同目录下已存在同名档案或资料夹。' });
+                return res.status(409).json({ success: false, message: '同目录下已存在同名档案或资料夾。' });
             }
             result = await storage.upload(tempFilePath, fileName, 'text/plain', userId, folderId);
         } else {
@@ -599,12 +622,10 @@ app.post('/api/folder', requireLogin, async (req, res) => {
     }
     
     try {
-        // --- 关键修改：禁止在根目录建立资料夹 ---
         const parentFolder = await data.getFolderPath(parentId, userId);
-        if (parentFolder.length <= 1 && !req.session.isAdmin) {
+        if (parentFolder.length <= 1) { // 根目录的路径长度为1
             return res.status(403).json({ success: false, message: '不能在根目录下建立资料夹。' });
         }
-        // --- 修改结束 ---
 
         const conflict = await data.checkFullConflict(name, parentId, userId);
         if (conflict) {
