@@ -85,7 +85,7 @@ async function upload(tempFilePath, fileName, mimetype, userId, folderPathInfo) 
     await client.putFileContents(remoteFilePath, fileBuffer, { overwrite: true });
     
     const stat = await client.stat(remoteFilePath);
-    const messageId = BigInt(Date.now()) * 1000000n + BigInt(crypto.randomInt(1000000));
+    const messageId = Date.now() * 1000 + crypto.randomInt(1000);
     
     const fullDbPath = path.posix.join('/', mountName, remoteFilePath);
 
