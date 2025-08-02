@@ -546,10 +546,10 @@ app.get('/api/folders', requireLogin, async (req, res) => {
 
 app.post('/api/move', requireLogin, async (req, res) => {
     try {
-        const { itemIds, targetFolderId, resolutions = {} } = req.body;
+        const { items, targetFolderId, resolutions = {} } = req.body;
         const userId = req.session.userId;
 
-        if (!itemIds || !Array.isArray(itemIds) || itemIds.length === 0 || !targetFolderId) {
+        if (!items || !Array.isArray(items) || items.length === 0 || !targetFolderId) {
             return res.status(400).json({ success: false, message: '无效的请求参数。' });
         }
         
@@ -558,21 +558,19 @@ app.post('/api/move', requireLogin, async (req, res) => {
         let totalErrors = 0;
         const errorMessages = [];
         
-        for (const itemId of itemIds) {
+        for (const item of items) {
             try {
-                const items = await data.getItemsByIds([itemId], userId);
-                if (items.length === 0) {
-                    totalSkipped++;
-                    continue; 
+                 if (!item.id || !item.type) {
+                    totalErrors++;
+                    errorMessages.push('移动的项目缺少ID或类型信息。');
+                    continue;
                 }
-                
-                const item = items[0];
                 const report = await data.moveItem(item.id, item.type, targetFolderId, userId, { resolutions });
                 totalMoved += report.moved;
                 totalSkipped += report.skipped;
                 if (report.errors > 0) {
                     totalErrors += report.errors;
-                    errorMessages.push(`项目 "${item.name}" 处理失败。`);
+                    errorMessages.push(`项目 "${item.name || item.id}" 处理失败。`);
                 }
 
             } catch (err) {
