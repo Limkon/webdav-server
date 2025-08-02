@@ -421,8 +421,8 @@ async function unifiedDelete(itemId, itemType, userId) {
             const pathParts = await getFolderPath(folder.id, userId);
             if (pathParts.length > 1) { // 排除根目录
                 const mountName = pathParts[1].name;
-                const remotePath = '/' + pathParts.slice(1).map(p => p.name).join('/');
-                itemsForStorage.push({ mountName, remotePath, type: 'folder' });
+                const remotePath = '/' + pathParts.slice(2).map(p => p.name).join('/');
+                itemsForStorage.push({ mountName, remotePath: remotePath || '/', type: 'folder' });
             }
         }
 
