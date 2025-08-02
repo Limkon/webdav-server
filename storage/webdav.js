@@ -5,107 +5,135 @@ const crypto = require('crypto');
 const fsp = require('fs').promises;
 const path = require('path');
 
-let client = null;
+// 使用 Map 来缓存不同 WebDAV 设定的客户端实例
+const clients = new Map();
 
-function getWebdavConfig() {
-    const storageManager = require('./index'); 
-    const config = storageManager.readConfig();
-    const webdavConfig = config.webdav && Array.isArray(config.webdav) ? config.webdav[0] : config.webdav;
-    if (!webdavConfig || !webdavConfig.url) {
-        throw new Error('WebDAV 设定不完整或未设定');
-    }
-    return webdavConfig;
-}
-
-function getClient() {
-    if (!client) {
-        console.log('[DEBUG] [storage/webdav.js] Creating new WebDAV client instance.');
-        const webdavConfig = getWebdavConfig();
-        client = createClient(webdavConfig.url, {
-            username: webdavConfig.username,
-            password: webdavConfig.password
-        });
-    }
-    return client;
-}
-
-function resetClient() {
-    console.log('[DEBUG] [storage/webdav.js] Resetting WebDAV client.');
-    client = null;
-}
-
-async function getFolderPath(folderId, userId) {
-    const userRoot = await new Promise((resolve, reject) => {
-        db.get("SELECT id FROM folders WHERE user_id = ? AND parent_id IS NULL", [userId], (err, row) => {
-            if (err) return reject(err);
-            if (!row) return reject(new Error('找不到使用者根目录'));
+async function getWebdavConfig(mountId) {
+    return new Promise((resolve, reject) => {
+        db.get('SELECT * FROM webdav_configs WHERE id = ?', [mountId], (err, row) => {
+            if (err) return reject(new Error('查询 WebDAV 设定时发生错误'));
+            if (!row) return reject(new Error(`找不到 ID 为 ${mountId} 的 WebDAV 设定`));
             resolve(row);
         });
     });
-
-    if (folderId === userRoot.id) return '/';
-    
-    const pathParts = await data.getFolderPath(folderId, userId);
-    const resultPath = '/' + pathParts.slice(1).map(p => p.name).join('/');
-    console.log(`[DEBUG] [storage/webdav.js getFolderPath] Resolved folderId ${folderId} to path: ${resultPath}`);
-    return resultPath;
 }
+
+async function getClient(mountId) {
+    if (clients.has(mountId)) {
+        return clients.get(mountId);
+    }
+    
+    console.log(`[DEBUG] [storage/webdav.js] Creating new WebDAV client for mount ID: ${mountId}`);
+    const webdavConfig = await getWebdavConfig(mountId);
+    
+    const newClient = createClient(webdavConfig.url, {
+        username: webdavConfig.username,
+        password: webdavConfig.password
+    });
+    clients.set(mountId, newClient);
+    return newClient;
+}
+
+function resetClient(mountId) {
+    if (mountId) {
+        console.log(`[DEBUG] [storage/webdav.js] Resetting WebDAV client for mount ID: ${mountId}`);
+        clients.delete(mountId);
+    } else {
+        console.log('[DEBUG] [storage/webdav.js] Resetting all WebDAV clients.');
+        clients.clear();
+    }
+}
+
+// 获取资料夹在 WebDAV 上的真实路径
+async function getRemotePath(itemId, itemType, userId) {
+    let item;
+    if (itemType === 'folder') {
+        item = await data.findFolderById(itemId, userId);
+    } else {
+        item = (await data.getFilesByIds([itemId], userId))[0];
+        if (item) item.folder_id = item.folderId; // 统一属性名
+    }
+
+    if (!item) throw new Error('项目未找到');
+    
+    const mountId = item.webdav_mount_id;
+    if (!mountId) throw new Error('项目不属于任何 WebDAV 挂载点');
+    
+    const pathParts = await data.getFolderPath(itemType === 'folder' ? itemId : item.folder_id, userId);
+    // 移除代表挂载点的第一层目录
+    const relativePath = path.posix.join(...pathParts.slice(1).map(p => p.name));
+    
+    const remotePath = itemType === 'file' ? path.posix.join('/', relativePath, item.fileName) : path.posix.join('/', relativePath);
+    console.log(`[DEBUG] [storage/webdav.js getRemotePath] Resolved item ID ${itemId} to remote path: ${remotePath} on mount ${mountId}`);
+    return { remotePath, mountId };
+}
+
 
 async function upload(tempFilePath, fileName, mimetype, userId, folderId) {
     console.log(`[DEBUG] [storage/webdav.js upload] Starting upload. tempFilePath=${tempFilePath}, fileName=${fileName}, folderId=${folderId}`);
-    const client = getClient();
-    const folderPath = await getFolderPath(folderId, userId);
-    const remotePath = path.posix.join(folderPath, fileName);
+    
+    const targetFolder = await data.findFolderById(folderId, userId);
+    if (!targetFolder || !targetFolder.webdav_mount_id) {
+        throw new Error('上传目标资料夹无效或不是一个 WebDAV 挂载子目录');
+    }
+    const mountId = targetFolder.webdav_mount_id;
+
+    // 熔断机制：检查 WebDAV 目录是否已满
+    const mountConfig = await getWebdavConfig(mountId);
+    if (mountConfig.is_full) {
+        throw new Error(`WebDAV 储存空间 (${mountConfig.mount_name}) 可能已满，上传操作已暂停。请删除一些档案后再试。`);
+    }
+
+    const client = await getClient(mountId);
+    const { remotePath: folderRemotePath } = await getRemotePath(folderId, 'folder', userId);
+    const remotePath = path.posix.join(folderRemotePath, fileName);
     console.log(`[DEBUG] [storage/webdav.js upload] Remote path determined as: ${remotePath}`);
     
-    if (folderPath && folderPath !== "/") {
+    if (folderRemotePath && folderRemotePath !== "/") {
         try {
-            console.log(`[DEBUG] [storage/webdav.js upload] Attempting to create directory: ${folderPath}`);
-            await client.createDirectory(folderPath, { recursive: true });
-            console.log(`[DEBUG] [storage/webdav.js upload] Directory creation successful or directory already exists.`);
+            await client.createDirectory(folderRemotePath, { recursive: true });
         } catch (e) {
             if (e.response && (e.response.status !== 405 && e.response.status !== 501)) {
-                 console.error(`[DEBUG] [storage/webdav.js upload] FATAL: Failed to create directory ${folderPath}. Status: ${e.response.status}`, e);
                  throw new Error(`建立 WebDAV 目录失败 (${e.response.status}): ${e.message}`);
             }
-            console.log(`[DEBUG] [storage/webdav.js upload] Directory creation returned ignorable status (405 or 501), proceeding.`);
         }
     }
 
     const fileBuffer = await fsp.readFile(tempFilePath);
-    console.log(`[DEBUG] [storage/webdav.js upload] Putting file contents to ${remotePath} with overwrite: true.`);
-    const success = await client.putFileContents(remotePath, fileBuffer, { overwrite: true });
-
-    if (!success) {
-        console.error(`[DEBUG] [storage/webdav.js upload] FATAL: WebDAV putFileContents returned false.`);
-        throw new Error('WebDAV putFileContents 操作失败');
+    try {
+        const success = await client.putFileContents(remotePath, fileBuffer, { overwrite: true });
+        if (!success) throw new Error('WebDAV putFileContents 操作失败');
+    } catch (error) {
+        // 检查是否为空间不足的错误 (通常是 507 Insufficient Storage)
+        if (error.response && error.response.status === 507) {
+            await data.setWebdavMountFullStatus(mountId, true); // 标记为已满
+            throw new Error(`上传失败：WebDAV 储存空间不足 (507)。该挂载点已被标记为已满。`);
+        }
+        throw error; // 抛出其他错误
     }
-    console.log(`[DEBUG] [storage/webdav.js upload] putFileContents successful. Stat-ing remote file.`);
 
     const stat = await client.stat(remotePath);
     const messageId = BigInt(Date.now()) * 1000000n + BigInt(crypto.randomInt(1000000));
 
-    console.log(`[DEBUG] [storage/webdav.js upload] Adding file to DB. message_id=${messageId}, file_id=${remotePath}`);
     const dbResult = await data.addFile({
         message_id: messageId,
         fileName,
         mimetype,
         size: stat.size,
-        file_id: remotePath,
+        file_id: remotePath, // file_id 储存相对于 WebDAV 根的路径
         date: new Date(stat.lastmod).getTime(),
-    }, folderId, userId, 'webdav');
+    }, folderId, userId, 'webdav', mountId); // 传入 mountId
     
-    console.log(`[DEBUG] [storage/webdav.js upload] Upload complete. DB result fileId: ${dbResult.fileId}`);
     return { success: true, message: '档案已上传至 WebDAV。', fileId: dbResult.fileId };
 }
 
-async function move(sourcePath, destinationPath, overwrite = false) {
-    console.log(`[DEBUG] [storage/webdav.js move] Initiating move.`);
+async function move(sourcePath, destinationPath, mountId, overwrite = false) {
+    console.log(`[DEBUG] [storage/webdav.js move] Initiating move on mount ${mountId}.`);
     console.log(`  - Source: ${sourcePath}`);
     console.log(`  - Destination: ${destinationPath}`);
     console.log(`  - Overwrite: ${overwrite}`);
     
-    const client = getClient();
+    const client = await getClient(mountId);
     try {
         await client.moveFile(sourcePath, destinationPath, { overwrite });
         console.log(`[DEBUG] [storage/webdav.js move] Move successful.`);
@@ -118,38 +146,38 @@ async function move(sourcePath, destinationPath, overwrite = false) {
         } else {
             console.error(`  - Error Message: ${error.message}`);
         }
-        
-        // Re-throw the error to be handled by the calling function in data.js
         throw error;
     }
 }
 
 async function remove(files, folders, userId) {
     console.log(`[DEBUG] [storage/webdav.js remove] Initiating remove for ${files.length} files and ${folders.length} folders.`);
-    const client = getClient();
     const results = { success: true, errors: [] };
+    const mountsWithDeletions = new Set();
 
     const allItemsToDelete = [];
     
     files.forEach(file => {
-        let p = file.file_id.startsWith('/') ? file.file_id : '/' + file.file_id;
-        allItemsToDelete.push({ path: path.posix.normalize(p), type: 'file' });
+        if(file.webdav_mount_id) {
+            allItemsToDelete.push({ path: file.file_id, type: 'file', mountId: file.webdav_mount_id });
+        }
     });
     
     folders.forEach(folder => {
-        if (folder.path && folder.path !== '/') {
-            let p = folder.path.startsWith('/') ? folder.path : '/' + folder.path;
-            allItemsToDelete.push({ path: p, type: 'folder' });
+        if (folder.path && folder.path !== '/' && folder.webdav_mount_id) {
+            allItemsToDelete.push({ path: folder.path, type: 'folder', mountId: folder.webdav_mount_id });
         }
     });
 
+    // 按路径深度倒序排列，确保先删除子项目
     allItemsToDelete.sort((a, b) => b.path.length - a.path.length);
-    console.log(`[DEBUG] [storage/webdav.js remove] Sorted items for deletion:`, allItemsToDelete.map(i => i.path));
 
     for (const item of allItemsToDelete) {
         try {
-            console.log(`[DEBUG] [storage/webdav.js remove] Attempting to delete: ${item.path}`);
+            const client = await getClient(item.mountId);
+            console.log(`[DEBUG] [storage/webdav.js remove] Attempting to delete: ${item.path} on mount ${item.mountId}`);
             await client.deleteFile(item.path);
+            mountsWithDeletions.add(item.mountId);
             console.log(`[DEBUG] [storage/webdav.js remove] Successfully deleted: ${item.path}`);
         } catch (error) {
             if (error.response && error.response.status === 404) {
@@ -163,44 +191,52 @@ async function remove(files, folders, userId) {
         }
     }
 
+    // 移除熔断标记
+    for (const mountId of mountsWithDeletions) {
+        await data.setWebdavMountFullStatus(mountId, false);
+    }
+
+
     return results;
 }
 
-async function stream(file_id, userId) {
-    console.log(`[DEBUG] [storage/webdav.js stream] Creating a NEW, ISOLATED client for streaming file: ${file_id}`);
-    const webdavConfig = getWebdavConfig();
-    const streamClient = createClient(webdavConfig.url, {
-        username: webdavConfig.username,
-        password: webdavConfig.password
-    });
-    return streamClient.createReadStream(path.posix.join('/', file_id));
+
+async function stream(file_id, userId, mountId) {
+    const client = await getClient(mountId);
+    return client.createReadStream(path.posix.join('/', file_id));
 }
 
-async function getUrl(file_id, userId) {
-    const client = getClient();
+async function getUrl(file_id, userId, mountId) {
+    const client = await getClient(mountId);
     return client.getFileDownloadLink(path.posix.join('/', file_id));
 }
 
-async function createDirectory(fullPath) {
-    console.log(`[DEBUG] [storage/webdav.js createDirectory] Creating directory: ${fullPath}`);
-    const client = getClient();
+async function createDirectory(fullPath, mountId) {
+    const client = await getClient(mountId);
     try {
         const remotePath = path.posix.join('/', fullPath);
         if (await client.exists(remotePath)) {
-            console.log(`[DEBUG] [storage/webdav.js createDirectory] Directory already exists, skipping.`);
             return true;
         }
         await client.createDirectory(remotePath, { recursive: true });
-        console.log(`[DEBUG] [storage/webdav.js createDirectory] Directory created successfully.`);
         return true;
     } catch (e) {
         if (e.response && (e.response.status === 405 || e.response.status === 501)) {
-            console.log(`[DEBUG] [storage/webdav.js createDirectory] Directory already exists (ignorable error ${e.response.status}).`);
             return true;
         }
-        console.error(`[DEBUG] [storage/webdav.js createDirectory] FAILED to create directory.`, e);
         throw new Error(`建立 WebDAV 目录失败: ${e.message}`);
     }
 }
 
-module.exports = { upload, remove, getUrl, stream, resetClient, getClient, createDirectory, move, type: 'webdav' };
+module.exports = { 
+    upload, 
+    remove, 
+    getUrl, 
+    stream, 
+    resetClient, 
+    getClient, 
+    createDirectory, 
+    move, 
+    getRemotePath, // 导出供 data.js 使用
+    type: 'webdav' 
+};
