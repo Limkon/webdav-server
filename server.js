@@ -378,7 +378,7 @@ app.post('/api/admin/webdav', requireAdmin, async (req, res) => {
 });
 
 app.delete('/api/admin/webdav/:id', requireAdmin, async (req, res) => {
-    const { id } = req.params;
+    const { id } = req.params; 
     log('info', `請求刪除 WebDAV 掛載點 ID: ${id}`);
     const config = storageManager.readConfig();
     const configIndex = config.webdav.findIndex(c => c.id === id);
@@ -803,7 +803,7 @@ app.post('/rename', requireLogin, async (req, res) => {
             return res.status(400).json({ success: false, message: '无效的项目类型。'});
         }
         res.json(result);
-    } catch (error) {
+    } catch (error) { 
         log('error', `重命名失敗:`, error);
         res.status(500).json({ success: false, message: '重命名失败: ' + error.message }); 
     }
