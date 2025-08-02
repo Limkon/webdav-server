@@ -278,78 +278,48 @@ function getAllFolders(userId) {
 }
 
 async function moveItem(itemId, itemType, targetFolderId, userId, options = {}) {
-    const { resolutions = {}, pathPrefix = '' } = options;
+    const { resolutions = {} } = options;
     const report = { moved: 0, skipped: 0, errors: 0 };
-    
+
     const sourceItem = (await getItemsByIds([itemId], userId))[0];
     if (!sourceItem) {
         report.errors++;
         return report;
     }
-    
-    const currentPath = path.join(pathPrefix, sourceItem.name).replace(/\\/g, '/');
-    const existingItemInTarget = await findItemInFolder(sourceItem.name, targetFolderId, userId);
-    const resolutionAction = resolutions[currentPath] || (existingItemInTarget ? 'skip_default' : 'move');
 
-    switch (resolutionAction) {
-        case 'skip':
-        case 'skip_default':
+    const action = resolutions[sourceItem.name] || 'move';
+    
+    try {
+        if (action === 'skip') {
             report.skipped++;
             return report;
+        }
 
-        case 'rename':
+        if (action === 'overwrite') {
+            const existingItem = await findItemInFolder(sourceItem.name, targetFolderId, userId);
+            if (existingItem) {
+                await unifiedDelete(existingItem.id, existingItem.type, userId);
+            }
+        } else if (action === 'rename') {
             const newName = await findAvailableName(sourceItem.name, targetFolderId, userId, itemType === 'folder');
-            if (itemType === 'folder') {
-                await renameFolder(itemId, newName, userId);
-                await moveItems([], [itemId], targetFolderId, userId);
-            } else {
-                await renameAndMoveFile(itemId, newName, targetFolderId, userId);
-            }
-            report.moved++;
-            return report;
-
-        case 'overwrite':
-            if (!existingItemInTarget) {
-                report.skipped++;
-                return report;
-            }
-            await unifiedDelete(existingItemInTarget.id, existingItemInTarget.type, userId);
-            await moveItems(itemType === 'file' ? [itemId] : [], itemType === 'folder' ? [itemId] : [], targetFolderId, userId);
-            report.moved++;
-            return report;
-
-        case 'merge':
-            if (!existingItemInTarget || existingItemInTarget.type !== 'folder' || itemType !== 'folder') {
-                report.skipped++;
-                return report;
-            }
-            
-            const children = await getChildrenOfFolder(itemId, userId);
-            let allChildrenProcessedSuccessfully = true;
-
-            for (const child of children) {
-                const childReport = await moveItem(child.id, child.type, existingItemInTarget.id, userId, { ...options, pathPrefix: currentPath });
-                report.moved += childReport.moved;
-                report.skipped += childReport.skipped;
-                report.errors += childReport.errors;
-                if(childReport.skipped > 0 || childReport.errors > 0) {
-                    allChildrenProcessedSuccessfully = false;
-                }
-            }
-            
-            if (allChildrenProcessedSuccessfully) {
-                await unifiedDelete(itemId, 'folder', userId);
-            }
-            
-            return report;
-
-        default: // 'move'
-            await moveItems(itemType === 'file' ? [itemId] : [], itemType === 'folder' ? [itemId] : [], targetFolderId, userId);
-            report.moved++;
-            return report;
+            await (itemType === 'folder' ? renameFolder(itemId, newName, userId) : renameFile(itemId, newName, userId));
+            // Update sourceItem with the new name for the move operation
+            sourceItem.name = newName;
+        } else { // 'move'
+             const conflict = await findItemInFolder(sourceItem.name, targetFolderId, userId);
+             if (conflict) {
+                 report.skipped++;
+                 return report;
+             }
+        }
+        
+        await moveItems(itemType === 'file' ? [sourceItem.id] : [], itemType === 'folder' ? [sourceItem.id] : [], targetFolderId, userId, action === 'overwrite');
+        report.moved++;
+    } catch (e) {
+        report.errors++;
     }
+    return report;
 }
-
 
 async function unifiedDelete(itemId, itemType, userId) {
     const storage = require('./storage').getStorage();
@@ -374,22 +344,20 @@ async function unifiedDelete(itemId, itemType, userId) {
     await executeDeletion(filesForStorage.map(f => f.message_id), foldersForStorage.map(f => f.id), userId);
 }
 
-async function moveItems(fileIds = [], folderIds = [], targetFolderId, userId) {
+// *** 关键修正：moveItems 现在接受 overwrite 旗标 ***
+async function moveItems(fileIds = [], folderIds = [], targetFolderId, userId, overwrite = false) {
     const storage = require('./storage').getStorage();
-    const client = storage.getClient();
-    
+
     const targetPathParts = await getFolderPath(targetFolderId, userId);
-    const targetFullPath = path.posix.join(...targetPathParts.map(p => p.name));
+    const targetFullPath = path.posix.join(...targetPathParts.slice(1).map(p => p.name));
 
     const filesToMove = await getFilesByIds(fileIds, userId);
     for (const file of filesToMove) {
         const oldRelativePath = file.file_id;
         const newRelativePath = path.posix.join(targetFullPath, file.fileName);
-        
         try {
-            await client.moveFile(oldRelativePath, newRelativePath);
-            await new Promise((res, rej) => db.run('UPDATE files SET file_id = ? WHERE message_id = ?', [newRelativePath, file.message_id], (e) => e ? rej(e) : res()));
-
+            await storage.move(oldRelativePath, newRelativePath, overwrite);
+            await new Promise((res, rej) => db.run('UPDATE files SET file_id = ?, folder_id = ? WHERE message_id = ?', [newRelativePath, targetFolderId, file.message_id], (e) => e ? rej(e) : res()));
         } catch (err) {
             throw new Error(`物理移动文件 ${file.fileName} 失败`);
         }
@@ -402,8 +370,7 @@ async function moveItems(fileIds = [], folderIds = [], targetFolderId, userId) {
         const newFullPath = path.posix.join(targetFullPath, folder.name);
 
         try {
-             await client.moveFile(oldFullPath, newFullPath);
-
+            await storage.move(oldFullPath, newFullPath, overwrite);
             const descendantFiles = await getFilesRecursive(folder.id, userId);
             for (const file of descendantFiles) {
                 const updatedFileId = file.file_id.replace(oldFullPath, newFullPath);
@@ -594,22 +561,19 @@ async function renameFile(messageId, newFileName, userId) {
         return { success: false, message: '文件未找到。' };
     }
 
-    // --- *** 关键修正：增加冲突检查 *** ---
     const conflict = await checkFullConflict(newFileName, file.folder_id, userId);
     if (conflict) {
         throw new Error('目标文件夹中已存在同名项目。');
     }
-    // --- *** 修正结束 *** ---
 
     const storage = require('./storage').getStorage();
     const oldRelativePath = file.file_id;
     const newRelativePath = path.posix.join(path.posix.dirname(oldRelativePath), newFileName);
 
     try {
-        const client = storage.getClient();
-        await client.moveFile(oldRelativePath, newRelativePath);
+        await storage.move(oldRelativePath, newRelativePath, false); // Rename should not overwrite
     } catch(err) {
-        throw new Error(`实体档案重新命名失败`);
+        throw new Error(`实体档案重新命名失败: ${err.message}`);
     }
     
     const sql = `UPDATE files SET fileName = ?, file_id = ? WHERE message_id = ? AND user_id = ?`;
@@ -627,13 +591,12 @@ async function renameAndMoveFile(messageId, newFileName, targetFolderId, userId)
 
     const storage = require('./storage').getStorage();
     const targetPathParts = await getFolderPath(targetFolderId, userId);
-    const targetRelativePath = path.posix.join(...targetPathParts.map(p => p.name));
+    const targetRelativePath = path.posix.join(...targetPathParts.slice(1).map(p => p.name));
     const newRelativePath = path.posix.join(targetRelativePath, newFileName);
     const oldRelativePath = file.file_id;
     
     try {
-        const client = storage.getClient();
-        await client.moveFile(oldRelativePath, newRelativePath);
+        await storage.move(oldRelativePath, newRelativePath, false); // Renaming should not overwrite
     } catch(err) {
         throw new Error(`实体档案移动并重命名失败`);
     }
@@ -650,32 +613,30 @@ async function renameFolder(folderId, newFolderName, userId) {
     if (!folder) {
         return { success: false, message: '资料夹未找到。'};
     }
+    
+    if (folder.parent_id === null) { // Cannot rename root folder
+        throw new Error('无法重新命名根目录。');
+    }
 
-    // --- *** 关键修正：增加冲突检查 *** ---
     const conflict = await checkFullConflict(newFolderName, folder.parent_id, userId);
     if (conflict) {
         throw new Error('目标文件夹中已存在同名项目。');
     }
-    // --- *** 修正结束 *** ---
     
     const storage = require('./storage').getStorage();
     const oldPathParts = await getFolderPath(folderId, userId);
-    const oldFullPath = path.posix.join(...oldPathParts.map(p => p.name));
+    const oldFullPath = path.posix.join(...oldPathParts.slice(1).map(p => p.name));
     const newFullPath = path.posix.join(path.posix.dirname(oldFullPath), newFolderName);
 
     try {
-        const client = storage.getClient();
-        await client.moveFile(oldFullPath, newFullPath);
-
+        await storage.move(oldFullPath, newFullPath, false); // Renaming should not overwrite
         const descendantFiles = await getFilesRecursive(folderId, userId);
         for (const file of descendantFiles) {
             const updatedFileId = file.file_id.replace(oldFullPath, newFullPath);
             await new Promise((res, rej) => db.run('UPDATE files SET file_id = ? WHERE message_id = ?', [updatedFileId, file.message_id], (e) => e ? rej(e) : res()));
         }
     } catch(e) {
-        if (e.code !== 'ENOENT') {
-            throw new Error("物理资料夹重新命名失败");
-        }
+        throw new Error(`物理资料夹重新命名失败: ${e.message}`);
     }
 
     const sql = `UPDATE folders SET name = ? WHERE id = ? AND user_id = ?`;
