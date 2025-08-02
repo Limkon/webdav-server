@@ -19,7 +19,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const textEditBtn = document.getElementById('textEditBtn');
     const logoutBtn = document.getElementById('logoutBtn');
     const changePasswordBtn = document.getElementById('changePasswordBtn');
-    const showUploadModalBtn = document.getElementById('showUploadModalBtn'); // 已在HTML中
+    const showUploadModalBtn = document.getElementById('showUploadModalBtn');
     const previewModal = document.getElementById('previewModal');
     const modalContent = document.getElementById('modalContent');
     const closeModal = document.querySelector('.close-button');
@@ -57,7 +57,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // 状态
     let isMultiSelectMode = false;
     let currentFolderId = 1;
-    let currentFolderPath = []; // --- 新增：储存目前目录路径 ---
+    let currentFolderPath = []; // --- 新增：存储当前目录路径 ---
     let currentFolderContents = { folders: [], files: [] };
     let selectedItems = new Map();
     let moveTargetFolderId = null;
@@ -171,7 +171,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const conflicts = existenceData.filter(f => f.exists).map(f => f.relativePath);
     
         if (conflicts.length > 0) {
-            const conflictResult = await handleConflict(conflicts, '档案');
+            const conflictResult = await handleConflict(conflicts, '文件');
             if (conflictResult.aborted) {
                 showNotification('上传操作已取消。', 'info', !isDrag ? uploadNotificationArea : null);
                 return;
@@ -235,8 +235,8 @@ document.addEventListener('DOMContentLoaded', () => {
             renderItems(currentFolderContents.folders, currentFolderContents.files);
             updateActionBar();
         } catch (error) {
-            itemGrid.innerHTML = '<p>搜寻失败。</p>';
-            itemListBody.innerHTML = '<p>搜寻失败。</p>';
+            itemGrid.innerHTML = '<p>搜索失败。</p>';
+            itemListBody.innerHTML = '<p>搜索失败。</p>';
         }
     };
     const renderBreadcrumb = (path) => {
@@ -277,7 +277,7 @@ document.addEventListener('DOMContentLoaded', () => {
                  parentGrid.innerHTML = emptyMsg;
                  parentList.innerHTML = `<div class="list-item">${emptyMsg}</div>`;
             } else {
-                 const emptyMsg = '<p>这个资料夾是空的。</p>';
+                 const emptyMsg = '<p>这个文件夹是空的。</p>';
                  parentGrid.innerHTML = emptyMsg;
                  parentList.innerHTML = `<div class="list-item">${emptyMsg}</div>`;
             }
@@ -304,7 +304,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (item.type === 'file') {
             const fullFile = currentFolderContents.files.find(f => f.id === item.id) || item;
             if (fullFile.storage_type === 'telegram' && fullFile.thumb_file_id) {
-                iconHtml = `<img src="/thumbnail/${item.id}" alt="缩图" loading="lazy">`;
+                iconHtml = `<img src="/thumbnail/${item.id}" alt="缩略图" loading="lazy">`;
             } else if (fullFile.mimetype && fullFile.mimetype.startsWith('image/')) {
                  iconHtml = `<img src="/download/proxy/${item.id}" alt="图片" loading="lazy">`;
             } else if (fullFile.mimetype && fullFile.mimetype.startsWith('video/')) {
@@ -380,7 +380,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
         textEditBtn.disabled = !(count === 0 || isSingleTextFile) || (count === 0 && isCurrentlyRoot);
         textEditBtn.innerHTML = count === 0 ? '<i class="fas fa-file-alt"></i>' : '<i class="fas fa-edit"></i>';
-        textEditBtn.title = count === 0 ? '新建文字档' : '编辑文字档';
+        textEditBtn.title = count === 0 ? '新建文本文件' : '编辑文本文件';
 
         previewBtn.disabled = !isSingleFile;
         shareBtn.disabled = !isSingleItem;
@@ -417,7 +417,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 option.value = node.id;
                 option.textContent = prefix + (node.name === '/' ? '根目录' : node.name);
                 
-                // 在根目录时，上传选单中禁用根目录选项
+                // 在根目录时，上传菜单中禁用根目录选项
                 if (node.parent_id === null) {
                     option.disabled = true;
                 }
@@ -429,7 +429,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
             foldersLoaded = true;
         } catch (error) {
-            console.error('加载资料夾列表失败', error);
+            console.error('加载文件夹列表失败', error);
         }
     };
     
@@ -464,7 +464,7 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    async function handleConflict(conflicts, operationType = '档案') {
+    async function handleConflict(conflicts, operationType = '文件') {
         const resolutions = {};
         let applyToAllAction = null;
         let aborted = false;
@@ -538,11 +538,11 @@ document.addEventListener('DOMContentLoaded', () => {
             const oldPassword = prompt('请输入您的旧密码：');
             if (!oldPassword) return;
 
-            const newPassword = prompt('请输入您的新密码 (至少 4 个字元)：');
+            const newPassword = prompt('请输入您的新密码 (至少 4 个字符)：');
             if (!newPassword) return;
 
             if (newPassword.length < 4) {
-                alert('密码长度至少需要 4 个字元。');
+                alert('密码长度至少需要 4 个字符。');
                 return;
             }
 
@@ -598,7 +598,7 @@ document.addEventListener('DOMContentLoaded', () => {
             const files = e.target.files;
             if (files.length > 0) {
                 const folderName = files[0].webkitRelativePath.split('/')[0];
-                fileListContainer.innerHTML = `<li>已选择资料夹: <b>${folderName}</b> (包含 ${files.length} 个文件)</li>`;
+                fileListContainer.innerHTML = `<li>已选择文件夹: <b>${folderName}</b> (包含 ${files.length} 个文件)</li>`;
                 uploadSubmitBtn.style.display = 'block';
             }
         });
@@ -652,7 +652,7 @@ document.addEventListener('DOMContentLoaded', () => {
             }
 
             if (hasFolder) {
-                showNotification('不支援拖拽资料夹上传，请使用上传按钮选择资料夹。', 'error');
+                showNotification('不支持拖拽文件夹上传，请使用上传按钮选择文件夹。', 'error');
                 return;
             }
             if (files.length > 0) {
@@ -742,13 +742,13 @@ document.addEventListener('DOMContentLoaded', () => {
     if (createFolderBtn) {
         createFolderBtn.addEventListener('click', async () => {
             if(createFolderBtn.disabled) return;
-            const name = prompt('请输入新资料夹的名称：');
+            const name = prompt('请输入新文件夹的名称：');
             if (name && name.trim()) {
                 try {
                     await axios.post('/api/folder', { name: name.trim(), parentId: currentFolderId });
                     foldersLoaded = false; 
                     loadFolderContents(currentFolderId);
-                } catch (error) { alert(error.response?.data?.message || '建立失败'); }
+                } catch (error) { alert(error.response?.data?.message || '创建失败'); }
             }
         });
     }
@@ -827,7 +827,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     const escapedContent = res.data.replace(/&/g, "&amp;").replace(/</g, "&lt;");
                     modalContent.innerHTML = `<pre><code>${escapedContent}</code></pre>`;
                 } catch {
-                    modalContent.innerHTML = '无法载入文字内容。';
+                    modalContent.innerHTML = '无法载入文本内容。';
                 }
             } else {
                 modalContent.innerHTML = `
@@ -885,7 +885,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 window.URL.revokeObjectURL(url);
                 document.body.removeChild(link);
             } catch (error) {
-                alert('下载压缩档失败！');
+                alert('下载压缩文件失败！');
             }
         });
     }
@@ -893,7 +893,7 @@ document.addEventListener('DOMContentLoaded', () => {
         deleteBtn.addEventListener('click', async () => {
             if (deleteBtn.disabled) return;
             if (selectedItems.size === 0) return;
-            if (!confirm(`确定要删除这 ${selectedItems.size} 个项目吗？\n注意：删除资料夾将会一并删除其所有内容！`)) return;
+            if (!confirm(`确定要删除这 ${selectedItems.size} 个项目吗？\n注意：删除文件夹将会一并删除其所有内容！`)) return;
             const filesToDelete = [], foldersToDelete = [];
             selectedItems.forEach((item, id) => {
                 if (item.type === 'file') filesToDelete.push(parseInt(id));
@@ -939,14 +939,14 @@ document.addEventListener('DOMContentLoaded', () => {
                 const sourceMountNode = rootNode ? folderMap.get(rootNode.id).children.find(child => child.name === sourceMountName) : null;
                 
                 if (!sourceMountNode) {
-                    folderTree.innerHTML = '<p>找不到可用的目标资料夹。</p>';
+                    folderTree.innerHTML = '<p>找不到可用的目标文件夹。</p>';
                     moveModal.style.display = 'flex';
                     return;
                 }
 
-                // 建立可移动到的资料夹树
+                // 创建可移动到的文件夹树
                 const buildTree = (node, prefix = '') => {
-                    const isDisabled = node.id === currentFolderId; // 不能移动到自己所在的资料夹
+                    const isDisabled = node.id === currentFolderId || selectedItems.has(String(node.id)); // 不能移动到自己所在的文件夹或选中的文件夹
 
                     const item = document.createElement('div');
                     item.className = 'folder-item';
@@ -962,12 +962,12 @@ document.addEventListener('DOMContentLoaded', () => {
                     node.children.sort((a,b) => a.name.localeCompare(b.name)).forEach(child => buildTree(child, prefix + '　'));
                 };
 
-                buildTree(sourceMountNode); // 只渲染来源挂载点下的资料夹
+                buildTree(sourceMountNode); // 只渲染来源挂载点下的文件夹
 
                 moveModal.style.display = 'flex';
                 moveTargetFolderId = null;
                 confirmMoveBtn.disabled = true;
-            } catch { alert('无法获取资料夾列表。'); }
+            } catch { alert('无法获取文件夹列表。'); }
         });
     }
     // --- 主要修改结束 ---
@@ -1035,7 +1035,7 @@ document.addEventListener('DOMContentLoaded', () => {
     
                 if (fileConflicts.length > 0) {
                     const prefixedFileConflicts = fileConflicts.map(name => pathPrefix ? `${pathPrefix}/${name}` : name);
-                    const result = await handleConflict(prefixedFileConflicts, '档案');
+                    const result = await handleConflict(prefixedFileConflicts, '文件');
     
                     if (result.aborted) {
                         isAborted = true;
@@ -1146,12 +1146,27 @@ document.addEventListener('DOMContentLoaded', () => {
     if (document.getElementById('itemGrid')) {
         const pathParts = window.location.pathname.split('/');
         const lastPart = pathParts.filter(p => p).pop();
-        let folderId = parseInt(lastPart, 10);
-        if (isNaN(folderId)) {
-            const rootFolderLink = document.querySelector('.breadcrumb a');
-            folderId = rootFolderLink ? parseInt(rootFolderLink.dataset.folderId) : 1;
+        let folderId;
+
+        // 检查路径是否指向根目录
+        if (!lastPart || pathParts[pathParts.length - 2] === 'folder' && !/\d/.test(lastPart)) {
+            folderId = 1; // 默认根目录ID
+        } else {
+            folderId = parseInt(lastPart, 10);
+            if(isNaN(folderId)) folderId = 1;
         }
-        loadFolderContents(folderId);
+
+        // 获取真实的根目录ID
+        axios.get('/api/folder/root').then(res => {
+            if(window.location.pathname === '/'){
+                loadFolderContents(res.data.id);
+            } else {
+                loadFolderContents(folderId);
+            }
+        }).catch(() => {
+            loadFolderContents(folderId);
+        });
+
         checkScreenWidthAndCollapse();
         window.addEventListener('resize', checkScreenWidthAndCollapse);
     }
