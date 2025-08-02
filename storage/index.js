@@ -43,6 +43,9 @@ function getStorage() {
     return webdavStorage;
 }
 
+// setStorageMode 不再需要，但为保持 API 一致性，可以保留一个空函数或直接移除
+// 为了代码简洁，这里我们直接移除
+
 module.exports = {
     getStorage,
     readConfig,
