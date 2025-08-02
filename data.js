@@ -311,31 +311,6 @@ function getAllFolders(userId) {
     });
 }
 
-async function getMountNameForId(itemId, itemType, userId) {
-    let folderIdToCheck;
-    if (itemType === 'folder') {
-        folderIdToCheck = itemId;
-    } else {
-        const file = (await getFilesByIds([itemId], userId))[0];
-        folderIdToCheck = file ? file.folder_id : null;
-    }
-
-    if (!folderIdToCheck) return null;
-
-    const path = await getFolderPath(folderIdToCheck, userId);
-    if (path.length > 1) {
-        return path[1].name;
-    }
-    
-    const rootFolder = await getRootFolder(userId);
-    const folder = await new Promise((res, rej) => db.get("SELECT * FROM folders WHERE id = ? AND user_id = ?", [folderIdToCheck, userId], (e, r) => e ? rej(e) : res(r)));
-    if (folder && folder.parent_id === rootFolder.id) {
-         return folder.name;
-    }
-
-    return null;
-}
-
 async function moveItem(itemId, itemType, targetFolderId, userId, options = {}) {
     const { resolutions = {}, pathPrefix = '' } = options;
     const report = { moved: 0, skipped: 0, errors: 0 };
@@ -452,7 +427,7 @@ async function unifiedDelete(itemId, itemType, userId) {
     try {
         await storage.remove(itemsForStorage);
     } catch (err) {
-        throw new Error("实体文件删除失败，操作已中止。");
+        throw new Error(`实体删除失败，操作已中止: ${err.message}`);
     }
     
     await executeDeletion(fileIdsToDelete, folderIdsToDelete, userId);
