@@ -5,6 +5,8 @@ const bcrypt = require('bcrypt');
 
 const DATA_DIR = path.join(__dirname, 'data');
 const DB_FILE = path.join(DATA_DIR, 'file-manager.db');
+// --- 新增：讀取設定檔路徑 ---
+const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
 
 // 确保资料目录存在
 try {
@@ -122,9 +124,36 @@ function checkAndCreateAdmin() {
                         return;
                     }
                     if (!root) {
-                        db.run("INSERT INTO folders (name, parent_id, user_id) VALUES (?, NULL, ?)", ['/', adminId], (err) => {
-                            if(err) console.error("为管理员建立根目录失败:", err.message);
-                            else console.log("管理员根目录建立成功。");
+                        db.run("INSERT INTO folders (name, parent_id, user_id) VALUES (?, NULL, ?)", ['/', adminId], function(err) {
+                            if(err) {
+                                console.error("为管理员建立根目录失败:", err.message);
+                            } else {
+                                console.log("管理员根目录建立成功。");
+                                const rootId = this.lastID;
+                                // --- 主要修改开始 ---
+                                // 建立根目录后，根据设定档为管理员建立挂载点
+                                try {
+                                    if (fs.existsSync(CONFIG_FILE)) {
+                                        const rawData = fs.readFileSync(CONFIG_FILE);
+                                        const config = JSON.parse(rawData);
+                                        if (config.webdav && Array.isArray(config.webdav)) {
+                                            console.log('正在为管理员建立 WebDAV 挂载点...');
+                                            config.webdav.forEach(mount => {
+                                                db.run("INSERT INTO folders (name, parent_id, user_id) VALUES (?, ?, ?)", [mount.mount_name, rootId, adminId], (err) => {
+                                                    if (err) {
+                                                        console.error(`建立挂载点资料夹 "${mount.mount_name}" 失败:`, err.message);
+                                                    } else {
+                                                        console.log(`已为管理员建立挂载点资料夹: ${mount.mount_name}`);
+                                                    }
+                                                });
+                                            });
+                                        }
+                                    }
+                                } catch (error) {
+                                    console.error("读取设定档或建立挂载点时出错:", error);
+                                }
+                                // --- 主要修改结束 ---
+                            }
                         });
                     }
                 });
