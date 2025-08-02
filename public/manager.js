@@ -19,6 +19,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const textEditBtn = document.getElementById('textEditBtn');
     const logoutBtn = document.getElementById('logoutBtn');
     const changePasswordBtn = document.getElementById('changePasswordBtn');
+    const showUploadModalBtn = document.getElementById('showUploadModalBtn'); // 已在HTML中
     const previewModal = document.getElementById('previewModal');
     const modalContent = document.getElementById('modalContent');
     const closeModal = document.querySelector('.close-button');
@@ -37,7 +38,6 @@ document.addEventListener('DOMContentLoaded', () => {
     const folderConflictOptions = document.getElementById('folderConflictOptions');
     const shareModal = document.getElementById('shareModal');
     const uploadModal = document.getElementById('uploadModal');
-    const showUploadModalBtn = document.getElementById('showUploadModalBtn');
     const closeUploadModalBtn = document.getElementById('closeUploadModalBtn');
     const uploadForm = document.getElementById('uploadForm');
     const fileInput = document.getElementById('fileInput');
@@ -57,6 +57,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // 状态
     let isMultiSelectMode = false;
     let currentFolderId = 1;
+    let currentFolderPath = []; // --- 新增：储存目前目录路径 ---
     let currentFolderContents = { folders: [], files: [] };
     let selectedItems = new Map();
     let moveTargetFolderId = null;
@@ -64,6 +65,9 @@ document.addEventListener('DOMContentLoaded', () => {
     const MAX_TELEGRAM_SIZE = 50 * 1024 * 1024;
     let foldersLoaded = false;
     let currentView = 'grid';
+    // --- 新增：判断是否为根目录 ---
+    let isCurrentlyRoot = false;
+
 
     const formatBytes = (bytes, decimals = 2) => {
         if (!bytes || bytes === 0) return '0 Bytes';
@@ -149,7 +153,6 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
 
-        // 总是上传所有由使用者选择的文件
         const fileObjects = Array.from(files).filter(f => f.name);
         const filesToCheck = fileObjects.map(f => ({
             relativePath: f.webkitRelativePath || f.name
@@ -183,7 +186,7 @@ document.addEventListener('DOMContentLoaded', () => {
         });
         
         formData.append('folderId', targetFolderId);
-        formData.append('resolutions', JSON.stringify(resolutions)); // 将解决方案发送给服务器
+        formData.append('resolutions', JSON.stringify(resolutions)); 
     
         const captionInput = document.getElementById('uploadCaption');
         if (captionInput && captionInput.value && !isDrag) {
@@ -199,8 +202,11 @@ document.addEventListener('DOMContentLoaded', () => {
             if (searchInput) searchInput.value = '';
             currentFolderId = folderId;
             const res = await axios.get(`/api/folder/${folderId}`);
+            
             currentFolderContents = res.data.contents;
-            // 清理已不存在的选择项
+            currentFolderPath = res.data.path; // 更新当前路径
+            isCurrentlyRoot = currentFolderPath.length <= 1; // 判断是否在根目录
+            
             const currentIds = new Set([...res.data.contents.folders.map(f => String(f.id)), ...res.data.contents.files.map(f => String(f.id))]);
             selectedItems.forEach((_, key) => {
                 if (!currentIds.has(key)) {
@@ -223,6 +229,7 @@ document.addEventListener('DOMContentLoaded', () => {
             isSearchMode = true;
             const res = await axios.get(`/api/search?q=${encodeURIComponent(query)}`);
             currentFolderContents = res.data.contents;
+            isCurrentlyRoot = false; // 搜索结果页不是根目录
             selectedItems.clear();
             renderBreadcrumb(res.data.path);
             renderItems(currentFolderContents.folders, currentFolderContents.files);
@@ -261,8 +268,19 @@ document.addEventListener('DOMContentLoaded', () => {
         const allItems = [...folders, ...files];
         
         if (allItems.length === 0) {
-            if (currentView === 'grid') parentGrid.innerHTML = isSearchMode ? '<p>找不到符合条件的文件。</p>' : '<p>这个资料夾是空的。</p>';
-            else parentList.innerHTML = isSearchMode ? '<div class="list-item"><p>找不到符合条件的文件。</p></div>' : '<div class="list-item"><p>这个资料夾是空的。</p></div>';
+            if (isCurrentlyRoot) {
+                 const emptyMsg = '<p>根目录是空的。请先在管理后台新增 WebDAV 挂载点。</p>';
+                 parentGrid.innerHTML = emptyMsg;
+                 parentList.innerHTML = `<div class="list-item">${emptyMsg}</div>`;
+            } else if (isSearchMode) {
+                 const emptyMsg = '<p>找不到符合条件的文件。</p>';
+                 parentGrid.innerHTML = emptyMsg;
+                 parentList.innerHTML = `<div class="list-item">${emptyMsg}</div>`;
+            } else {
+                 const emptyMsg = '<p>这个资料夾是空的。</p>';
+                 parentGrid.innerHTML = emptyMsg;
+                 parentList.innerHTML = `<div class="list-item">${emptyMsg}</div>`;
+            }
             return;
         }
 
@@ -338,34 +356,44 @@ document.addEventListener('DOMContentLoaded', () => {
         if (mimetype.includes('archive') || mimetype.includes('zip')) return 'fa-file-archive';
         return 'fa-file-alt';
     };
+
+    // --- 主要修改开始 (更新操作栏状态) ---
     const updateActionBar = () => {
         if (!actionBar) return;
         const count = selectedItems.size;
         selectionCountSpan.textContent = `已选择 ${count} 个项目`;
 
-        if (downloadBtn) downloadBtn.disabled = count === 0;
+        const isSingleItem = count === 1;
+        const isSingleFile = isSingleItem && selectedItems.values().next().value.type === 'file';
+        const isSingleTextFile = isSingleFile && selectedItems.values().next().value.name.endsWith('.txt');
+        const firstSelected = isSingleItem ? selectedItems.values().next().value : null;
 
-        const isSingleTextFile = count === 1 && selectedItems.values().next().value.name.endsWith('.txt');
-        if (textEditBtn) {
-            textEditBtn.disabled = !(count === 0 || isSingleTextFile);
-            textEditBtn.innerHTML = count === 0 ? '<i class="fas fa-file-alt"></i>' : '<i class="fas fa-edit"></i>';
-            textEditBtn.title = count === 0 ? '新建文字档' : '编辑文字档';
+        // 根据是否在根目录禁用写操作
+        if (showUploadModalBtn) {
+            showUploadModalBtn.disabled = isCurrentlyRoot;
+            showUploadModalBtn.style.opacity = isCurrentlyRoot ? 0.6 : 1;
+            showUploadModalBtn.style.cursor = isCurrentlyRoot ? 'not-allowed' : 'pointer';
         }
+        createFolderBtn.disabled = isCurrentlyRoot;
+        deleteBtn.disabled = count === 0 || isCurrentlyRoot;
+        renameBtn.disabled = !isSingleItem || isCurrentlyRoot;
 
-        if (previewBtn) previewBtn.disabled = count !== 1 || (count === 1 && selectedItems.values().next().value.type === 'folder');
+        textEditBtn.disabled = !(count === 0 || isSingleTextFile) || (count === 0 && isCurrentlyRoot);
+        textEditBtn.innerHTML = count === 0 ? '<i class="fas fa-file-alt"></i>' : '<i class="fas fa-edit"></i>';
+        textEditBtn.title = count === 0 ? '新建文字档' : '编辑文字档';
 
-        if (shareBtn) shareBtn.disabled = count !== 1;
-
-        if (renameBtn) renameBtn.disabled = count !== 1;
-        if (moveBtn) moveBtn.disabled = count === 0 || isSearchMode;
-        if (deleteBtn) deleteBtn.disabled = count === 0;
-
+        previewBtn.disabled = !isSingleFile;
+        shareBtn.disabled = !isSingleItem;
+        downloadBtn.disabled = count === 0;
+        moveBtn.disabled = count === 0 || isSearchMode || isCurrentlyRoot;
+        
         actionBar.classList.toggle('visible', true);
-
         if (!isMultiSelectMode && multiSelectBtn) {
             multiSelectBtn.classList.remove('active');
         }
     };
+    // --- 主要修改结束 ---
+
     const rerenderSelection = () => {
         document.querySelectorAll('.item-card, .list-item').forEach(el => {
             el.classList.toggle('selected', selectedItems.has(el.dataset.id));
@@ -388,6 +416,12 @@ document.addEventListener('DOMContentLoaded', () => {
                 const option = document.createElement('option');
                 option.value = node.id;
                 option.textContent = prefix + (node.name === '/' ? '根目录' : node.name);
+                
+                // 在根目录时，上传选单中禁用根目录选项
+                if (node.parent_id === null) {
+                    option.disabled = true;
+                }
+
                 folderSelect.appendChild(option);
                 node.children.sort((a,b) => a.name.localeCompare(b.name)).forEach(child => buildOptions(child, prefix + '　'));
             };
@@ -588,7 +622,9 @@ document.addEventListener('DOMContentLoaded', () => {
         });
 
         ['dragenter', 'dragover'].forEach(eventName => {
-            dropZone.addEventListener(eventName, () => dropZone.classList.add('dragover'));
+            dropZone.addEventListener(eventName, () => {
+                if (!isCurrentlyRoot) dropZone.classList.add('dragover')
+            });
         });
 
         ['dragleave', 'drop'].forEach(eventName => {
@@ -596,6 +632,13 @@ document.addEventListener('DOMContentLoaded', () => {
         });
 
         dropZone.addEventListener('drop', (e) => {
+            // --- 主要修改：禁止在根目录拖拽上传 ---
+            if (isCurrentlyRoot) {
+                showNotification('不能直接上传到根目录，请进入一个挂载点再上传。', 'error');
+                return;
+            }
+            // --- 修改结束 ---
+
             const files = Array.from(e.dataTransfer.files);
              let hasFolder = false;
             if (e.dataTransfer.items) {
@@ -698,6 +741,7 @@ document.addEventListener('DOMContentLoaded', () => {
     });
     if (createFolderBtn) {
         createFolderBtn.addEventListener('click', async () => {
+            if(createFolderBtn.disabled) return;
             const name = prompt('请输入新资料夹的名称：');
             if (name && name.trim()) {
                 try {
@@ -747,6 +791,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     if (showUploadModalBtn) {
         showUploadModalBtn.addEventListener('click', async () => {
+            if (showUploadModalBtn.disabled) return;
             await loadFoldersForSelect();
             folderSelect.value = currentFolderId;
             uploadNotificationArea.innerHTML = '';
@@ -846,8 +891,9 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     if (deleteBtn) {
         deleteBtn.addEventListener('click', async () => {
+            if (deleteBtn.disabled) return;
             if (selectedItems.size === 0) return;
-            if (!confirm(`确定要删除这 ${selectedItems.size} 个项目吗？\n注意：删除资料夹将会一并删除其所有内容！`)) return;
+            if (!confirm(`确定要删除这 ${selectedItems.size} 个项目吗？\n注意：删除资料夾将会一并删除其所有内容！`)) return;
             const filesToDelete = [], foldersToDelete = [];
             selectedItems.forEach((item, id) => {
                 if (item.type === 'file') filesToDelete.push(parseInt(id));
@@ -860,59 +906,63 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
+    // --- 主要修改开始 (移动操作的前端逻辑) ---
     if (moveBtn) {
         moveBtn.addEventListener('click', async () => {
+            if (moveBtn.disabled) return;
             if (selectedItems.size === 0) return;
+            
+            // 确定来源挂载点
+            const sourceMountName = currentFolderPath.length > 1 ? currentFolderPath[1].name : null;
+            if (!sourceMountName) {
+                alert("无法确定来源挂载点。");
+                return;
+            }
+
             try {
                 const res = await axios.get('/api/folders');
                 const folders = res.data;
                 folderTree.innerHTML = '';
 
                 const folderMap = new Map(folders.map(f => [f.id, { ...f, children: [] }]));
-                const tree = [];
+                let tree = [];
                 folderMap.forEach(f => {
                     if (f.parent_id && folderMap.has(f.parent_id)) {
                         folderMap.get(f.parent_id).children.push(f);
-                    } else {
-                        tree.push(f);
+                    } else if (f.parent_id === null) {
+                        tree.push(f); // 根目录
                     }
                 });
 
-                const disabledFolderIds = new Set();
-                selectedItems.forEach((item, id) => {
-                    if (item.type === 'folder') {
-                        const folderId = parseInt(id);
-                        disabledFolderIds.add(folderId);
-                        const findDescendants = (parentId) => {
-                            const parentNode = folderMap.get(parentId);
-                            if (parentNode && parentNode.children) {
-                                parentNode.children.forEach(child => {
-                                    disabledFolderIds.add(child.id);
-                                    findDescendants(child.id);
-                                });
-                            }
-                        };
-                        findDescendants(folderId);
-                    }
-                });
+                // 找到我们关心的那个挂载点分支
+                const rootNode = tree.find(node => node.name === '/');
+                const sourceMountNode = rootNode ? folderMap.get(rootNode.id).children.find(child => child.name === sourceMountName) : null;
+                
+                if (!sourceMountNode) {
+                    folderTree.innerHTML = '<p>找不到可用的目标资料夹。</p>';
+                    moveModal.style.display = 'flex';
+                    return;
+                }
 
+                // 建立可移动到的资料夹树
                 const buildTree = (node, prefix = '') => {
-                    const isDisabled = disabledFolderIds.has(node.id) || node.id === currentFolderId;
+                    const isDisabled = node.id === currentFolderId; // 不能移动到自己所在的资料夹
 
                     const item = document.createElement('div');
                     item.className = 'folder-item';
                     item.dataset.folderId = node.id;
-                    item.textContent = prefix + (node.name === '/' ? '根目录' : node.name);
+                    item.textContent = prefix + node.name;
 
                     if (isDisabled) {
                         item.style.color = '#ccc';
                         item.style.cursor = 'not-allowed';
                     }
-
+                    
                     folderTree.appendChild(item);
                     node.children.sort((a,b) => a.name.localeCompare(b.name)).forEach(child => buildTree(child, prefix + '　'));
                 };
-                tree.sort((a,b) => a.name.localeCompare(b.name)).forEach(node => buildTree(node));
+
+                buildTree(sourceMountNode); // 只渲染来源挂载点下的资料夹
 
                 moveModal.style.display = 'flex';
                 moveTargetFolderId = null;
@@ -920,6 +970,8 @@ document.addEventListener('DOMContentLoaded', () => {
             } catch { alert('无法获取资料夾列表。'); }
         });
     }
+    // --- 主要修改结束 ---
+
     if (folderTree) {
         folderTree.addEventListener('click', e => {
             const target = e.target.closest('.folder-item');
@@ -933,7 +985,6 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
     
-    // *** 关键修正：重构移动确认逻辑以处理嵌套冲突 ***
     if (confirmMoveBtn) {
         confirmMoveBtn.addEventListener('click', async () => {
             if (!moveTargetFolderId) return;
@@ -941,22 +992,18 @@ document.addEventListener('DOMContentLoaded', () => {
             const resolutions = {};
             let isAborted = false;
     
-            // 递归函数，用于检查并解决各层级的冲突
             async function resolveConflictsRecursively(itemsToMove, currentTargetFolderId, pathPrefix = '') {
                 if (isAborted) return;
     
-                // 1. 获取当前层级的冲突
                 const conflictCheckRes = await axios.post('/api/check-move-conflict', {
                     itemIds: itemsToMove.map(item => item.id),
                     targetFolderId: currentTargetFolderId
                 });
                 const { fileConflicts, folderConflicts } = conflictCheckRes.data;
     
-                // 为了能递归检查，需获取目标资料夹中子资料夹的 ID
                 const destFolderContentsRes = await axios.get(`/api/folder/${currentTargetFolderId}`);
                 const destFolderMap = new Map(destFolderContentsRes.data.contents.folders.map(f => [f.name, f.id]));
     
-                // 2. 优先处理资料夹冲突
                 for (const folderName of folderConflicts) {
                     const fullPath = pathPrefix ? `${pathPrefix}/${folderName}` : folderName;
                     const action = await handleFolderConflict(fullPath);
@@ -967,7 +1014,6 @@ document.addEventListener('DOMContentLoaded', () => {
                     }
                     resolutions[fullPath] = action;
     
-                    // 如果使用者选择合并，则递归检查该资料夹内部的冲突
                     if (action === 'merge') {
                         const sourceFolder = itemsToMove.find(item => item.name === folderName && item.type === 'folder');
                         const destSubFolderId = destFolderMap.get(folderName);
@@ -987,7 +1033,6 @@ document.addEventListener('DOMContentLoaded', () => {
                     }
                 }
     
-                // 3. 处理当前层级的档案冲突
                 if (fileConflicts.length > 0) {
                     const prefixedFileConflicts = fileConflicts.map(name => pathPrefix ? `${pathPrefix}/${name}` : name);
                     const result = await handleConflict(prefixedFileConflicts, '档案');
@@ -996,16 +1041,13 @@ document.addEventListener('DOMContentLoaded', () => {
                         isAborted = true;
                         return;
                     }
-                    // 将解决结果合并到主 resolutions 物件中
                     Object.assign(resolutions, result.resolutions);
                 }
             }
     
             try {
-                // 准备好顶层要移动的项目列表
                 const topLevelItems = Array.from(selectedItems.entries()).map(([id, { type, name }]) => ({ id: parseInt(id), type, name }));
                 
-                // 启动递归冲突解决流程
                 await resolveConflictsRecursively(topLevelItems, moveTargetFolderId);
     
                 if (isAborted) {
@@ -1014,7 +1056,6 @@ document.addEventListener('DOMContentLoaded', () => {
                     return;
                 }
     
-                // 4. 发送包含所有冲突解决方案的最终移动请求
                 const response = await axios.post('/api/move', {
                     itemIds: topLevelItems.map(item => item.id),
                     targetFolderId: moveTargetFolderId,
