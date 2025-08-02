@@ -273,12 +273,10 @@ app.post('/api/admin/webdav', requireAdmin, async (req, res) => {
         return res.status(400).json({ success: false, message: 'URL, 用户名和挂载名称为必填项' });
     }
     
-    // --- *** 关键修正 开始 *** ---
-    // 修改正则表达式以允许中文字符 (Unicode 范围 \u4e00-\u9fa5)
+    // 允许中文
     if (/[^a-zA-Z0-9_-\u4e00-\u9fa5]/.test(mount_name)) {
         return res.status(400).json({ success: false, message: '挂载名称只能包含中文、字母、数字、下划线和连字符。' });
     }
-    // --- *** 关键修正 结束 *** ---
 
     const config = storageManager.readConfig();
     const isEditing = !!id;
@@ -323,7 +321,6 @@ app.post('/api/admin/webdav', requireAdmin, async (req, res) => {
                         if(mountFolder) {
                             await data.renameFolder(mountFolder.id, mount_name, user.id);
                         } else {
-                            // 如果旧文件夹不存在，就创建一个新的
                             await data.createFolder(mount_name, rootFolder.id, user.id);
                         }
                     } else if (!isEditing) {
@@ -341,7 +338,7 @@ app.post('/api/admin/webdav', requireAdmin, async (req, res) => {
 });
 
 app.delete('/api/admin/webdav/:id', requireAdmin, async (req, res) => {
-    const { id } = req.params; 
+    const { id } = req.params;
     const config = storageManager.readConfig();
     const configIndex = config.webdav.findIndex(c => c.id === id);
 
@@ -393,6 +390,7 @@ app.post('/upload', requireLogin, async (req, res, next) => {
     await cleanupTempDir();
     next();
 }, uploadMiddleware, fixFileNameEncoding, async (req, res) => {
+
     if (!req.files || req.files.length === 0) {
         return res.status(400).json({ success: false, message: '没有选择文件' });
     }
@@ -420,6 +418,7 @@ app.post('/upload', requireLogin, async (req, res, next) => {
             const file = req.files[i];
             const tempFilePath = file.path;
             const relativePath = relativePaths[i];
+            
             const action = resolutions[relativePath] || 'upload';
 
             try {
@@ -431,6 +430,7 @@ app.post('/upload', requireLogin, async (req, res, next) => {
                 const pathParts = (relativePath || file.originalname).split('/');
                 let fileName = pathParts.pop() || file.originalname;
                 const folderPathParts = pathParts;
+
                 const targetFolderId = await data.resolvePathToFolderId(initialFolderId, folderPathParts, userId);
                 
                 if (action === 'overwrite') {
@@ -447,14 +447,15 @@ app.post('/upload', requireLogin, async (req, res, next) => {
                         continue;
                     }
                 }
-
+                
                 const folderPathInfo = await data.getWebdavPathInfo(targetFolderId, userId);
                 const result = await storage.upload(tempFilePath, fileName, file.mimetype, userId, folderPathInfo);
                 const dbResult = await data.addFile(result.dbData, targetFolderId, userId, 'webdav');
                 results.push({ ...result, fileId: dbResult.fileId });
 
             } finally {
-                if (fsSync.existsSync(tempFilePath)) {
+                // *** 关键修正 ***
+                if (fs.existsSync(tempFilePath)) {
                     await fsp.unlink(tempFilePath).catch(err => {});
                 }
             }
@@ -466,14 +467,14 @@ app.post('/upload', requireLogin, async (req, res, next) => {
         }
     } catch (error) {
         for (const file of req.files) {
-            if (fsSync.existsSync(file.path)) {
+             // *** 关键修正 ***
+            if (fs.existsSync(file.path)) {
                 await fsp.unlink(file.path).catch(err => {});
             }
         }
         res.status(500).json({ success: false, message: '处理上传时发生错误: ' + error.message });
     }
 });
-
 
 app.post('/api/text-file', requireLogin, async (req, res) => {
     const { mode, fileId, folderId, fileName, content } = req.body;
@@ -500,6 +501,7 @@ app.post('/api/text-file', requireLogin, async (req, res) => {
                 if (fileName !== originalFile.fileName) {
                     const conflict = await data.checkFullConflict(fileName, finalFolderId, userId);
                     if (conflict) {
+                        await fsp.unlink(tempFilePath).catch(err => {});
                         return res.status(409).json({ success: false, message: '同目录下已存在同名文件或文件夹。' });
                     }
                 }
@@ -526,7 +528,7 @@ app.post('/api/text-file', requireLogin, async (req, res) => {
     } catch (error) {
         res.status(500).json({ success: false, message: '服务器内部错误' });
     } finally {
-        if (fsSync.existsSync(tempFilePath)) {
+        if (fs.existsSync(tempFilePath)) {
             await fsp.unlink(tempFilePath).catch(err => {});
         }
     }
