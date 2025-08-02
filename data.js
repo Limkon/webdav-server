@@ -8,6 +8,12 @@ const { getStorage } = require('./storage');
 
 const UPLOAD_DIR = path.resolve(__dirname, 'data', 'uploads');
 
+// --- 辅助函數：日誌記錄 ---
+function log(level, message, ...args) {
+    const timestamp = new Date().toISOString();
+    console.log(`[${timestamp}] [DATA] [${level.toUpperCase()}] ${message}`, ...args);
+}
+
 async function getWebdavPathInfo(folderId, userId) {
     if (!folderId) {
          throw new Error("无效的 folderId");
@@ -18,6 +24,7 @@ async function getWebdavPathInfo(folderId, userId) {
     }
     const mountName = pathParts[1].name;
     const remotePath = '/' + pathParts.slice(2).map(p => p.name).join('/');
+    log('debug', `getWebdavPathInfo: folderId=${folderId}, mountName=${mountName}, remotePath=${remotePath}`);
     return { mountName, remotePath: remotePath || '/' };
 }
 
@@ -314,6 +321,7 @@ function getAllFolders(userId) {
 async function moveItem(itemId, itemType, targetFolderId, userId, options = {}) {
     const { resolutions = {}, pathPrefix = '' } = options;
     const report = { moved: 0, skipped: 0, errors: 0 };
+    log('debug', `moveItem: itemId=${itemId}, type=${itemType}, target=${targetFolderId}, prefix=${pathPrefix}`);
     
     const sourceMount = await getMountNameForId(itemId, itemType, userId);
     const targetMount = await getMountNameForId(targetFolderId, 'folder', userId);
@@ -324,6 +332,7 @@ async function moveItem(itemId, itemType, targetFolderId, userId, options = {}) 
     
     const sourceItem = (await getItemsByIds([itemId], userId))[0];
     if (!sourceItem) {
+        log('error', `moveItem: 找不到来源项目 ID=${itemId}`);
         report.errors++;
         return report;
     }
@@ -331,6 +340,7 @@ async function moveItem(itemId, itemType, targetFolderId, userId, options = {}) 
     const currentPath = path.posix.join(pathPrefix, sourceItem.name).replace(/\\/g, '/');
     const existingItemInTarget = await findItemInFolder(sourceItem.name, targetFolderId, userId);
     const resolutionAction = resolutions[currentPath] || (existingItemInTarget ? 'skip_default' : 'move');
+    log('debug', `moveItem: currentPath=${currentPath}, resolution=${resolutionAction}`);
 
     switch (resolutionAction) {
         case 'skip':
@@ -389,6 +399,7 @@ async function moveItem(itemId, itemType, targetFolderId, userId, options = {}) 
 
 async function unifiedDelete(itemId, itemType, userId) {
     const storage = getStorage();
+    log('info', `unifiedDelete: itemId=${itemId}, type=${itemType}, storage=${storage.type}`);
     if (storage.type !== 'webdav') {
         throw new Error("目前只支援 WebDAV 储存的删除操作。");
     }
@@ -424,17 +435,20 @@ async function unifiedDelete(itemId, itemType, userId) {
         }
     }
     
+    log('debug', 'unifiedDelete: Physical items to delete:', itemsForStorage);
     try {
         await storage.remove(itemsForStorage);
     } catch (err) {
         throw new Error(`实体删除失败，操作已中止: ${err.message}`);
     }
     
+    log('debug', `unifiedDelete: DB files to delete: ${fileIdsToDelete.join(',')}, folders: ${folderIdsToDelete.join(',')}`);
     await executeDeletion(fileIdsToDelete, folderIdsToDelete, userId);
 }
 
 async function moveSingleItem(itemId, itemType, targetFolderId, userId) {
     const storage = getStorage();
+    log('info', `moveSingleItem: itemId=${itemId}, type=${itemType}, target=${targetFolderId}, storage=${storage.type}`);
     
     if (storage.type === 'webdav') {
         const newPathInfo = await getWebdavPathInfo(targetFolderId, userId);
@@ -444,6 +458,7 @@ async function moveSingleItem(itemId, itemType, targetFolderId, userId) {
             if(!file) throw new Error("找不到要移动的文件");
             const oldPathInfo = getWebdavPathInfoFromFileId(file.file_id);
             const newPath = { ...newPathInfo, remotePath: path.posix.join(newPathInfo.remotePath, file.fileName) };
+            log('debug', `moveSingleItem (file): Moving from ${oldPathInfo.remotePath} to ${newPath.remotePath}`);
             
             await storage.moveFile(oldPathInfo, newPath);
 
@@ -458,6 +473,7 @@ async function moveSingleItem(itemId, itemType, targetFolderId, userId) {
             const oldRemotePath = '/' + oldPathParts.slice(1).map(p => p.name).join('/');
             
             const newPath = { ...newPathInfo, remotePath: path.posix.join(newPathInfo.remotePath, folder.name) };
+            log('debug', `moveSingleItem (folder): Moving from ${oldRemotePath} to ${newPath.remotePath}`);
 
             await storage.moveFile({mountName: oldMountName, remotePath: oldRemotePath}, newPath);
 
@@ -962,6 +978,24 @@ async function resolvePathToFolderId(startFolderId, pathParts, userId) {
     return currentParentId;
 }
 
+async function getMountNameForId(itemId, itemType, userId) {
+    try {
+        let folderId;
+        if (itemType === 'folder') {
+            folderId = itemId;
+        } else {
+            const [file] = await getFilesByIds([itemId], userId);
+            if (!file) return null;
+            folderId = file.folder_id;
+        }
+        const pathParts = await getFolderPath(folderId, userId);
+        return (pathParts.length > 1) ? pathParts[1].name : null;
+    } catch (error) {
+        log('error', `getMountNameForId 失败: itemId=${itemId}, itemType=${itemType}`, error);
+        return null;
+    }
+}
+
 module.exports = {
     createUser,
     findUserByName,
@@ -1013,4 +1047,5 @@ module.exports = {
     renameAndMoveItem,
     getWebdavPathInfo,
     getWebdavPathInfoFromFileId,
+    getMountNameForId
 };
