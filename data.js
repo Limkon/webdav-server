@@ -288,6 +288,35 @@ function getAllFolders(userId) {
     });
 }
 
+
+function overwriteFileInDB(sourceFileId, targetFileId, targetFolderId, userId) {
+    return new Promise((resolve, reject) => {
+        db.serialize(() => {
+            db.run("BEGIN TRANSACTION;", (err) => { if (err) return reject(err); });
+
+            const deleteSql = `DELETE FROM files WHERE message_id = ? AND user_id = ?`;
+            const updateSql = `UPDATE files SET folder_id = ? WHERE message_id = ? AND user_id = ?`;
+
+            db.run(deleteSql, [targetFileId, userId], function(err) {
+                if (err) {
+                    return db.run("ROLLBACK;", () => reject(err));
+                }
+                db.run(updateSql, [targetFolderId, sourceFileId, userId], function(err) {
+                    if (err) {
+                        return db.run("ROLLBACK;", () => reject(err));
+                    }
+                    db.run("COMMIT;", (err) => {
+                        if (err) {
+                            return db.run("ROLLBACK;", () => reject(err));
+                        }
+                        resolve();
+                    });
+                });
+            });
+        });
+    });
+}
+
 async function moveItem(itemId, itemType, targetFolderId, userId, options = {}) {
     const { resolutions = {}, pathPrefix = '' } = options;
     const report = { moved: 0, skipped: 0, errors: 0 };
@@ -324,9 +353,31 @@ async function moveItem(itemId, itemType, targetFolderId, userId, options = {}) 
                 report.skipped++;
                 return report;
             }
-            await unifiedDelete(existingItemInTarget.id, existingItemInTarget.type, userId);
-            await moveItems(itemType === 'file' ? [itemId] : [], itemType === 'folder' ? [itemId] : [], targetFolderId, userId);
-            report.moved++;
+            try {
+                if (sourceItem.type === 'file' && existingItemInTarget.type === 'file') {
+                    const storage = require('./storage').getStorage();
+                    const targetFile = (await getFilesByIds([existingItemInTarget.id], userId))[0];
+
+                    if (storage.remove) {
+                        await storage.remove([targetFile], [], userId);
+                    }
+                    
+                    if (storage.type === 'webdav' && sourceItem.file_id && targetFile.file_id) {
+                         const client = storage.getClient();
+                         await client.moveFile(sourceItem.file_id, targetFile.file_id);
+                         await new Promise((res, rej) => db.run('UPDATE files SET file_id = ? WHERE message_id = ?', [targetFile.file_id, sourceItem.id], (e) => e ? rej(e) : res()));
+                    }
+                    
+                    await overwriteFileInDB(sourceItem.id, existingItemInTarget.id, targetFolderId, userId);
+                    
+                    report.moved++;
+                } else {
+                    report.skipped++;
+                }
+            } catch (err) {
+                report.errors++;
+                console.error("Overwrite error:", err);
+            }
             return report;
 
         case 'merge':
@@ -377,7 +428,9 @@ async function unifiedDelete(itemId, itemType, userId) {
     }
     
     try {
-        await storage.remove(filesForStorage, foldersForStorage, userId);
+        if(storage.remove) {
+            await storage.remove(filesForStorage, foldersForStorage, userId);
+        }
     } catch (err) {
         throw new Error("实体档案删除失败，操作已中止。");
     }
@@ -388,24 +441,19 @@ async function unifiedDelete(itemId, itemType, userId) {
 async function moveItems(fileIds = [], folderIds = [], targetFolderId, userId) {
     const storage = require('./storage').getStorage();
 
-    if (storage.type === 'local' || storage.type === 'webdav') {
-        const client = storage.type === 'webdav' ? storage.getClient() : null;
+    if (storage.type === 'webdav') {
+        const client = storage.getClient();
         
         const targetPathParts = await getFolderPath(targetFolderId, userId);
-        const targetFullPath = path.posix.join(...targetPathParts.map(p => p.name));
+        const targetFullPath = path.posix.join(...targetPathParts.slice(1).map(p => p.name));
 
         const filesToMove = await getFilesByIds(fileIds, userId);
         for (const file of filesToMove) {
             const oldRelativePath = file.file_id;
-            const newRelativePath = path.posix.join(targetFullPath, file.fileName);
+            const newRelativePath = path.posix.join(targetFullPath, file.fileName).replace(/\\/g, '/');
             
             try {
-                if (storage.type === 'local') {
-                    const oldFullPath = path.join(UPLOAD_DIR, String(userId), oldRelativePath);
-                    const newFullPath = path.join(UPLOAD_DIR, String(userId), newRelativePath);
-                    await fs.mkdir(path.dirname(newFullPath), { recursive: true });
-                    await fs.rename(oldFullPath, newFullPath);
-                } else if (client) {
+                if (client && oldRelativePath !== newRelativePath) {
                     await client.moveFile(oldRelativePath, newRelativePath);
                 }
                 
@@ -419,17 +467,11 @@ async function moveItems(fileIds = [], folderIds = [], targetFolderId, userId) {
         const foldersToMove = (await getItemsByIds(folderIds, userId)).filter(i => i.type === 'folder');
         for (const folder of foldersToMove) {
             const oldPathParts = await getFolderPath(folder.id, userId);
-            const oldFullPath = path.posix.join(...oldPathParts.map(p => p.name));
+            const oldFullPath = path.posix.join(...oldPathParts.slice(1).map(p => p.name));
             const newFullPath = path.posix.join(targetFullPath, folder.name);
 
             try {
-                 if (storage.type === 'local') {
-                    const oldAbsPath = path.join(UPLOAD_DIR, String(userId), oldFullPath);
-                    const newAbsPath = path.join(UPLOAD_DIR, String(userId), newFullPath);
-                    if (fsSync.existsSync(oldAbsPath)) {
-                       await fs.rename(oldAbsPath, newAbsPath);
-                    }
-                 } else if (client) {
+                 if (client && oldFullPath !== newFullPath) {
                     await client.moveFile(oldFullPath, newFullPath);
                  }
 
@@ -502,9 +544,14 @@ async function getFolderDeletionData(folderId, userId) {
     function buildPath(fId) {
         let pathParts = [];
         let current = folderMap.get(fId);
+        let rootName = (current && !current.parent_id) ? current.name : '';
+        
         while(current && current.parent_id) {
             pathParts.unshift(current.name);
             current = folderMap.get(current.parent_id);
+        }
+        if (rootName && rootName !== '/') {
+            pathParts.unshift(rootName);
         }
         return path.join(...pathParts);
     }
@@ -624,18 +671,16 @@ async function renameFile(messageId, newFileName, userId) {
 
     const storage = require('./storage').getStorage();
 
-    if (storage.type === 'local' || storage.type === 'webdav') {
+    if (storage.type === 'webdav') {
         const oldRelativePath = file.file_id;
         const newRelativePath = path.posix.join(path.posix.dirname(oldRelativePath), newFileName);
 
         try {
-            if (storage.type === 'local') {
-                const oldFullPath = path.join(UPLOAD_DIR, String(userId), oldRelativePath);
-                const newFullPath = path.join(UPLOAD_DIR, String(userId), newRelativePath);
-                await fs.rename(oldFullPath, newFullPath);
-            } else if (storage.type === 'webdav') {
+            if (storage.type === 'webdav') {
                 const client = storage.getClient();
-                await client.moveFile(oldRelativePath, newRelativePath);
+                if (oldRelativePath !== newRelativePath) {
+                    await client.moveFile(oldRelativePath, newRelativePath);
+                }
             }
         } catch(err) {
             throw new Error(`实体档案重新命名失败`);
@@ -665,19 +710,14 @@ async function renameAndMoveFile(messageId, newFileName, targetFolderId, userId)
     if (!file) throw new Error('File not found for rename and move');
 
     const storage = require('./storage').getStorage();
-    if (storage.type === 'local' || storage.type === 'webdav') {
+    if (storage.type === 'webdav') {
         const targetPathParts = await getFolderPath(targetFolderId, userId);
-        const targetRelativePath = path.posix.join(...targetPathParts.map(p => p.name));
+        const targetRelativePath = path.posix.join(...targetPathParts.slice(1).map(p => p.name));
         const newRelativePath = path.posix.join(targetRelativePath, newFileName);
         const oldRelativePath = file.file_id;
         
         try {
-            if (storage.type === 'local') {
-                 const oldFullPath = path.join(UPLOAD_DIR, String(userId), oldRelativePath);
-                 const newFullPath = path.join(UPLOAD_DIR, String(userId), newRelativePath);
-                 await fs.mkdir(path.dirname(newFullPath), { recursive: true });
-                 await fs.rename(oldFullPath, newFullPath);
-            } else if (storage.type === 'webdav') {
+            if (storage.type === 'webdav' && oldRelativePath !== newRelativePath) {
                 const client = storage.getClient();
                 await client.moveFile(oldRelativePath, newRelativePath);
             }
@@ -704,19 +744,13 @@ async function renameFolder(folderId, newFolderName, userId) {
     
     const storage = require('./storage').getStorage();
 
-    if (storage.type === 'local' || storage.type === 'webdav') {
+    if (storage.type === 'webdav') {
         const oldPathParts = await getFolderPath(folderId, userId);
-        const oldFullPath = path.posix.join(...oldPathParts.map(p => p.name));
+        const oldFullPath = path.posix.join(...oldPathParts.slice(1).map(p => p.name));
         const newFullPath = path.posix.join(path.posix.dirname(oldFullPath), newFolderName);
 
         try {
-            if (storage.type === 'local') {
-                const oldAbsPath = path.join(UPLOAD_DIR, String(userId), oldFullPath);
-                const newAbsPath = path.join(UPLOAD_DIR, String(userId), newFullPath);
-                if (fsSync.existsSync(oldAbsPath)) {
-                    await fs.rename(oldAbsPath, newAbsPath);
-                }
-            } else if (storage.type === 'webdav') {
+            if (storage.type === 'webdav' && oldFullPath !== newFullPath) {
                 const client = storage.getClient();
                 await client.moveFile(oldFullPath, newFullPath);
             }
@@ -923,7 +957,7 @@ function getRootFolder(userId) {
 }
 
 async function findOrCreateFolderByPath(fullPath, userId) {
-    if (!fullPath || fullPath === '/') {
+    if (!fullPath || fullPath === '/' || fullPath === '.') {
         const root = await getRootFolder(userId);
         return root.id;
     }
