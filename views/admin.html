@@ -6,94 +6,120 @@
     <title>管理后台</title>
     <link rel="stylesheet" href="/vendor/fontawesome/css/all.min.css">
     <link rel="stylesheet" href="/manager.css">
+    <style>
+        /* --- 布局修正：让此页面结构与主页面一致 --- */
+        html, body {
+            height: 100%;
+            margin: 0;
+            overflow: hidden; /* 防止 body 本身滚动 */
+        }
+        body { 
+            padding: 20px;
+            box-sizing: border-box;
+        }
+        .container {
+            height: 100%;
+            width: 100%;
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        /* --- 滚动条核心样式 --- */
+        .scrollable-content {
+            flex-grow: 1; /* 让此区域填满剩余空间 */
+            overflow-y: auto; /* 当内容超出时，显示垂直滚动条 */
+            padding: 15px;
+            margin: -15px; /* 抵销内边距以对齐 */
+        }
+    </style>
 </head>
 <body>
     <div class="container">
         <header class="admin-header">
             <h1><i class="fas fa-cogs"></i> 管理后台</h1>
             <nav>
-                <a href="/" class="nav-link"><i class="fas fa-arrow-left"></i> 返回档案管理器</a>
+                <a href="/" class="upload-link-btn"><i class="fas fa-arrow-left"></i> 返回档案管理器</a>
             </nav>
         </header>
-
-        <main class="admin-main">
-            <div class="setting-card" id="webdav-settings-card">
-                <h2><i class="fas fa-server"></i> WebDAV 挂载设定</h2>
-                <p>为当前管理员帐号添加多个 WebDAV 挂载点。每个挂载点将在根目录下显示为一个子目录。</p>
+        <div class="scrollable-content">
+            <main class="admin-main">
+                <div class="setting-card" id="webdav-settings-card">
+                    <h2><i class="fas fa-server"></i> WebDAV 挂载设定</h2>
+                    <p>为当前管理员帐号添加多个 WebDAV 挂载点。每个挂载点将在根目录下显示为一个子目录。</p>
+                    
+                    <div class="table-container">
+                        <table class="user-table" id="webdav-table">
+                            <thead>
+                                <tr>
+                                    <th>挂载名称</th>
+                                    <th>URL</th>
+                                    <th>使用者名称</th>
+                                    <th>状态</th>
+                                    <th>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody id="webdav-table-body">
+                                </tbody>
+                        </table>
+                    </div>
                 
-                <div class="table-container">
-                    <table class="user-table" id="webdav-table">
-                        <thead>
-                            <tr>
-                                <th>挂载名称</th>
-                                <th>URL</th>
-                                <th>使用者名称</th>
-                                <th>状态</th>
-                                <th>操作</th>
-                            </tr>
-                        </thead>
-                        <tbody id="webdav-table-body">
-                            </tbody>
-                    </table>
+                    <h3 class="form-title">新增或编辑 WebDAV 挂载点</h3>
+                    <form id="webdav-form">
+                        <input type="hidden" id="webdav-id">
+                        <div class="form-grid">
+                            <input type="text" id="webdav-mount-name" placeholder="挂载名称 (例如 'MyNAS')" required>
+                            <input type="url" id="webdav-url" placeholder="WebDAV URL (例如 'http://192.168.1.100:5005')" required>
+                            <input type="text" id="webdav-username" placeholder="使用者名称" required>
+                            <input type="password" id="webdav-password" placeholder="密码 (留空则不变更)">
+                            <button type="submit" id="save-webdav-btn">储存设定</button>
+                            <button type="button" id="clear-webdav-form-btn" class="secondary-btn">清除表单</button>
+                        </div>
+                    </form>
                 </div>
-            
-                <h3 class="form-title">新增或编辑 WebDAV 挂载点</h3>
-                <form id="webdav-form">
-                    <input type="hidden" id="webdav-id">
-                    <div class="form-grid">
-                        <input type="text" id="webdav-mount-name" placeholder="挂载名称 (例如 'MyNAS')" required>
-                        <input type="url" id="webdav-url" placeholder="WebDAV URL (例如 'http://192.168.1.100:5005')" required>
-                        <input type="text" id="webdav-username" placeholder="使用者名称" required>
-                        <input type="password" id="webdav-password" placeholder="密码 (留空则不变更)">
-                        <button type="submit" id="save-webdav-btn">储存设定</button>
-                        <button type="button" id="clear-webdav-form-btn" class="secondary-btn">清除表单</button>
+
+                <div class="setting-card" id="user-management-card">
+                    <h2><i class="fas fa-users"></i> 使用者管理</h2>
+                    <p>管理系统的非管理员使用者。</p>
+                    <div class="table-container">
+                        <table class="user-table" id="user-table">
+                            <thead>
+                                <tr>
+                                    <th>使用者名称</th>
+                                    <th>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody id="user-table-body">
+                                </tbody>
+                        </table>
                     </div>
-                </form>
-            </div>
 
-            <div class="setting-card" id="user-management-card">
-                <h2><i class="fas fa-users"></i> 使用者管理</h2>
-                <p>管理系统的非管理员使用者。</p>
-                <div class="table-container">
-                    <table class="user-table" id="user-table">
-                        <thead>
-                            <tr>
-                                <th>使用者名称</th>
-                                <th>操作</th>
-                            </tr>
-                        </thead>
-                        <tbody id="user-table-body">
-                            </tbody>
-                    </table>
+                    <h3 class="form-title">新增使用者</h3>
+                    <form id="add-user-form" class="form-grid">
+                        <input type="text" id="new-username" placeholder="新使用者名称" required>
+                        <input type="password" id="new-password" placeholder="新使用者密码 (至少4位)" required>
+                        <button type="submit">新增使用者</button>
+                    </form>
                 </div>
 
-                <h3 class="form-title">新增使用者</h3>
-                <form id="add-user-form" class="form-grid">
-                    <input type="text" id="new-username" placeholder="新使用者名称" required>
-                    <input type="password" id="new-password" placeholder="新使用者密码 (至少4位)" required>
-                    <button type="submit">新增使用者</button>
-                </form>
-            </div>
-
-             <div class="setting-card" id="scan-card">
-                <h2><i class="fas fa-search"></i> 资料扫描汇入</h2>
-                <p>从 WebDAV 伺服器扫描档案和资料夹并将其汇入资料库。这对于初次设定或同步外部变动非常有用。</p>
-                <form id="scan-form">
-                    <div class="form-grid">
-                        <select id="scan-user-select" required>
-                            <option value="">-- 选择要扫描的使用者 --</option>
-                        </select>
-                        <select id="scan-mount-select" required>
-                            <option value="">-- 先选择使用者 --</option>
-                        </select>
-                        <button type="submit" id="start-scan-btn">开始扫描</button>
+                 <div class="setting-card" id="scan-card">
+                    <h2><i class="fas fa-search"></i> 资料扫描汇入</h2>
+                    <p>从 WebDAV 伺服器扫描档案和资料夹并将其汇入资料库。这对于初次设定或同步外部变动非常有用。</p>
+                    <form id="scan-form">
+                        <div class="form-grid">
+                            <select id="scan-user-select" required>
+                                <option value="">-- 选择要扫描的使用者 --</option>
+                            </select>
+                            <select id="scan-mount-select" required>
+                                <option value="">-- 先选择使用者 --</option>
+                            </select>
+                            <button type="submit" id="start-scan-btn">开始扫描</button>
+                        </div>
+                    </form>
+                    <div id="scan-log-container" class="log-container">
+                        <pre id="scan-log"></pre>
                     </div>
-                </form>
-                <div id="scan-log-container" class="log-container">
-                    <pre id="scan-log"></pre>
                 </div>
-            </div>
-        </main>
+            </main>
+        </div>
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
