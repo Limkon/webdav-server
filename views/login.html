@@ -101,12 +101,8 @@
       </div>
       <button type="submit">登入</button>
     </form>
-    <div class="register-link">
-        还没有帐号？ <a href="/register">点此注册</a>
-    </div>
   </div>
 
-  <!-- --- *** 关键修正 开始 *** --- -->
   <script>
     document.addEventListener('DOMContentLoaded', () => {
       const form = document.getElementById('loginForm');
@@ -115,7 +111,7 @@
 
       const handleEnter = (event) => {
         if (event.key === 'Enter') {
-          event.preventDefault(); // 防止预设的换行行为
+          event.preventDefault();
           form.submit();
         }
       };
@@ -124,6 +120,5 @@
       passwordInput.addEventListener('keydown', handleEnter);
     });
   </script>
-  <!-- --- *** 关键修正 结束 *** --- -->
 </body>
 </html>
