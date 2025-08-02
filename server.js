@@ -906,7 +906,6 @@ app.post('/api/scan/webdav', requireAdmin, async (req, res) => {
                             const folderPathInDb = path.posix.join('/', mountConfig.mount_name, path.dirname(item.filename));
                             const folderId = await data.findOrCreateFolderByPath(folderPathInDb, userId);
                             
-                            // *** 关键修正: 不再使用 BigInt ***
                             const messageId = Date.now() * 1000 + crypto.randomInt(1000);
                             await data.addFile({
                                 message_id: messageId,
