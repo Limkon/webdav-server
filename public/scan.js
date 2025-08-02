@@ -1,49 +1,21 @@
 document.addEventListener('DOMContentLoaded', () => {
     const userSelect = document.getElementById('user-select');
-    const webdavSelect = document.getElementById('webdav-select');
-    const scanBtn = document.getElementById('scan-btn');
+    const scanWebdavBtn = document.getElementById('scan-webdav-btn');
     const scanLog = document.getElementById('scan-log');
-    let allUsers = [];
-    let allWebdavs = [];
 
+    // 加载所有使用者到下拉选单
     async function loadUsers() {
         try {
             const response = await axios.get('/api/admin/all-users');
-            allUsers = response.data;
-            userSelect.innerHTML = '<option value="" disabled selected>-- 请选择使用者 --</option>';
-            allUsers.forEach(user => {
-                const option = new Option(user.username, user.id);
+            userSelect.innerHTML = '<option value="" disabled selected>-- 请选择一个使用者 --</option>';
+            response.data.forEach(user => {
+                const option = document.createElement('option');
+                option.value = user.id;
+                option.textContent = user.username;
                 userSelect.appendChild(option);
             });
         } catch (error) {
-            logMessage('无法加载使用者列表', 'error');
-        }
-    }
-
-    async function loadWebdavConfigs(userId) {
-        webdavSelect.innerHTML = '<option value="">加载中...</option>';
-        webdavSelect.disabled = true;
-        scanBtn.disabled = true;
-        if (!userId) {
-            webdavSelect.innerHTML = '<option value="">请先选择使用者</option>';
-            return;
-        }
-        try {
-            const response = await axios.get(`/api/admin/webdav-configs?userId=${userId}`);
-            allWebdavs = response.data;
-            webdavSelect.innerHTML = '<option value="" disabled selected>-- 请选择挂载点 --</option>';
-            if (allWebdavs.length > 0) {
-                allWebdavs.forEach(config => {
-                    const option = new Option(`${config.mount_name} (${config.url})`, config.id);
-                    webdavSelect.appendChild(option);
-                });
-                webdavSelect.disabled = false;
-            } else {
-                webdavSelect.innerHTML = '<option value="">此使用者无挂载点</option>';
-            }
-        } catch (error) {
-            webdavSelect.innerHTML = '<option value="">加载失败</option>';
-            logMessage('加载 WebDAV 设定失败', 'error');
+            logMessage('无法加载使用者列表: ' + (error.response?.data?.message || error.message), 'error');
         }
     }
 
@@ -55,44 +27,36 @@ document.addEventListener('DOMContentLoaded', () => {
         scanLog.scrollTop = scanLog.scrollHeight;
     }
 
-    function disableControls(disabled) {
-        scanBtn.disabled = disabled;
+    function disableButtons(disabled) {
+        scanWebdavBtn.disabled = disabled;
         userSelect.disabled = disabled;
-        webdavSelect.disabled = disabled;
     }
 
-    async function startScan() {
+    async function startScan(storageType) {
         const userId = userSelect.value;
-        const webdavConfigId = webdavSelect.value;
-
-        if (!userId || !webdavConfigId) {
-            alert('请先选择一个使用者和 WebDAV 挂载点！');
+        if (!userId) {
+            alert('请先选择一个要汇入的使用者！');
             return;
         }
         
         scanLog.innerHTML = '';
-        logMessage(`开始为使用者 ID ${userId} 扫描 WebDAV 挂载点 ID ${webdavConfigId}`, 'info');
-        disableControls(true);
+        logMessage(`开始扫描 ${storageType.toUpperCase()} 储存，为使用者 ID: ${userId}`, 'info');
+        disableButtons(true);
 
         try {
-            const response = await axios.post(`/api/scan/webdav`, { userId, webdavConfigId });
+            const response = await axios.post(`/api/scan/${storageType}`, { userId });
             const logs = response.data.log;
-            if(logs && logs.length > 0) {
-               logs.forEach(log => logMessage(log.message, log.type));
-            }
+            logs.forEach(log => logMessage(log.message, log.type));
             logMessage('扫描完成！', 'success');
+
         } catch (error) {
             logMessage('扫描时发生严重错误: ' + (error.response?.data?.message || error.message), 'error');
         } finally {
-            disableControls(false);
+            disableButtons(false);
         }
     }
 
-    userSelect.addEventListener('change', () => loadWebdavConfigs(userSelect.value));
-    webdavSelect.addEventListener('change', () => {
-        scanBtn.disabled = !webdavSelect.value;
-    });
-    scanBtn.addEventListener('click', startScan);
+    scanWebdavBtn.addEventListener('click', () => startScan('webdav'));
 
     loadUsers();
 });
