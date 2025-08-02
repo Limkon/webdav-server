@@ -273,7 +273,6 @@ app.post('/api/admin/webdav', requireAdmin, async (req, res) => {
         return res.status(400).json({ success: false, message: 'URL, 用户名和挂载名称为必填项' });
     }
     
-    // 允许中文
     if (/[^a-zA-Z0-9_-\u4e00-\u9fa5]/.test(mount_name)) {
         return res.status(400).json({ success: false, message: '挂载名称只能包含中文、字母、数字、下划线和连字符。' });
     }
@@ -338,7 +337,7 @@ app.post('/api/admin/webdav', requireAdmin, async (req, res) => {
 });
 
 app.delete('/api/admin/webdav/:id', requireAdmin, async (req, res) => {
-    const { id } = req.params;
+    const { id } = req.params; 
     const config = storageManager.readConfig();
     const configIndex = config.webdav.findIndex(c => c.id === id);
 
@@ -390,7 +389,6 @@ app.post('/upload', requireLogin, async (req, res, next) => {
     await cleanupTempDir();
     next();
 }, uploadMiddleware, fixFileNameEncoding, async (req, res) => {
-
     if (!req.files || req.files.length === 0) {
         return res.status(400).json({ success: false, message: '没有选择文件' });
     }
@@ -418,7 +416,6 @@ app.post('/upload', requireLogin, async (req, res, next) => {
             const file = req.files[i];
             const tempFilePath = file.path;
             const relativePath = relativePaths[i];
-            
             const action = resolutions[relativePath] || 'upload';
 
             try {
@@ -430,7 +427,6 @@ app.post('/upload', requireLogin, async (req, res, next) => {
                 const pathParts = (relativePath || file.originalname).split('/');
                 let fileName = pathParts.pop() || file.originalname;
                 const folderPathParts = pathParts;
-
                 const targetFolderId = await data.resolvePathToFolderId(initialFolderId, folderPathParts, userId);
                 
                 if (action === 'overwrite') {
@@ -447,14 +443,13 @@ app.post('/upload', requireLogin, async (req, res, next) => {
                         continue;
                     }
                 }
-                
+
                 const folderPathInfo = await data.getWebdavPathInfo(targetFolderId, userId);
                 const result = await storage.upload(tempFilePath, fileName, file.mimetype, userId, folderPathInfo);
                 const dbResult = await data.addFile(result.dbData, targetFolderId, userId, 'webdav');
                 results.push({ ...result, fileId: dbResult.fileId });
 
             } finally {
-                // *** 关键修正 ***
                 if (fs.existsSync(tempFilePath)) {
                     await fsp.unlink(tempFilePath).catch(err => {});
                 }
@@ -467,7 +462,6 @@ app.post('/upload', requireLogin, async (req, res, next) => {
         }
     } catch (error) {
         for (const file of req.files) {
-             // *** 关键修正 ***
             if (fs.existsSync(file.path)) {
                 await fsp.unlink(file.path).catch(err => {});
             }
@@ -475,6 +469,7 @@ app.post('/upload', requireLogin, async (req, res, next) => {
         res.status(500).json({ success: false, message: '处理上传时发生错误: ' + error.message });
     }
 });
+
 
 app.post('/api/text-file', requireLogin, async (req, res) => {
     const { mode, fileId, folderId, fileName, content } = req.body;
@@ -911,7 +906,8 @@ app.post('/api/scan/webdav', requireAdmin, async (req, res) => {
                             const folderPathInDb = path.posix.join('/', mountConfig.mount_name, path.dirname(item.filename));
                             const folderId = await data.findOrCreateFolderByPath(folderPathInDb, userId);
                             
-                            const messageId = BigInt(Date.now()) * 1000000n + BigInt(crypto.randomInt(1000000));
+                            // *** 关键修正: 不再使用 BigInt ***
+                            const messageId = Date.now() * 1000 + crypto.randomInt(1000);
                             await data.addFile({
                                 message_id: messageId,
                                 fileName: item.basename,
