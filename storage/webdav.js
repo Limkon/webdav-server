@@ -87,6 +87,21 @@ async function upload(tempFilePath, fileName, mimetype, userId, folderId) {
     return { success: true, message: '档案已上传至 WebDAV。', fileId: dbResult.fileId };
 }
 
+// *** 关键修正：新增 move 函数来处理物理移动 ***
+async function move(sourcePath, destinationPath, overwrite = false) {
+    const client = getClient();
+    try {
+        await client.moveFile(sourcePath, destinationPath, { overwrite });
+        return true;
+    } catch (error) {
+        // 如果错误是 412，表示目标已存在且不允许覆盖，这是预期的失败情况
+        if (error.response && error.response.status === 412) {
+            throw new Error('Precondition Failed: Destination exists and overwrite is false.');
+        }
+        // 其他错误则重新抛出
+        throw error;
+    }
+}
 
 async function remove(files, folders, userId) {
     const client = getClient();
@@ -170,4 +185,4 @@ async function createDirectory(fullPath) {
 }
 // --- *** 新增函数结束 *** ---
 
-module.exports = { upload, remove, getUrl, stream, resetClient, getClient, createDirectory, type: 'webdav' };
+module.exports = { upload, remove, getUrl, stream, resetClient, getClient, createDirectory, move, type: 'webdav' };
