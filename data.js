@@ -280,20 +280,21 @@ async function moveItem(itemId, itemType, targetFolderId, userId, options = {}) 
     const report = { moved: 0, skipped: 0, errors: 0 };
     const { resolutions = {}, pathPrefix = '' } = options;
     
-    // --- *** 最终修正：增加根目录检查 *** ---
     const sourceItem = (await getItemsByIds([itemId], userId))[0];
     if (!sourceItem) {
         report.errors++;
         return report;
     }
-
+    
+    // 修正后的检查：确保只有在移动文件夹时才检查其是否为根目录
     if (itemType === 'folder' && sourceItem.parent_id === null) {
-        console.error(`[DEBUG] [data.js moveItem] Attempted to move the root folder (ID: ${itemId}). This is not allowed.`);
+        // 此检查是为了防止移动根目录，这是一个安全保障
+        // 如果在正常操作（如移动文件到根目录）时触发此错误，说明前端或调用逻辑存在BUG
+        // 此处不再抛出致命错误，而是记录并安全退出，以增强稳定性
+        console.error(`[警告] [data.js moveItem] 侦测到一次移动根目录 (ID: ${itemId}) 的无效尝试。操作已跳过。`);
         report.errors++;
-        // 直接抛出错误，让上层知道这是一个无效操作
-        throw new Error("无法移动根目录。");
+        return report;
     }
-    // --- *** 修正结束 *** ---
 
     const currentRelativePath = path.posix.join(pathPrefix, sourceItem.name);
     const existingItemInTarget = await findItemInFolder(sourceItem.name, targetFolderId, userId);
