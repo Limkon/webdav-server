@@ -102,20 +102,36 @@ function searchItems(query, userId) {
     });
 }
 
-function getItemsByIds(itemIds, userId) {
+function getItemsByIds(itemIds, userId, itemType = null) {
     return new Promise((resolve, reject) => {
         if (!itemIds || itemIds.length === 0) return resolve([]);
         const placeholders = itemIds.map(() => '?').join(',');
-        const sql = `
-            SELECT id, name, parent_id, 'folder' as type, null as storage_type, null as file_id
-            FROM folders 
-            WHERE id IN (${placeholders}) AND user_id = ?
-            UNION ALL
-            SELECT message_id as id, fileName as name, folder_id as parent_id, 'file' as type, storage_type, file_id
-            FROM files 
-            WHERE message_id IN (${placeholders}) AND user_id = ?
-        `;
-        db.all(sql, [...itemIds, userId, ...itemIds, userId], (err, rows) => {
+        
+        let sql;
+        let params = [...itemIds, userId];
+
+        if (itemType === 'folder') {
+            sql = `SELECT id, name, parent_id, 'folder' as type, null as storage_type, null as file_id
+                   FROM folders 
+                   WHERE id IN (${placeholders}) AND user_id = ?`;
+        } else if (itemType === 'file') {
+            sql = `SELECT message_id as id, fileName as name, folder_id as parent_id, 'file' as type, storage_type, file_id
+                   FROM files 
+                   WHERE message_id IN (${placeholders}) AND user_id = ?`;
+        } else {
+            sql = `
+                SELECT id, name, parent_id, 'folder' as type, null as storage_type, null as file_id
+                FROM folders 
+                WHERE id IN (${placeholders}) AND user_id = ?
+                UNION ALL
+                SELECT message_id as id, fileName as name, folder_id as parent_id, 'file' as type, storage_type, file_id
+                FROM files 
+                WHERE message_id IN (${placeholders}) AND user_id = ?
+            `;
+            params.push(...itemIds, userId);
+        }
+
+        db.all(sql, params, (err, rows) => {
             if (err) return reject(err);
             resolve(rows);
         });
@@ -280,17 +296,13 @@ async function moveItem(itemId, itemType, targetFolderId, userId, options = {}) 
     const report = { moved: 0, skipped: 0, errors: 0 };
     const { resolutions = {}, pathPrefix = '' } = options;
     
-    const sourceItem = (await getItemsByIds([itemId], userId))[0];
+    const sourceItem = (await getItemsByIds([itemId], userId, itemType))[0];
     if (!sourceItem) {
         report.errors++;
         return report;
     }
     
-    // 修正后的检查：确保只有在移动文件夹时才检查其是否为根目录
     if (itemType === 'folder' && sourceItem.parent_id === null) {
-        // 此检查是为了防止移动根目录，这是一个安全保障
-        // 如果在正常操作（如移动文件到根目录）时触发此错误，说明前端或调用逻辑存在BUG
-        // 此处不再抛出致命错误，而是记录并安全退出，以增强稳定性
         console.error(`[警告] [data.js moveItem] 侦测到一次移动根目录 (ID: ${itemId}) 的无效尝试。操作已跳过。`);
         report.errors++;
         return report;
