@@ -273,8 +273,8 @@ app.post('/api/admin/webdav', requireAdmin, async (req, res) => {
         return res.status(400).json({ success: false, message: 'URL, 用户名和挂载名称为必填项' });
     }
     
-    if (/[^a-zA-Z0-9_-\u4e00-\u9fa5]/.test(mount_name)) {
-        return res.status(400).json({ success: false, message: '挂载名称只能包含中文、字母、数字、下划线和连字符。' });
+    if (/[\\/]/.test(mount_name)) {
+        return res.status(400).json({ success: false, message: '挂载名称不能包含斜线符号。' });
     }
 
     const config = storageManager.readConfig();
