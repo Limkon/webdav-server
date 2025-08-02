@@ -233,40 +233,115 @@ app.post('/api/admin/delete-user', requireAdmin, async (req, res) => {
     }
 });
 
+// --- 主要修改开始 (WebDAV 管理 API) ---
 app.get('/api/admin/webdav', requireAdmin, (req, res) => {
     const config = storageManager.readConfig();
-    const webdavConfig = config.webdav || {};
-    res.json(webdavConfig.url ? [{ id: 1, ...webdavConfig }] : []);
+    res.json(config.webdav || []);
 });
 
-app.post('/api/admin/webdav', requireAdmin, (req, res) => {
-    const { url, username, password } = req.body;
-    if (!url || !username) { 
-        return res.status(400).json({ success: false, message: '缺少必要参数' });
+app.post('/api/admin/webdav', requireAdmin, async (req, res) => {
+    const { id, url, username, password, mount_name } = req.body;
+    if (!url || !username || !mount_name) { 
+        return res.status(400).json({ success: false, message: 'URL, 使用者名称和挂载名称为必填项' });
     }
-    const config = storageManager.readConfig();
-    
-    config.webdav = { url, username };
-    if (password) {
-        config.webdav.password = password;
+    if (/[^a-zA-Z0-9_-]/.test(mount_name)) {
+        return res.status(400).json({ success: false, message: '挂载名称只能包含字母、数字、底线和连字号。' });
     }
 
+    const config = storageManager.readConfig();
+    const isEditing = !!id;
+
+    const nameConflict = config.webdav.find(c => c.mount_name === mount_name && c.id !== id);
+    if (nameConflict) {
+        return res.status(409).json({ success: false, message: `挂载名称 "${mount_name}" 已被使用。` });
+    }
+
+    let oldMountName = null;
+
+    if (isEditing) {
+        const index = config.webdav.findIndex(c => c.id === id);
+        if (index > -1) {
+            oldMountName = config.webdav[index].mount_name;
+            config.webdav[index] = { ...config.webdav[index], url, username, mount_name };
+            if (password) {
+                config.webdav[index].password = password;
+            }
+        } else {
+             return res.status(404).json({ success: false, message: '找不到要更新的设定' });
+        }
+    } else {
+        const newConfig = {
+            id: crypto.randomBytes(4).toString('hex'),
+            mount_name,
+            url,
+            username,
+            password
+        };
+        config.webdav.push(newConfig);
+    }
+    
     if (storageManager.writeConfig(config)) {
-        res.json({ success: true, message: 'WebDAV 设定已储存' });
+        try {
+            const users = await data.listAllUsers();
+            for (const user of users) {
+                const rootFolder = await data.getRootFolder(user.id);
+                if (rootFolder) {
+                    if (isEditing && oldMountName && oldMountName !== mount_name) {
+                        // 如果挂载点名称改变，更新数据库中对应的文件夹名称
+                        const mountFolder = await data.findFolderByName(oldMountName, rootFolder.id, user.id);
+                        if(mountFolder) {
+                            await data.renameFolder(mountFolder.id, mount_name, user.id);
+                        }
+                    } else if (!isEditing) {
+                         // 如果是新增，为每个使用者建立对应的挂载点文件夹
+                        await data.createFolder(mount_name, rootFolder.id, user.id);
+                    }
+                }
+            }
+             res.json({ success: true, message: 'WebDAV 设定已储存' });
+        } catch(dbError) {
+             res.status(500).json({ success: false, message: `设定已储存，但更新使用者资料夹时出错: ${dbError.message}` });
+        }
     } else {
         res.status(500).json({ success: false, message: '写入设定失败' });
     }
 });
 
-app.delete('/api/admin/webdav/:id', requireAdmin, (req, res) => {
+app.delete('/api/admin/webdav/:id', requireAdmin, async (req, res) => {
+    const { id } = req.params;
     const config = storageManager.readConfig();
-    config.webdav = {}; 
+    const configIndex = config.webdav.findIndex(c => c.id === id);
+
+    if (configIndex === -1) {
+        return res.status(404).json({ success: false, message: '找不到要删除的设定' });
+    }
+    
+    const mountNameToDelete = config.webdav[configIndex].mount_name;
+    config.webdav.splice(configIndex, 1);
+
     if (storageManager.writeConfig(config)) {
-        res.json({ success: true, message: 'WebDAV 设定已删除' });
+         try {
+            const users = await data.listAllUsers();
+            for (const user of users) {
+                const rootFolder = await data.getRootFolder(user.id);
+                if (rootFolder) {
+                    const mountFolder = await data.findFolderByName(mountNameToDelete, rootFolder.id, user.id);
+                    if (mountFolder) {
+                        // 统一删除，这将处理数据库记录和实体档案
+                        await data.unifiedDelete(mountFolder.id, 'folder', user.id);
+                    }
+                }
+            }
+            res.json({ success: true, message: 'WebDAV 设定及相关档案已删除' });
+         } catch(dbError) {
+            res.status(500).json({ success: false, message: `设定已删除，但清理使用者资料夹时出错: ${dbError.message}` });
+         }
     } else {
         res.status(500).json({ success: false, message: '删除设定失败' });
     }
 });
+// --- 主要修改结束 ---
+
 
 const uploadMiddleware = (req, res, next) => {
     upload.array('files')(req, res, (err) => {
@@ -518,11 +593,19 @@ app.get('/api/folder/:id', requireLogin, async (req, res) => {
 app.post('/api/folder', requireLogin, async (req, res) => {
     const { name, parentId } = req.body;
     const userId = req.session.userId;
+
     if (!name || !parentId) {
         return res.status(400).json({ success: false, message: '缺少资料夹名称或父 ID。' });
     }
     
     try {
+        // --- 关键修改：禁止在根目录建立资料夹 ---
+        const parentFolder = await data.getFolderPath(parentId, userId);
+        if (parentFolder.length <= 1 && !req.session.isAdmin) {
+            return res.status(403).json({ success: false, message: '不能在根目录下建立资料夹。' });
+        }
+        // --- 修改结束 ---
+
         const conflict = await data.checkFullConflict(name, parentId, userId);
         if (conflict) {
             return res.status(409).json({ success: false, message: '同目录下已存在同名档案或资料夹。' });
@@ -532,9 +615,8 @@ app.post('/api/folder', requireLogin, async (req, res) => {
         
         const storage = storageManager.getStorage();
         if (storage.type === 'webdav' && storage.createDirectory) {
-            const newFolderPathParts = await data.getFolderPath(result.id, userId);
-            const newFullPath = path.posix.join(...newFolderPathParts.slice(1).map(p => p.name));
-            await storage.createDirectory(newFullPath);
+            const newFolderPath = await data.getFolderPath(result.id, userId);
+            await storage.createDirectory(newFolderPath, userId);
         }
 
         res.json(result);
