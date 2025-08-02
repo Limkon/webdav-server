@@ -930,15 +930,17 @@ function addFile(fileData, folderId, userId, storageType, webdavMountId) {
 function addOrUpdateWebdavConfig(config) {
     return new Promise((resolve, reject) => {
         if (config.id) { // 更新
-            const params = [config.mount_name, config.url, config.username, config.id, config.userId];
+            const params = [config.mount_name, config.url, config.username];
             let sql = `UPDATE webdav_configs SET mount_name = ?, url = ?, username = ?`;
-            if (config.password) {
+
+            // *** 关键修正：只有在提供新密码时才更新密码栏位 ***
+            if (config.password && config.password.length > 0) {
                 sql += `, password = ?`;
-                params.splice(3, 0, config.password);
-            } else {
-                 sql += `, password = NULL`;
+                params.push(config.password);
             }
+
             sql += ` WHERE id = ? AND user_id = ?`;
+            params.push(config.id, config.userId);
             
             db.run(sql, params, function(err) {
                 if (err) return reject(err);
