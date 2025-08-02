@@ -16,6 +16,12 @@ const storageManager = require('./storage');
 
 const app = express();
 
+// --- 輔助函數：日誌記錄 ---
+function log(level, message, ...args) {
+    const timestamp = new Date().toISOString();
+    console.log(`[${timestamp}] [${level.toUpperCase()}] ${message}`, ...args);
+}
+
 // --- Temp File Directory and Cleanup ---
 const TMP_DIR = path.join(__dirname, 'data', 'tmp');
 
@@ -30,11 +36,11 @@ async function cleanupTempDir() {
             try {
                 await fsp.unlink(path.join(TMP_DIR, file));
             } catch (err) {
-                // 在生产环境中，这类非致命警告可以被移除或记录到专门的日志文件
+                log('warn', `無法刪除暫存檔案: ${file}`, err.message);
             }
         }
     } catch (error) {
-        console.error(`[严重错误] 清理暂存目录失败: ${TMP_DIR}。`, error);
+        log('error', `[嚴重錯誤] 清理暫存目錄失敗: ${TMP_DIR}。`, error);
     }
 }
 cleanupTempDir();
@@ -70,6 +76,7 @@ const fixFileNameEncoding = (req, res, next) => {
 
 function requireLogin(req, res, next) {
   if (req.session.loggedIn) return next();
+  log('info', '未登入，重定向到 /login');
   res.redirect('/login');
 }
 
@@ -77,23 +84,26 @@ function requireAdmin(req, res, next) {
     if (req.session.loggedIn && req.session.isAdmin) {
         return next();
     }
+    log('warn', `權限不足，拒絕訪問。使用者 ID: ${req.session.userId}`);
     res.status(403).send('权限不足');
 }
 
-// 辅助函数：为新用户创建挂载点
+// 輔助函數：為新用戶创建掛載點
 async function createMountPointsForUser(userId) {
+    log('info', `為使用者 ${userId} 檢查並創建掛載點...`);
     const rootFolder = await data.getRootFolder(userId);
     if (!rootFolder) {
-        console.error(`无法为用户 ${userId} 找到根目录。`);
+        log('error', `無法為使用者 ${userId} 找到根目錄。`);
         return;
     }
     const config = storageManager.readConfig();
     if (config.webdav && Array.isArray(config.webdav)) {
         for (const mount of config.webdav) {
             if (mount.mount_name) {
-                // 检查文件夹是否已存在
+                // 檢查文件夹是否已存在
                 const existing = await data.findFolderByName(mount.mount_name, rootFolder.id, userId);
                 if (!existing) {
+                    log('info', `為使用者 ${userId} 創建掛載點資料夾: ${mount.mount_name}`);
                     await data.createFolder(mount.mount_name, rootFolder.id, userId);
                 }
             }
@@ -107,26 +117,31 @@ app.get('/register', (req, res) => res.sendFile(path.join(__dirname, 'views/regi
 app.get('/editor', requireLogin, (req, res) => res.sendFile(path.join(__dirname, 'views/editor.html')));
 
 app.post('/login', async (req, res) => {
+    log('info', `使用者 ${req.body.username} 正在嘗試登入...`);
     try {
         const user = await data.findUserByName(req.body.username);
         if (user && await bcrypt.compare(req.body.password, user.password)) {
             req.session.loggedIn = true;
             req.session.userId = user.id;
             req.session.isAdmin = !!user.is_admin;
-            // 登录时也检查一下挂载点
+            log('info', `使用者 ${user.username} (ID: ${user.id}) 登入成功。是否為管理員: ${req.session.isAdmin}`);
             await createMountPointsForUser(user.id);
             res.redirect('/');
         } else {
+            log('warn', `使用者 ${req.body.username} 登入失敗：帳號或密碼錯誤。`);
             res.status(401).send('帐号或密码错误');
         }
     } catch(error) {
+        log('error', '登入時發生錯誤:', error);
         res.status(500).send('登录时发生错误');
     }
 });
 
 app.post('/register', async (req, res) => {
     const { username, password } = req.body;
+    log('info', `新的註冊請求: ${username}`);
     if (!username || !password) {
+        log('warn', `註冊失敗: 缺少用戶名或密碼。`);
         return res.status(400).send('请提供用户名和密码');
     }
     try {
@@ -136,16 +151,19 @@ app.post('/register', async (req, res) => {
         
         await data.createFolder('/', null, newUser.id); // 创建根目录
         await createMountPointsForUser(newUser.id); // 创建挂载点
-        
+        log('info', `使用者 ${username} (ID: ${newUser.id}) 註冊成功。`);
         res.redirect('/login');
     } catch (error) {
+        log('error', `註冊失敗 for ${username}:`, error);
         res.status(500).send('注册失败，用户名可能已被使用。');
     }
 });
 
 app.get('/logout', (req, res) => {
+    log('info', `使用者 ${req.session.userId} 正在登出。`);
     req.session.destroy(err => {
         if (err) {
+            log('error', '登出時 session 銷毀失敗:', err);
             return res.redirect('/');
         }
         res.clearCookie('connect.sid');
@@ -156,10 +174,10 @@ app.get('/logout', (req, res) => {
 app.get('/', requireLogin, async (req, res) => {
     let rootFolder = await data.getRootFolder(req.session.userId);
     if (!rootFolder) {
+        log('info', `為使用者 ${req.session.userId} 創建根目錄...`);
         await data.createFolder('/', null, req.session.userId);
         rootFolder = await data.getRootFolder(req.session.userId);
     }
-    // 确保挂载点存在
     await createMountPointsForUser(req.session.userId);
     res.redirect(`/folder/${rootFolder.id}`);
 });
@@ -172,18 +190,22 @@ app.get('/scan', requireAdmin, (req, res) => res.sendFile(path.join(__dirname, '
 // --- API Endpoints ---
 app.post('/api/user/change-password', requireLogin, async (req, res) => {
     const { oldPassword, newPassword } = req.body;
+    log('info', `使用者 ${req.session.userId} 正在嘗試修改密碼。`);
     
     if (!oldPassword || !newPassword || newPassword.length < 4) {
+        log('warn', `密碼修改失敗: 提供的資料無效。`);
         return res.status(400).json({ success: false, message: '请提供旧密码和新密码，且新密码长度至少 4 个字符。' });
     }
     try {
         const user = await data.findUserById(req.session.userId);
         if (!user) {
+            log('error', `密碼修改失敗: 找不到使用者 ${req.session.userId}。`);
             return res.status(404).json({ success: false, message: '找不到用户。' });
         }
 
         const isMatch = await bcrypt.compare(oldPassword, user.password);
         if (!isMatch) {
+            log('warn', `使用者 ${req.session.userId} 密碼修改失敗: 舊密碼不正確。`);
             return res.status(401).json({ success: false, message: '旧密码不正确。' });
         }
         
@@ -191,8 +213,10 @@ app.post('/api/user/change-password', requireLogin, async (req, res) => {
         const hashedPassword = await bcrypt.hash(newPassword, salt);
         await data.changeUserPassword(req.session.userId, hashedPassword);
         
+        log('info', `使用者 ${req.session.userId} 密碼修改成功。`);
         res.json({ success: true, message: '密码修改成功。' });
     } catch (error) {
+        log('error', `使用者 ${req.session.userId} 修改密碼時發生錯誤:`, error);
         res.status(500).json({ success: false, message: '修改密码失败。' });
     }
 });
@@ -202,6 +226,7 @@ app.get('/api/admin/users', requireAdmin, async (req, res) => {
         const users = await data.listNormalUsers();
         res.json(users);
     } catch (error) {
+        log('error', '獲取使用者列表失敗:', error);
         res.status(500).json({ success: false, message: '获取用户列表失败。' });
     }
 });
@@ -211,12 +236,14 @@ app.get('/api/admin/all-users', requireAdmin, async (req, res) => {
         const users = await data.listAllUsers();
         res.json(users);
     } catch (error) {
+        log('error', '獲取所有使用者列表失敗:', error);
         res.status(500).json({ success: false, message: '获取所有用户列表失败。' });
     }
 });
 
 app.post('/api/admin/add-user', requireAdmin, async (req, res) => {
     const { username, password } = req.body;
+    log('info', `管理員 ${req.session.userId} 正在新增使用者: ${username}`);
     if (!username || !password || password.length < 4) {
         return res.status(400).json({ success: false, message: '用户名和密码为必填项，且密码长度至少 4 个字符。' });
     }
@@ -228,14 +255,17 @@ app.post('/api/admin/add-user', requireAdmin, async (req, res) => {
         await data.createFolder('/', null, newUser.id);
         await createMountPointsForUser(newUser.id);
         
+        log('info', `使用者 ${username} (ID: ${newUser.id}) 新增成功。`);
         res.json({ success: true, user: newUser });
     } catch (error) {
+        log('error', `新增使用者 ${username} 失敗:`, error);
         res.status(500).json({ success: false, message: '创建用户失败，可能用户名已被使用。' });
     }
 });
 
 app.post('/api/admin/change-password', requireAdmin, async (req, res) => {
     const { userId, newPassword } = req.body;
+    log('info', `管理員 ${req.session.userId} 正在修改使用者 ${userId} 的密碼。`);
     if (!userId || !newPassword || newPassword.length < 4) {
         return res.status(400).json({ success: false, message: '用户 ID 和新密码为必填项，且密码长度至少 4 个字符。' });
     }
@@ -243,21 +273,26 @@ app.post('/api/admin/change-password', requireAdmin, async (req, res) => {
         const salt = await bcrypt.genSalt(10);
         const hashedPassword = await bcrypt.hash(newPassword, salt);
         await data.changeUserPassword(userId, hashedPassword);
+        log('info', `使用者 ${userId} 的密碼修改成功。`);
         res.json({ success: true, message: '密码修改成功。' });
     } catch (error) {
+        log('error', `修改使用者 ${userId} 的密碼失敗:`, error);
         res.status(500).json({ success: false, message: '修改密码失败。' });
     }
 });
 
 app.post('/api/admin/delete-user', requireAdmin, async (req, res) => {
     const { userId } = req.body;
+    log('info', `管理員 ${req.session.userId} 正在刪除使用者 ${userId}。`);
     if (!userId) {
         return res.status(400).json({ success: false, message: '缺少用户 ID。' });
     }
     try {
         await data.deleteUser(userId);
+        log('info', `使用者 ${userId} 已被刪除。`);
         res.json({ success: true, message: '用户已删除。' });
     } catch (error) {
+        log('error', `刪除使用者 ${userId} 失敗:`, error);
         res.status(500).json({ success: false, message: '删除用户失败。' });
     }
 });
@@ -269,11 +304,13 @@ app.get('/api/admin/webdav', requireAdmin, (req, res) => {
 
 app.post('/api/admin/webdav', requireAdmin, async (req, res) => {
     const { id, url, username, password, mount_name } = req.body;
+    log('info', `WebDAV 設定儲存請求: id=${id}, mount_name=${mount_name}`);
     if (!url || !username || !mount_name) { 
         return res.status(400).json({ success: false, message: 'URL, 用户名和挂载名称为必填项' });
     }
     
     if (/[\\/]/.test(mount_name)) {
+        log('warn', `WebDAV 掛載點名稱 ${mount_name} 包含無效字符。`);
         return res.status(400).json({ success: false, message: '挂载名称不能包含斜线符号。' });
     }
 
@@ -282,6 +319,7 @@ app.post('/api/admin/webdav', requireAdmin, async (req, res) => {
 
     const nameConflict = config.webdav.find(c => c.mount_name === mount_name && c.id !== id);
     if (nameConflict) {
+        log('warn', `WebDAV 掛載點名稱衝突: ${mount_name}`);
         return res.status(409).json({ success: false, message: `挂载名称 "${mount_name}" 已被使用。` });
     }
 
@@ -295,6 +333,7 @@ app.post('/api/admin/webdav', requireAdmin, async (req, res) => {
             if (password) {
                 config.webdav[index].password = password;
             }
+            log('info', `正在編輯 WebDAV 掛載點: ${oldMountName} -> ${mount_name}`);
         } else {
              return res.status(404).json({ success: false, message: '找不到要更新的设置' });
         }
@@ -307,6 +346,7 @@ app.post('/api/admin/webdav', requireAdmin, async (req, res) => {
             password
         };
         config.webdav.push(newConfig);
+        log('info', `正在新增 WebDAV 掛載點: ${mount_name}`);
     }
     
     if (storageManager.writeConfig(config)) {
@@ -329,6 +369,7 @@ app.post('/api/admin/webdav', requireAdmin, async (req, res) => {
             }
              res.json({ success: true, message: 'WebDAV 设置已保存' });
         } catch(dbError) {
+             log('error', '更新使用者資料夾時出錯:', dbError);
              res.status(500).json({ success: false, message: `设置已保存，但更新用户文件夹时出错: ${dbError.message}` });
         }
     } else {
@@ -337,7 +378,8 @@ app.post('/api/admin/webdav', requireAdmin, async (req, res) => {
 });
 
 app.delete('/api/admin/webdav/:id', requireAdmin, async (req, res) => {
-    const { id } = req.params; 
+    const { id } = req.params;
+    log('info', `請求刪除 WebDAV 掛載點 ID: ${id}`);
     const config = storageManager.readConfig();
     const configIndex = config.webdav.findIndex(c => c.id === id);
 
@@ -360,8 +402,10 @@ app.delete('/api/admin/webdav/:id', requireAdmin, async (req, res) => {
                     }
                 }
             }
+            log('info', `WebDAV 掛載點 ${mountNameToDelete} 已成功刪除。`);
             res.json({ success: true, message: 'WebDAV 设置及相关文件已删除' });
          } catch(dbError) {
+            log('error', `刪除 WebDAV 掛載點 ${mountNameToDelete} 的資料時出錯:`, dbError);
             res.status(500).json({ success: false, message: `设置已删除，但清理用户文件夹时出错: ${dbError.message}` });
          }
     } else {
@@ -373,6 +417,7 @@ app.delete('/api/admin/webdav/:id', requireAdmin, async (req, res) => {
 const uploadMiddleware = (req, res, next) => {
     upload.array('files')(req, res, (err) => {
         if (err) {
+            log('error', '上傳中介軟體錯誤:', err);
             if (err.code === 'LIMIT_FILE_SIZE') {
                 return res.status(400).json({ success: false, message: '文件大小超出限制。' });
             }
@@ -389,6 +434,7 @@ app.post('/upload', requireLogin, async (req, res, next) => {
     await cleanupTempDir();
     next();
 }, uploadMiddleware, fixFileNameEncoding, async (req, res) => {
+    log('info', `收到 ${req.files.length} 個檔案的上傳請求。`);
     if (!req.files || req.files.length === 0) {
         return res.status(400).json({ success: false, message: '没有选择文件' });
     }
@@ -461,6 +507,7 @@ app.post('/upload', requireLogin, async (req, res, next) => {
             res.json({ success: true, results });
         }
     } catch (error) {
+        log('error', '處理上傳時發生錯誤:', error);
         for (const file of req.files) {
             if (fs.existsSync(file.path)) {
                 await fsp.unlink(file.path).catch(err => {});
@@ -475,6 +522,7 @@ app.post('/api/text-file', requireLogin, async (req, res) => {
     const { mode, fileId, folderId, fileName, content } = req.body;
     const userId = req.session.userId;
     const storage = storageManager.getStorage();
+    log('info', `文字檔案操作: mode=${mode}, fileId=${fileId}, fileName=${fileName}`);
 
     if (!fileName || !fileName.endsWith('.txt')) {
         return res.status(400).json({ success: false, message: '文件名无效或不是 .txt 文件' });
@@ -521,6 +569,7 @@ app.post('/api/text-file', requireLogin, async (req, res) => {
 
         res.json({ success: true, fileId: dbResult.fileId });
     } catch (error) {
+        log('error', `儲存文字檔案失敗:`, error);
         res.status(500).json({ success: false, message: '服务器内部错误' });
     } finally {
         if (fs.existsSync(tempFilePath)) {
@@ -626,6 +675,7 @@ app.get('/api/folder/:id', requireLogin, async (req, res) => {
 app.post('/api/folder', requireLogin, async (req, res) => {
     const { name, parentId } = req.body;
     const userId = req.session.userId;
+    log('info', `使用者 ${userId} 正在資料夾 ${parentId} 中創建 ${name}`);
 
     if (!name || !parentId) {
         return res.status(400).json({ success: false, message: '缺少文件夹名称或父 ID。' });
@@ -653,6 +703,7 @@ app.post('/api/folder', requireLogin, async (req, res) => {
 
         res.json(result);
     } catch (error) {
+        log('error', `創建資料夾失敗:`, error);
          res.status(500).json({ success: false, message: error.message || '处理文件夹时发生错误。' });
     }
 });
@@ -667,6 +718,8 @@ app.post('/api/move', requireLogin, async (req, res) => {
     try {
         const { itemIds, targetFolderId, resolutions = {} } = req.body;
         const userId = req.session.userId;
+        log('info', `移動請求: items=${itemIds.join(',')} 到 folder=${targetFolderId} by user=${userId}`);
+        log('debug', 'Resolutions:', resolutions);
 
         if (!itemIds || !Array.isArray(itemIds) || itemIds.length === 0 || !targetFolderId) {
             return res.status(400).json({ success: false, message: '无效的请求参数。' });
@@ -693,6 +746,7 @@ app.post('/api/move', requireLogin, async (req, res) => {
                 }
 
             } catch (err) {
+                log('error', `移動項目 ${itemId} 時出錯:`, err);
                 errors.push(err.message);
             }
         }
@@ -707,10 +761,11 @@ app.post('/api/move', requireLogin, async (req, res) => {
         } else if (totalMoved > 0) {
             message = `${totalMoved} 个项目移动成功。`;
         }
-
+        log('info', `移動操作完成: ${message}`);
         res.json({ success: errors.length === 0, message: message });
 
     } catch (error) { 
+        log('error', '移動操作失敗:', error);
         res.status(500).json({ success: false, message: '移动失败：' + error.message }); 
     }
 });
@@ -718,11 +773,13 @@ app.post('/api/move', requireLogin, async (req, res) => {
 app.post('/delete-multiple', requireLogin, async (req, res) => {
     const { messageIds = [], folderIds = [] } = req.body;
     const userId = req.session.userId;
+    log('info', `刪除請求: files=${messageIds.join(',')}, folders=${folderIds.join(',')} by user=${userId}`);
     try {
         for(const id of messageIds) { await data.unifiedDelete(id, 'file', userId); }
         for(const id of folderIds) { await data.unifiedDelete(id, 'folder', userId); }
         res.json({ success: true, message: '删除成功' });
     } catch (error) {
+        log('error', '多重刪除失敗:', error);
         res.status(500).json({ success: false, message: '删除失败: ' + error.message });
     }
 });
@@ -732,6 +789,7 @@ app.post('/rename', requireLogin, async (req, res) => {
     try {
         const { id, newName, type } = req.body;
         const userId = req.session.userId;
+        log('info', `重命名請求: type=${type}, id=${id}, newName=${newName}, user=${userId}`);
         if (!id || !newName || !type) {
             return res.status(400).json({ success: false, message: '缺少必要参数。'});
         }
@@ -745,7 +803,8 @@ app.post('/rename', requireLogin, async (req, res) => {
             return res.status(400).json({ success: false, message: '无效的项目类型。'});
         }
         res.json(result);
-    } catch (error) { 
+    } catch (error) {
+        log('error', `重命名失敗:`, error);
         res.status(500).json({ success: false, message: '重命名失败: ' + error.message }); 
     }
 });
@@ -978,6 +1037,7 @@ app.get('/share/view/folder/:token', async (req, res) => {
 
 function handleStream(stream, res) {
     stream.on('error', (err) => {
+        log('error', `读取文件流时发生错误:`, err);
         if (!res.headersSent) {
             res.status(500).send('读取文件流时发生错误');
         }
