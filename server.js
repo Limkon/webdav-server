@@ -16,7 +16,6 @@ const storageManager = require('./storage');
 
 const app = express();
 
-// --- Temp File Directory and Cleanup ---
 const TMP_DIR = path.join(__dirname, 'data', 'tmp');
 
 async function cleanupTempDir() {
@@ -30,7 +29,7 @@ async function cleanupTempDir() {
             try {
                 await fsp.unlink(path.join(TMP_DIR, file));
             } catch (err) {
-                // 在生产环境中，这类非致命警告可以被移除或记录到专门的日志文件
+                // Production: silent fail
             }
         }
     } catch (error) {
@@ -58,7 +57,6 @@ app.use(express.static('public'));
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// --- Middleware ---
 const fixFileNameEncoding = (req, res, next) => {
     if (req.files) {
         req.files.forEach(file => {
@@ -80,7 +78,6 @@ function requireAdmin(req, res, next) {
     res.status(403).send('权限不足');
 }
 
-// --- Routes ---
 app.get('/login', (req, res) => res.sendFile(path.join(__dirname, 'views/login.html')));
 app.get('/register', (req, res) => res.sendFile(path.join(__dirname, 'views/register.html')));
 app.get('/editor', requireLogin, (req, res) => res.sendFile(path.join(__dirname, 'views/editor.html')));
@@ -143,7 +140,6 @@ app.get('/shares-page', requireLogin, (req, res) => res.sendFile(path.join(__dir
 app.get('/admin', requireAdmin, (req, res) => res.sendFile(path.join(__dirname, 'views/admin.html')));
 app.get('/scan', requireAdmin, (req, res) => res.sendFile(path.join(__dirname, 'views/scan.html')));
 
-// --- API Endpoints ---
 app.post('/api/user/change-password', requireLogin, async (req, res) => {
     const { oldPassword, newPassword } = req.body;
     
@@ -368,7 +364,6 @@ app.post('/upload', requireLogin, async (req, res, next) => {
         res.status(500).json({ success: false, message: '处理上传时发生错误: ' + error.message });
     }
 });
-
 app.post('/api/text-file', requireLogin, async (req, res) => {
     const { mode, fileId, folderId, fileName, content } = req.body;
     const userId = req.session.userId;
@@ -550,7 +545,6 @@ app.get('/api/folders', requireLogin, async (req, res) => {
 });
 
 app.post('/api/move', requireLogin, async (req, res) => {
-    console.log(`[DEBUG] [server.js /api/move] Received request. Body:`, req.body);
     try {
         const { itemIds, targetFolderId, resolutions = {} } = req.body;
         const userId = req.session.userId;
@@ -561,36 +555,35 @@ app.post('/api/move', requireLogin, async (req, res) => {
         
         let totalMoved = 0;
         let totalSkipped = 0;
-        const errors = [];
+        let totalErrors = 0;
+        const errorMessages = [];
         
         for (const itemId of itemIds) {
-            console.log(`[DEBUG] [server.js /api/move] Processing item ID: ${itemId}`);
             try {
                 const items = await data.getItemsByIds([itemId], userId);
                 if (items.length === 0) {
-                    console.log(`[DEBUG] [server.js /api/move] Item ID ${itemId} not found. Skipping.`);
                     totalSkipped++;
                     continue; 
                 }
                 
                 const item = items[0];
                 const report = await data.moveItem(item.id, item.type, targetFolderId, userId, { resolutions });
-                console.log(`[DEBUG] [server.js /api/move] Report for item ${itemId}:`, report);
                 totalMoved += report.moved;
                 totalSkipped += report.skipped;
                 if (report.errors > 0) {
-                    errors.push(`项目 "${item.name}" 处理失败。`);
+                    totalErrors += report.errors;
+                    errorMessages.push(`项目 "${item.name}" 处理失败。`);
                 }
 
             } catch (err) {
-                console.error(`[DEBUG] [server.js /api/move] CATCH block for item ID ${itemId}:`, err);
-                errors.push(err.message);
+                totalErrors++;
+                errorMessages.push(err.message);
             }
         }
         
         let message = "操作完成。";
-        if (errors.length > 0) {
-            message = `操作完成，但出现错误: ${errors.join(', ')}`;
+        if (totalErrors > 0) {
+            message = `操作完成，但出现错误: ${errorMessages.join(', ')}`;
         } else if (totalMoved > 0 && totalSkipped > 0) {
             message = `操作完成，${totalMoved} 个项目已移动，${totalSkipped} 个项目被跳过。`;
         } else if (totalMoved === 0 && totalSkipped > 0) {
@@ -598,11 +591,10 @@ app.post('/api/move', requireLogin, async (req, res) => {
         } else if (totalMoved > 0) {
             message = `${totalMoved} 个项目移动成功。`;
         }
-        console.log(`[DEBUG] [server.js /api/move] Final response message: "${message}"`);
-        res.json({ success: errors.length === 0, message: message });
+
+        res.json({ success: totalErrors === 0, message: message });
 
     } catch (error) { 
-        console.error(`[DEBUG] [server.js /api/move] TOP LEVEL CATCH block:`, error);
         res.status(500).json({ success: false, message: '移动失败：' + error.message }); 
     }
 });
@@ -621,7 +613,6 @@ app.post('/delete-multiple', requireLogin, async (req, res) => {
 
 
 app.post('/rename', requireLogin, async (req, res) => {
-    console.log(`[DEBUG] [server.js /rename] Received request. Body:`, req.body);
     try {
         const { id, newName, type } = req.body;
         const userId = req.session.userId;
@@ -637,15 +628,11 @@ app.post('/rename', requireLogin, async (req, res) => {
         } else {
             return res.status(400).json({ success: false, message: '无效的项目类型。'});
         }
-        console.log(`[DEBUG] [server.js /rename] Operation successful. Result:`, result);
         res.json(result);
     } catch (error) { 
-        console.error(`[DEBUG] [server.js /rename] CATCH block:`, error);
         res.status(500).json({ success: false, message: '重命名失败: ' + error.message }); 
     }
 });
-
-// Removed thumbnail route as it was Telegram-specific
 
 app.get('/download/proxy/:message_id', requireLogin, async (req, res) => {
     try {
@@ -769,7 +756,6 @@ app.post('/api/cancel-share', requireLogin, async (req, res) => {
     } catch (error) { res.status(500).json({ success: false, message: '取消分享失败' }); }
 });
 
-// --- Scanner Endpoints ---
 app.post('/api/scan/webdav', requireAdmin, async (req, res) => {
     const { userId } = req.body;
     const log = [];
@@ -826,7 +812,6 @@ app.post('/api/scan/webdav', requireAdmin, async (req, res) => {
     }
 });
 
-// --- Share Routes ---
 app.get('/share/view/file/:token', async (req, res) => {
     try {
         const token = req.params.token;
@@ -895,8 +880,6 @@ app.get('/share/download/file/:token', async (req, res) => {
 
     } catch (error) { res.status(500).send('下载失败'); }
 });
-
-// Removed shared thumbnail route
 
 app.get('/share/download/:folderToken/:fileId', async (req, res) => {
     try {
