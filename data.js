@@ -8,7 +8,7 @@ const { getStorage } = require('./storage');
 
 const UPLOAD_DIR = path.resolve(__dirname, 'data', 'uploads');
 
-// --- 辅助函數：日誌記錄 ---
+// --- 輔助函數：日誌記錄 ---
 function log(level, message, ...args) {
     const timestamp = new Date().toISOString();
     console.log(`[${timestamp}] [DATA] [${level.toUpperCase()}] ${message}`, ...args);
@@ -718,31 +718,36 @@ async function renameAndMoveFile(messageId, newFileName, targetFolderId, userId)
 
 
 async function renameFolder(folderId, newFolderName, userId) {
-    const folder = await new Promise((res, rej) => db.get("SELECT * FROM folders WHERE id=?", [folderId], (e,r)=>e?rej(e):res(r)));
+    const folder = await new Promise((res, rej) => db.get("SELECT * FROM folders WHERE id=? AND user_id=?", [folderId, userId], (e,r)=>e?rej(e):res(r)));
     if (!folder) return { success: false, message: '文件夹未找到。'};
+    if (folder.parent_id === null) return { success: false, message: '不能重命名根目录。'};
     
     const storage = getStorage();
 
     if (storage.type === 'webdav') {
         const oldPathParts = await getFolderPath(folderId, userId);
-        if (oldPathParts.length > 1) { // Not root
-            const oldPathInfo = {
-                mountName: oldPathParts[1].name,
-                remotePath: '/' + oldPathParts.slice(1).map(p => p.name).join('/')
-            };
-            const newRemotePath = path.posix.join(path.posix.dirname(oldPathInfo.remotePath), newFolderName);
-
-            await storage.moveFile(oldPathInfo, { ...oldPathInfo, remotePath: newRemotePath });
-
+        const isMountPoint = oldPathParts.length === 2;
+        
+        // 只有在不是掛載點本身被重命名時，才執行物理移動
+        if (!isMountPoint) {
+            const oldPathInfo = await getWebdavPathInfo(folder.parent_id, userId);
+            const oldRemotePath = path.posix.join(oldPathInfo.remotePath, folder.name);
+            const newRemotePath = path.posix.join(oldPathInfo.remotePath, newFolderName);
+            
+            await storage.moveFile({ ...oldPathInfo, remotePath: oldRemotePath }, { ...oldPathInfo, remotePath: newRemotePath });
+            
             const descendantFiles = await getFilesRecursive(folderId, userId);
             for (const file of descendantFiles) {
-                const updatedFileId = file.file_id.replace(oldPathInfo.remotePath, newRemotePath);
+                const updatedFileId = file.file_id.replace(
+                    path.posix.join('/', oldPathInfo.mountName, oldRemotePath),
+                    path.posix.join('/', oldPathInfo.mountName, newRemotePath)
+                );
                 await new Promise((res, rej) => db.run('UPDATE files SET file_id = ? WHERE message_id = ?', [updatedFileId, file.message_id], (e) => e ? rej(e) : res()));
             }
-
         }
     }
 
+    // 更新資料庫中的資料夾名稱
     const sql = `UPDATE folders SET name = ? WHERE id = ? AND user_id = ?`;
     return new Promise((resolve, reject) => {
         db.run(sql, [newFolderName, folderId, userId], function(err) {
