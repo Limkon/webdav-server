@@ -1,6 +1,4 @@
 // storage/index.js
-const telegramStorage = require('./telegram');
-const localStorage = require('./local');
 const webdavStorage = require('./webdav');
 const fs = require('fs');
 const path = require('path');
@@ -16,17 +14,21 @@ function readConfig() {
             if (!config.webdav || Array.isArray(config.webdav)) {
                 config.webdav = {}; 
             }
+            // 强制将储存模式设为 webdav
+            config.storageMode = 'webdav';
             return config;
         }
     } catch (error) {
         console.error("读取设定档失败:", error);
     }
-    // --- *** 关键修正：将预设值从 'telegram' 改为 'local' *** ---
-    return { storageMode: 'local', webdav: {} }; 
+    // --- 预设值强制为 'webdav' ---
+    return { storageMode: 'webdav', webdav: {} }; 
 }
 
 function writeConfig(config) {
     try {
+        // 强制将储存模式设为 webdav
+        config.storageMode = 'webdav';
         fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
         // 如果是 WebDAV 设定变更，则重置客户端以使用新设定
         if (config.storageMode === 'webdav') {
@@ -43,17 +45,11 @@ let config = readConfig();
 
 function getStorage() {
     config = readConfig(); 
-    if (config.storageMode === 'local') {
-        return localStorage;
-    }
-    if (config.storageMode === 'webdav') {
-        return webdavStorage;
-    }
-    return telegramStorage;
+    return webdavStorage;
 }
 
 function setStorageMode(mode) {
-    if (['local', 'telegram', 'webdav'].includes(mode)) {
+    if (mode === 'webdav') {
         config.storageMode = mode;
         return writeConfig(config);
     }
