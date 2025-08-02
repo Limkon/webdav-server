@@ -1,7 +1,11 @@
 const db = require('./database.js');
 const crypto = require('crypto');
 const path = require('path');
-const fs = require('fs').promises;
+const fsp = require('fs').promises;
+
+// =================================================================
+// Function Definitions
+// =================================================================
 
 function createUser(username, hashedPassword) {
     return new Promise((resolve, reject) => {
@@ -61,6 +65,67 @@ function listAllUsers() {
     });
 }
 
+function findFolderById(id, userId) {
+    return new Promise((resolve, reject) => {
+        db.get("SELECT * FROM folders WHERE id = ? AND user_id = ?", [id, userId], (err, row) => {
+            if (err) return reject(err);
+            resolve(row);
+        });
+    });
+}
+
+function findFolderByName(name, parentId, userId) {
+    return new Promise((resolve, reject) => {
+        const sql = `SELECT * FROM folders WHERE name = ? AND parent_id = ? AND user_id = ?`;
+        db.get(sql, [name, parentId, userId], (err, row) => {
+            if (err) return reject(err);
+            resolve(row);
+        });
+    });
+}
+
+async function getFolderContents(folderId, userId) {
+    const folder = await findFolderById(folderId, userId);
+    // 如果是根目录, 则显示 WebDAV 挂载点作为子目录
+    if (folder && folder.parent_id === null) {
+        const mounts = await getWebdavMounts(userId);
+        const mountFolders = await Promise.all(mounts.map(async mount => {
+            let existingFolder = await findFolderByName(mount.mount_name, folderId, userId);
+            if (!existingFolder) {
+                // 如果挂载点对应的目录不存在, 则自动创建
+                const result = await createFolder(mount.mount_name, folderId, userId, mount.id);
+                existingFolder = { id: result.id };
+            }
+            // 返回一个符合前端期望的虚拟资料夹物件
+            return {
+                id: existingFolder.id,
+                name: mount.mount_name,
+                parent_id: folderId,
+                type: 'folder',
+                webdav_mount_id: mount.id,
+                is_mount_point: true // 自定义属性用于前端识别
+            };
+        }));
+        return { folders: mountFolders, files: [] };
+    }
+
+    // 否则, 正常获取资料夹内容
+    return new Promise((resolve, reject) => {
+        const sqlFolders = `SELECT *, 'folder' as type FROM folders WHERE parent_id = ? AND user_id = ? ORDER BY name ASC`;
+        const sqlFiles = `SELECT *, message_id as id, fileName as name, 'file' as type FROM files WHERE folder_id = ? AND user_id = ? ORDER BY name ASC`;
+        let contents = { folders: [], files: [] };
+        db.all(sqlFolders, [folderId, userId], (err, folders) => {
+            if (err) return reject(err);
+            contents.folders = folders;
+            db.all(sqlFiles, [folderId, userId], (err, files) => {
+                if (err) return reject(err);
+                contents.files = files.map(f => ({ ...f, message_id: f.id }));
+                resolve(contents);
+            });
+        });
+    });
+}
+
 
 async function deleteUser(userId) {
     return new Promise((resolve, reject) => {
@@ -71,7 +136,6 @@ async function deleteUser(userId) {
         });
     });
 }
-
 
 function searchItems(query, userId) {
     return new Promise((resolve, reject) => {
@@ -565,6 +629,21 @@ function executeDeletion(fileIds, folderIds, userId) {
     });
 }
 
+function getFilesByIds(messageIds, userId) {
+    if (!messageIds || messageIds.length === 0) {
+        return Promise.resolve([]);
+    }
+    const placeholders = messageIds.map(() => '?').join(',');
+    const sql = `SELECT * FROM files WHERE message_id IN (${placeholders}) AND user_id = ?`;
+    return new Promise((resolve, reject) => {
+        db.all(sql, [...messageIds, userId], (err, rows) => {
+            if (err) reject(err);
+            else resolve(rows);
+        });
+    });
+}
+
+
 function getFileByShareToken(token) {
      return new Promise((resolve, reject) => {
         const sql = "SELECT * FROM files WHERE share_token = ?";
@@ -848,8 +927,6 @@ function addFile(fileData, folderId, userId, storageType, webdavMountId) {
     });
 }
 
-//--- 新增的数据库交互函数 ---
-
 function addOrUpdateWebdavConfig(config) {
     return new Promise((resolve, reject) => {
         if (config.id) { // 更新
@@ -882,15 +959,25 @@ function deleteWebdavConfig(mountId, userId) {
         db.serialize(() => {
             db.run("BEGIN TRANSACTION");
             // 删除对应的顶层挂载目录
-            db.run("DELETE FROM folders WHERE webdav_mount_id = ? AND user_id = ?", [mountId, userId]);
-            // 删除 webdav_configs 中的设定
-            db.run("DELETE FROM webdav_configs WHERE id = ? AND user_id = ?", [mountId, userId]);
-            db.run("COMMIT", (err) => {
+            db.run("DELETE FROM folders WHERE webdav_mount_id = ? AND user_id = ?", [mountId, userId], (err) => {
                 if (err) {
                     db.run("ROLLBACK");
                     return reject(err);
                 }
-                resolve();
+                 // 删除 webdav_configs 中的设定
+                db.run("DELETE FROM webdav_configs WHERE id = ? AND user_id = ?", [mountId, userId], (err) => {
+                    if (err) {
+                        db.run("ROLLBACK");
+                        return reject(err);
+                    }
+                    db.run("COMMIT", (err) => {
+                        if (err) {
+                            db.run("ROLLBACK");
+                            return reject(err);
+                        }
+                        resolve();
+                    });
+                });
             });
         });
     });
@@ -915,14 +1002,10 @@ function setWebdavMountFullStatus(mountId, isFull) {
     });
 }
 
-function findFolderById(id, userId) {
-    return new Promise((resolve, reject) => {
-        db.get("SELECT * FROM folders WHERE id = ? AND user_id = ?", [id, userId], (err, row) => {
-            if (err) return reject(err);
-            resolve(row);
-        });
-    });
-}
+
+// =================================================================
+// Module Exports
+// =================================================================
 
 module.exports = {
     createUser,
