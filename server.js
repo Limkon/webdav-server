@@ -1,904 +1,936 @@
-require('dotenv').config();
-const express = require('express');
-const session = require('express-session');
-const multer = require('multer');
-const path = require('path');
-const axios = require('axios');
-const archiver = require('archiver');
-const bcrypt = require('bcrypt');
-const fs = require('fs');
-const fsp = require('fs').promises;
+const db = require('./database.js');
 const crypto = require('crypto');
-const db = require('./database.js'); 
+const path = require('path');
+const fs = require('fs').promises;
 
-const data = require('./data.js');
-const storageManager = require('./storage'); 
-
-const app = express();
-
-const TMP_DIR = path.join(__dirname, 'data', 'tmp');
-
-async function cleanupTempDir() {
-    try {
-        if (!fs.existsSync(TMP_DIR)) {
-            await fsp.mkdir(TMP_DIR, { recursive: true });
-            return;
-        }
-        const files = await fsp.readdir(TMP_DIR);
-        for (const file of files) {
-            try {
-                await fsp.unlink(path.join(TMP_DIR, file));
-            } catch (err) {
-                // Production: silent fail
-            }
-        }
-    } catch (error) {
-        console.error(`[严重错误] 清理暂存目录失败: ${TMP_DIR}。`, error);
-    }
-}
-cleanupTempDir();
-
-const diskStorage = multer.diskStorage({
-  destination: (req, res, cb) => cb(null, TMP_DIR)
-});
-const upload = multer({ storage: diskStorage, limits: { fileSize: 1000 * 1024 * 1024 } });
-const PORT = process.env.PORT || 8100;
-
-app.use(session({
-  secret: process.env.SESSION_SECRET || 'your-strong-random-secret-here-please-change',
-  resave: false,
-  saveUninitialized: false,
-  cookie: { maxAge: 1000 * 60 * 60 * 24 * 7 }
-}));
-
-app.set('view engine', 'ejs');
-app.set('views', path.join(__dirname, 'views'));
-app.use(express.static('public'));
-app.use(express.urlencoded({ extended: true }));
-app.use(express.json());
-
-const fixFileNameEncoding = (req, res, next) => {
-    if (req.files) {
-        req.files.forEach(file => {
-            file.originalname = Buffer.from(file.originalname, 'latin1').toString('utf8');
+function createUser(username, hashedPassword) {
+    return new Promise((resolve, reject) => {
+        const sql = `INSERT INTO users (username, password, is_admin) VALUES (?, ?, 0)`;
+        db.run(sql, [username, hashedPassword], function(err) {
+            if (err) return reject(err);
+            resolve({ id: this.lastID, username });
         });
-    }
-    next();
-};
-
-function requireLogin(req, res, next) {
-  if (req.session.loggedIn) return next();
-  res.redirect('/login');
+    });
 }
 
-function requireAdmin(req, res, next) {
-    if (req.session.loggedIn && req.session.isAdmin) {
-        return next();
-    }
-    res.status(403).send('权限不足');
+function findUserByName(username) {
+    return new Promise((resolve, reject) => {
+        db.get("SELECT * FROM users WHERE username = ?", [username], (err, row) => {
+            if (err) return reject(err);
+            resolve(row);
+        });
+    });
 }
 
-app.get('/login', (req, res) => res.sendFile(path.join(__dirname, 'views/login.html')));
-app.get('/register', (req, res) => res.sendFile(path.join(__dirname, 'views/register.html')));
-app.get('/editor', requireLogin, (req, res) => res.sendFile(path.join(__dirname, 'views/editor.html')));
-
-app.post('/login', async (req, res) => {
-    try {
-        const user = await data.findUserByName(req.body.username);
-        if (user && await bcrypt.compare(req.body.password, user.password)) {
-            req.session.loggedIn = true;
-            req.session.userId = user.id;
-            req.session.isAdmin = !!user.is_admin;
-            res.redirect('/');
-        } else {
-            res.status(401).send('帐号或密码错误');
-        }
-    } catch(error) {
-        res.status(500).send('登入时发生错误');
-    }
-});
-
-app.post('/register', async (req, res) => {
-    const { username, password } = req.body;
-    if (!username || !password) {
-        return res.status(400).send('请提供使用者名称和密码');
-    }
-    try {
-        const salt = await bcrypt.genSalt(10);
-        const hashedPassword = await bcrypt.hash(password, salt);
-        const newUser = await data.createUser(username, hashedPassword); 
-        await data.createFolder('/', null, newUser.id); 
-        res.redirect('/login');
-    } catch (error) {
-        res.status(500).send('注册失败，使用者名称可能已被使用。');
-    }
-});
-
-app.get('/logout', (req, res) => {
-    req.session.destroy(err => {
-        if (err) {
-            return res.redirect('/');
-        }
-        res.clearCookie('connect.sid');
-        res.redirect('/login');
+function findUserById(id) {
+    return new Promise((resolve, reject) => {
+        db.get("SELECT * FROM users WHERE id = ?", [id], (err, row) => {
+            if (err) return reject(err);
+            resolve(row);
+        });
     });
-});
+}
 
-app.get('/', requireLogin, (req, res) => {
-    db.get("SELECT id FROM folders WHERE user_id = ? AND parent_id IS NULL", [req.session.userId], (err, rootFolder) => {
-        if (err || !rootFolder) {
-            data.createFolder('/', null, req.session.userId)
-                .then(newRoot => res.redirect(`/folder/${newRoot.id}`))
-                .catch(() => res.status(500).send("找不到您的根目录，也无法建立。"));
-            return;
-        }
-        res.redirect(`/folder/${rootFolder.id}`);
+function changeUserPassword(userId, newHashedPassword) {
+    return new Promise((resolve, reject) => {
+        const sql = `UPDATE users SET password = ? WHERE id = ?`;
+        db.run(sql, [newHashedPassword, userId], function(err) {
+            if (err) return reject(err);
+            resolve({ success: true, changes: this.changes });
+        });
     });
-});
-app.get('/folder/:id', requireLogin, (req, res) => res.sendFile(path.join(__dirname, 'views/manager.html')));
-app.get('/shares-page', requireLogin, (req, res) => res.sendFile(path.join(__dirname, 'views/shares.html')));
-app.get('/admin', requireAdmin, (req, res) => res.sendFile(path.join(__dirname, 'views/admin.html')));
-app.get('/scan', requireAdmin, (req, res) => res.sendFile(path.join(__dirname, 'views/scan.html')));
+}
 
-app.post('/api/user/change-password', requireLogin, async (req, res) => {
-    const { oldPassword, newPassword } = req.body;
-    
-    if (!oldPassword || !newPassword || newPassword.length < 4) {
-        return res.status(400).json({ success: false, message: '请提供旧密码和新密码，且新密码长度至少 4 个字符。' });
-    }
-    try {
-        const user = await data.findUserById(req.session.userId);
-        if (!user) {
-            return res.status(404).json({ success: false, message: '找不到使用者。' });
-        }
+function listNormalUsers() {
+    return new Promise((resolve, reject) => {
+        const sql = `SELECT id, username FROM users WHERE is_admin = 0 ORDER BY username ASC`;
+        db.all(sql, [], (err, rows) => {
+            if (err) return reject(err);
+            resolve(rows);
+        });
+    });
+}
 
-        const isMatch = await bcrypt.compare(oldPassword, user.password);
-        if (!isMatch) {
-            return res.status(401).json({ success: false, message: '旧密码不正确。' });
-        }
-        
-        const salt = await bcrypt.genSalt(10);
-        const hashedPassword = await bcrypt.hash(newPassword, salt);
-        await data.changeUserPassword(req.session.userId, hashedPassword);
-        
-        res.json({ success: true, message: '密码修改成功。' });
-    } catch (error) {
-        res.status(500).json({ success: false, message: '修改密码失败。' });
-    }
-});
+function listAllUsers() {
+    return new Promise((resolve, reject) => {
+        const sql = `SELECT id, username FROM users ORDER BY username ASC`;
+        db.all(sql, [], (err, rows) => {
+            if (err) return reject(err);
+            resolve(rows);
+        });
+    });
+}
 
-app.get('/api/admin/users', requireAdmin, async (req, res) => {
-    try {
-        const users = await data.listNormalUsers();
-        res.json(users);
-    } catch (error) {
-        res.status(500).json({ success: false, message: '获取使用者列表失败。' });
-    }
-});
 
-app.get('/api/admin/all-users', requireAdmin, async (req, res) => {
-    try {
-        const users = await data.listAllUsers();
-        res.json(users);
-    } catch (error) {
-        res.status(500).json({ success: false, message: '获取所有使用者列表失败。' });
-    }
-});
+async function deleteUser(userId) {
+    return new Promise((resolve, reject) => {
+        const sql = `DELETE FROM users WHERE id = ? AND is_admin = 0`;
+        db.run(sql, [userId], function(err) {
+            if (err) return reject(err);
+            resolve({ success: true, changes: this.changes });
+        });
+    });
+}
 
-app.post('/api/admin/add-user', requireAdmin, async (req, res) => {
-    const { username, password } = req.body;
-    if (!username || !password || password.length < 4) {
-        return res.status(400).json({ success: false, message: '使用者名称和密码为必填项，且密码长度至少 4 个字符。' });
-    }
-    try {
-        const salt = await bcrypt.genSalt(10);
-        const hashedPassword = await bcrypt.hash(password, salt);
-        const newUser = await data.createUser(username, hashedPassword);
-        await data.createFolder('/', null, newUser.id);
-        res.json({ success: true, user: newUser });
-    } catch (error) {
-        res.status(500).json({ success: false, message: '建立使用者失败，可能使用者名称已被使用。' });
-    }
-});
 
-app.post('/api/admin/change-password', requireAdmin, async (req, res) => {
-    const { userId, newPassword } = req.body;
-    if (!userId || !newPassword || newPassword.length < 4) {
-        return res.status(400).json({ success: false, message: '使用者 ID 和新密码为必填项，且密码长度至少 4 个字符。' });
-    }
-    try {
-        const salt = await bcrypt.genSalt(10);
-        const hashedPassword = await bcrypt.hash(newPassword, salt);
-        await data.changeUserPassword(userId, hashedPassword);
-        res.json({ success: true, message: '密码修改成功。' });
-    } catch (error) {
-        res.status(500).json({ success: false, message: '修改密码失败。' });
-    }
-});
+function searchItems(query, userId) {
+    return new Promise((resolve, reject) => {
+        const searchQuery = `%${query}%`;
+        const sqlFolders = `
+            SELECT id, name, parent_id, 'folder' as type
+            FROM folders
+            WHERE name LIKE ? AND user_id = ? AND parent_id IS NOT NULL
+            ORDER BY name ASC`;
 
-app.post('/api/admin/delete-user', requireAdmin, async (req, res) => {
-    const { userId } = req.body;
-    if (!userId) {
-        return res.status(400).json({ success: false, message: '缺少使用者 ID。' });
-    }
-    try {
-        await data.deleteUser(userId);
-        res.json({ success: true, message: '使用者已删除。' });
-    } catch (error) {
-        res.status(500).json({ success: false, message: '删除使用者失败。' });
-    }
-});
+        const sqlFiles = `
+            SELECT *, message_id as id, fileName as name, 'file' as type
+            FROM files
+            WHERE fileName LIKE ? AND user_id = ?
+            ORDER BY date DESC`;
 
-app.get('/api/admin/webdav', requireAdmin, (req, res) => {
-    const config = storageManager.readConfig();
-    const webdavConfig = config.webdav || {};
-    res.json(webdavConfig.url ? [{ id: 1, ...webdavConfig }] : []);
-});
+        let contents = { folders: [], files: [] };
 
-app.post('/api/admin/webdav', requireAdmin, (req, res) => {
-    const { url, username, password } = req.body;
-    if (!url || !username) { 
-        return res.status(400).json({ success: false, message: '缺少必要参数' });
-    }
-    const config = storageManager.readConfig();
-    
-    config.webdav = { url, username };
-    if (password) {
-        config.webdav.password = password;
-    }
+        db.all(sqlFolders, [searchQuery, userId], (err, folders) => {
+            if (err) return reject(err);
+            contents.folders = folders;
+            db.all(sqlFiles, [searchQuery, userId], (err, files) => {
+                if (err) return reject(err);
+                contents.files = files.map(f => ({ ...f, message_id: f.id }));
+                resolve(contents);
+            });
+        });
+    });
+}
 
-    if (storageManager.writeConfig(config)) {
-        res.json({ success: true, message: 'WebDAV 设定已储存' });
-    } else {
-        res.status(500).json({ success: false, message: '写入设定失败' });
-    }
-});
+function getItemsByIds(itemIds, userId) {
+    return new Promise((resolve, reject) => {
+        if (!itemIds || itemIds.length === 0) return resolve([]);
+        const placeholders = itemIds.map(() => '?').join(',');
+        const sql = `
+            SELECT id, name, parent_id, 'folder' as type, null as storage_type, null as file_id
+            FROM folders 
+            WHERE id IN (${placeholders}) AND user_id = ?
+            UNION ALL
+            SELECT message_id as id, fileName as name, folder_id as parent_id, 'file' as type, storage_type, file_id
+            FROM files 
+            WHERE message_id IN (${placeholders}) AND user_id = ?
+        `;
+        db.all(sql, [...itemIds, userId, ...itemIds, userId], (err, rows) => {
+            if (err) return reject(err);
+            resolve(rows);
+        });
+    });
+}
 
-app.delete('/api/admin/webdav/:id', requireAdmin, (req, res) => {
-    const config = storageManager.readConfig();
-    config.webdav = {}; 
-    if (storageManager.writeConfig(config)) {
-        res.json({ success: true, message: 'WebDAV 设定已删除' });
-    } else {
-        res.status(500).json({ success: false, message: '删除设定失败' });
-    }
-});
+function getChildrenOfFolder(folderId, userId) {
+    return new Promise((resolve, reject) => {
+        const sql = `
+            SELECT id, name, 'folder' as type FROM folders WHERE parent_id = ? AND user_id = ?
+            UNION ALL
+            SELECT message_id as id, fileName as name, 'file' as type FROM files WHERE folder_id = ? AND user_id = ?
+        `;
+        db.all(sql, [folderId, userId, folderId, userId], (err, rows) => {
+            if (err) return reject(err);
+            resolve(rows);
+        });
+    });
+}
 
-const uploadMiddleware = (req, res, next) => {
-    upload.array('files')(req, res, (err) => {
-        if (err) {
-            if (err.code === 'LIMIT_FILE_SIZE') {
-                return res.status(400).json({ success: false, message: '文件大小超出限制。' });
+async function getAllDescendantFolderIds(folderId, userId) {
+    let descendants = [];
+    let queue = [folderId];
+    const visited = new Set(queue);
+
+    while (queue.length > 0) {
+        const currentId = queue.shift();
+        const sql = `SELECT id FROM folders WHERE parent_id = ? AND user_id = ?`;
+        const children = await new Promise((resolve, reject) => {
+            db.all(sql, [currentId, userId], (err, rows) => {
+                if (err) reject(err);
+                else resolve(rows);
+            });
+        });
+
+        for (const child of children) {
+            if (!visited.has(child.id)) {
+                visited.add(child.id);
+                descendants.push(child.id);
+                queue.push(child.id);
             }
-            if (err.code === 'EDQUOT' || err.errno === -122) {
-                return res.status(507).json({ success: false, message: '上传失败：磁盘空间不足。' });
-            }
-            return res.status(500).json({ success: false, message: '上传档案到暂存区时发生错误。' });
         }
-        next();
+    }
+    return descendants;
+}
+
+function getFolderContents(folderId, userId) {
+    return new Promise((resolve, reject) => {
+        const sqlFolders = `SELECT id, name, parent_id, 'folder' as type FROM folders WHERE parent_id = ? AND user_id = ? ORDER BY name ASC`;
+        const sqlFiles = `SELECT *, message_id as id, fileName as name, 'file' as type FROM files WHERE folder_id = ? AND user_id = ? ORDER BY name ASC`;
+        let contents = { folders: [], files: [] };
+        db.all(sqlFolders, [folderId, userId], (err, folders) => {
+            if (err) return reject(err);
+            contents.folders = folders;
+            db.all(sqlFiles, [folderId, userId], (err, files) => {
+                if (err) return reject(err);
+                contents.files = files.map(f => ({ ...f, message_id: f.id }));
+                resolve(contents);
+            });
+        });
     });
-};
+}
 
-app.post('/upload', requireLogin, async (req, res, next) => {
-    await cleanupTempDir();
-    next();
-}, uploadMiddleware, fixFileNameEncoding, async (req, res) => {
-
-    if (!req.files || req.files.length === 0) {
-        return res.status(400).json({ success: false, message: '没有选择文件' });
+async function getFilesRecursive(folderId, userId, currentPath = '') {
+    let allFiles = [];
+    const sqlFiles = "SELECT * FROM files WHERE folder_id = ? AND user_id = ?";
+    const files = await new Promise((res, rej) => db.all(sqlFiles, [folderId, userId], (err, rows) => err ? rej(err) : res(rows)));
+    for (const file of files) {
+        allFiles.push({ ...file, path: path.join(currentPath, file.fileName) });
     }
 
-    const initialFolderId = parseInt(req.body.folderId, 10);
-    const userId = req.session.userId;
-    const storage = storageManager.getStorage();
-    const resolutions = req.body.resolutions ? JSON.parse(req.body.resolutions) : {};
-    let relativePaths = req.body.relativePaths;
-
-    if (!relativePaths) {
-        relativePaths = req.files.map(file => file.originalname);
-    } else if (!Array.isArray(relativePaths)) {
-        relativePaths = [relativePaths];
+    const sqlFolders = "SELECT id, name FROM folders WHERE parent_id = ? AND user_id = ?";
+    const subFolders = await new Promise((res, rej) => db.all(sqlFolders, [folderId, userId], (err, rows) => err ? rej(err) : res(rows)));
+    for (const subFolder of subFolders) {
+        const nestedFiles = await getFilesRecursive(subFolder.id, userId, path.join(currentPath, subFolder.name));
+        allFiles.push(...nestedFiles);
     }
+    return allFiles;
+}
 
-    if (req.files.length !== relativePaths.length) {
-        return res.status(400).json({ success: false, message: '上传档案和路径资讯不匹配。' });
+async function getDescendantFiles(folderIds, userId) {
+    let allFiles = [];
+    for (const folderId of folderIds) {
+        const nestedFiles = await getFilesRecursive(folderId, userId);
+        allFiles.push(...nestedFiles);
     }
+    return allFiles;
+}
 
-    const results = [];
-    let skippedCount = 0;
-    try {
-        for (let i = 0; i < req.files.length; i++) {
-            const file = req.files[i];
-            const tempFilePath = file.path;
-            const relativePath = relativePaths[i];
-            
-            const action = resolutions[relativePath] || 'upload';
-
-            try {
-                if (action === 'skip') {
-                    skippedCount++;
-                    continue;
-                }
-
-                const pathParts = (relativePath || file.originalname).split('/');
-                let fileName = pathParts.pop() || file.originalname;
-                const folderPathParts = pathParts;
-
-                const targetFolderId = await data.resolvePathToFolderId(initialFolderId, folderPathParts, userId);
-                
-                if (action === 'overwrite') {
-                    const existingItem = await data.findItemInFolder(fileName, targetFolderId, userId);
-                    if (existingItem) {
-                        await data.unifiedDelete(existingItem.id, existingItem.type, userId);
-                    }
-                } else if (action === 'rename') {
-                    fileName = await data.findAvailableName(fileName, targetFolderId, userId, false);
+function getFolderPath(folderId, userId) {
+    let pathArr = [];
+    return new Promise((resolve, reject) => {
+        function findParent(id) {
+            if (!id) return resolve(pathArr.reverse());
+            db.get("SELECT id, name, parent_id FROM folders WHERE id = ? AND user_id = ?", [id, userId], (err, folder) => {
+                if (err) return reject(err);
+                if (folder) {
+                    pathArr.push({ id: folder.id, name: folder.name });
+                    findParent(folder.parent_id);
                 } else {
-                    const conflict = await data.findItemInFolder(fileName, targetFolderId, userId);
-                    if (conflict) {
-                        skippedCount++;
-                        continue;
-                    }
+                    resolve(pathArr.reverse());
                 }
-
-                const result = await storage.upload(tempFilePath, fileName, file.mimetype, userId, targetFolderId, req.body.caption || '');
-                results.push(result);
-
-            } finally {
-                if (fs.existsSync(tempFilePath)) {
-                    await fsp.unlink(tempFilePath).catch(err => {});
-                }
-            }
+            });
         }
-        if (results.length === 0 && skippedCount > 0) {
-            res.json({ success: true, skippedAll: true, message: '所有文件因冲突而被跳过。' });
-        } else {
-            res.json({ success: true, results });
-        }
-    } catch (error) {
-        for (const file of req.files) {
-            if (fs.existsSync(file.path)) {
-                await fsp.unlink(file.path).catch(err => {});
-            }
-        }
-        res.status(500).json({ success: false, message: '处理上传时发生错误: ' + error.message });
-    }
-});
-app.post('/api/text-file', requireLogin, async (req, res) => {
-    const { mode, fileId, folderId, fileName, content } = req.body;
-    const userId = req.session.userId;
-    const storage = storageManager.getStorage();
-
-    if (!fileName || !fileName.endsWith('.txt')) {
-        return res.status(400).json({ success: false, message: '档名无效或不是 .txt 档案' });
-    }
-
-    const tempFilePath = path.join(TMP_DIR, `${Date.now()}-${crypto.randomBytes(8).toString('hex')}.txt`);
-
-    try {
-        await fsp.writeFile(tempFilePath, content, 'utf8');
-        let result;
-
-        if (mode === 'edit' && fileId) {
-            const filesToUpdate = await data.getFilesByIds([fileId], userId);
-            if (filesToUpdate.length > 0) {
-                const originalFile = filesToUpdate[0];
-                
-                if (fileName !== originalFile.fileName) {
-                    const conflict = await data.checkFullConflict(fileName, originalFile.folder_id, userId);
-                    if (conflict) {
-                        await fsp.unlink(tempFilePath).catch(err => {});
-                        return res.status(409).json({ success: false, message: '同目录下已存在同名档案或资料夹。' });
-                    }
-                }
-                
-                await data.unifiedDelete(originalFile.message_id, 'file', userId);
-                result = await storage.upload(tempFilePath, fileName, 'text/plain', userId, originalFile.folder_id);
-            } else {
-                return res.status(404).json({ success: false, message: '找不到要编辑的原始档案' });
-            }
-        } else if (mode === 'create' && folderId) {
-             const conflict = await data.checkFullConflict(fileName, folderId, userId);
-            if (conflict) {
-                return res.status(409).json({ success: false, message: '同目录下已存在同名档案或资料夹。' });
-            }
-            result = await storage.upload(tempFilePath, fileName, 'text/plain', userId, folderId);
-        } else {
-            return res.status(400).json({ success: false, message: '请求参数无效' });
-        }
-        res.json({ success: true, fileId: result.fileId });
-    } catch (error) {
-        res.status(500).json({ success: false, message: '伺服器内部错误' });
-    } finally {
-        if (fs.existsSync(tempFilePath)) {
-            await fsp.unlink(tempFilePath).catch(err => {});
-        }
-    }
-});
-
-
-app.get('/api/file-info/:id', requireLogin, async (req, res) => {
-    try {
-        const fileId = parseInt(req.params.id, 10);
-        const [fileInfo] = await data.getFilesByIds([fileId], req.session.userId);
-        if (fileInfo) {
-            res.json(fileInfo);
-        } else {
-            res.status(404).json({ success: false, message: '找不到档案资讯' });
-        }
-    } catch (error) {
-        res.status(500).json({ success: false, message: '获取档案资讯失败' });
-    }
-});
-
-app.post('/api/check-existence', requireLogin, async (req, res) => {
-    try {
-        const { files: filesToCheck, folderId: initialFolderId } = req.body;
-        const userId = req.session.userId;
-
-        if (!filesToCheck || !Array.isArray(filesToCheck) || !initialFolderId) {
-            return res.status(400).json({ success: false, message: '无效的请求参数。' });
-        }
-
-        const existenceChecks = await Promise.all(
-            filesToCheck.map(async (fileInfo) => {
-                const { relativePath } = fileInfo;
-                const pathParts = (relativePath || '').split('/');
-                const fileName = pathParts.pop() || relativePath;
-                const folderPathParts = pathParts;
-
-                const targetFolderId = await data.findFolderByPath(initialFolderId, folderPathParts, userId);
-                
-                if (targetFolderId === null) {
-                    return { name: fileName, relativePath, exists: false, messageId: null };
-                }
-
-                const existingFile = await data.findFileInFolder(fileName, targetFolderId, userId);
-                return { name: fileName, relativePath, exists: !!existingFile, messageId: existingFile ? existingFile.message_id : null };
-            })
-        );
-        res.json({ success: true, files: existenceChecks });
-    } catch (error) {
-        res.status(500).json({ success: false, message: "检查档案是否存在时发生内部错误。" });
-    }
-});
-
-app.post('/api/check-move-conflict', requireLogin, async (req, res) => {
-    try {
-        const { itemIds, targetFolderId } = req.body;
-        const userId = req.session.userId;
-
-        if (!itemIds || !Array.isArray(itemIds) || !targetFolderId) {
-            return res.status(400).json({ success: false, message: '无效的请求参数。' });
-        }
-        
-        const topLevelItems = await data.getItemsByIds(itemIds, userId);
-        const { fileConflicts, folderConflicts } = await data.getConflictingItems(topLevelItems, targetFolderId, userId);
-
-        res.json({
-            success: true,
-            fileConflicts,
-            folderConflicts
-        });
-
-    } catch (error) {
-        res.status(500).json({ success: false, message: '检查名称冲突时出错: ' + error.message });
-    }
-});
-
-
-app.get('/api/search', requireLogin, async (req, res) => {
-    try {
-        const query = req.query.q;
-        if (!query) return res.status(400).json({ success: false, message: '需要提供搜寻关键字。' });
-        
-        const contents = await data.searchItems(query, req.session.userId); 
-        
-        const path = [{ id: null, name: `搜寻结果: "${query}"` }];
-        res.json({ contents, path });
-    } catch (error) { 
-        res.status(500).json({ success: false, message: '搜寻失败。' }); 
-    }
-});
-
-app.get('/api/folder/:id', requireLogin, async (req, res) => {
-    try {
-        const folderId = parseInt(req.params.id, 10);
-        const contents = await data.getFolderContents(folderId, req.session.userId);
-        const path = await data.getFolderPath(folderId, req.session.userId);
-        res.json({ contents, path });
-    } catch (error) { res.status(500).json({ success: false, message: '读取资料夾内容失败。' }); }
-});
-
-app.post('/api/folder', requireLogin, async (req, res) => {
-    const { name, parentId } = req.body;
-    const userId = req.session.userId;
-    if (!name || !parentId) {
-        return res.status(400).json({ success: false, message: '缺少资料夾名称或父 ID。' });
-    }
-    
-    try {
-        const conflict = await data.checkFullConflict(name, parentId, userId);
-        if (conflict) {
-            return res.status(409).json({ success: false, message: '同目录下已存在同名档案或资料夹。' });
-        }
-
-        const result = await data.createFolder(name, parentId, userId);
-        
-        const storage = storageManager.getStorage();
-        if (storage.createDirectory) {
-            const newFolderPathParts = await data.getFolderPath(result.id, userId);
-            const newFullPath = path.posix.join(...newFolderPathParts.slice(1).map(p => p.name));
-            await storage.createDirectory(newFullPath);
-        }
-
-        res.json(result);
-    } catch (error) {
-         res.status(500).json({ success: false, message: error.message || '处理资料夾时发生错误。' });
-    }
-});
-
-
-app.get('/api/folders', requireLogin, async (req, res) => {
-    const folders = await data.getAllFolders(req.session.userId);
-    res.json(folders);
-});
-
-app.post('/api/move', requireLogin, async (req, res) => {
-    try {
-        const { itemIds, targetFolderId, resolutions = {} } = req.body;
-        const userId = req.session.userId;
-
-        if (!itemIds || !Array.isArray(itemIds) || itemIds.length === 0 || !targetFolderId) {
-            return res.status(400).json({ success: false, message: '无效的请求参数。' });
-        }
-        
-        let totalMoved = 0;
-        let totalSkipped = 0;
-        let totalErrors = 0;
-        const errorMessages = [];
-        
-        for (const itemId of itemIds) {
-            try {
-                const items = await data.getItemsByIds([itemId], userId);
-                if (items.length === 0) {
-                    totalSkipped++;
-                    continue; 
-                }
-                
-                const item = items[0];
-                const report = await data.moveItem(item.id, item.type, targetFolderId, userId, { resolutions });
-                totalMoved += report.moved;
-                totalSkipped += report.skipped;
-                if (report.errors > 0) {
-                    totalErrors += report.errors;
-                    errorMessages.push(`项目 "${item.name}" 处理失败。`);
-                }
-
-            } catch (err) {
-                totalErrors++;
-                errorMessages.push(err.message);
-            }
-        }
-        
-        let message = "操作完成。";
-        if (totalErrors > 0) {
-            message = `操作完成，但出现错误: ${errorMessages.join(', ')}`;
-        } else if (totalMoved > 0 && totalSkipped > 0) {
-            message = `操作完成，${totalMoved} 个项目已移动，${totalSkipped} 个项目被跳过。`;
-        } else if (totalMoved === 0 && totalSkipped > 0) {
-            message = "所有选定项目均被跳过。";
-        } else if (totalMoved > 0) {
-            message = `${totalMoved} 个项目移动成功。`;
-        }
-
-        res.json({ success: totalErrors === 0, message: message });
-
-    } catch (error) { 
-        res.status(500).json({ success: false, message: '移动失败：' + error.message }); 
-    }
-});
-
-app.post('/delete-multiple', requireLogin, async (req, res) => {
-    const { messageIds = [], folderIds = [] } = req.body;
-    const userId = req.session.userId;
-    try {
-        for(const id of messageIds) { await data.unifiedDelete(id, 'file', userId); }
-        for(const id of folderIds) { await data.unifiedDelete(id, 'folder', userId); }
-        res.json({ success: true, message: '删除成功' });
-    } catch (error) {
-        res.status(500).json({ success: false, message: '删除失败: ' + error.message });
-    }
-});
-
-
-app.post('/rename', requireLogin, async (req, res) => {
-    try {
-        const { id, newName, type } = req.body;
-        const userId = req.session.userId;
-        if (!id || !newName || !type) {
-            return res.status(400).json({ success: false, message: '缺少必要参数。'});
-        }
-
-        let result;
-        if (type === 'file') {
-            result = await data.renameFile(parseInt(id, 10), newName, userId);
-        } else if (type === 'folder') {
-            result = await data.renameFolder(parseInt(id, 10), newName, userId);
-        } else {
-            return res.status(400).json({ success: false, message: '无效的项目类型。'});
-        }
-        res.json(result);
-    } catch (error) { 
-        res.status(500).json({ success: false, message: '重命名失败: ' + error.message }); 
-    }
-});
-
-app.get('/download/proxy/:message_id', requireLogin, async (req, res) => {
-    try {
-        const messageId = parseInt(req.params.message_id, 10);
-        const [fileInfo] = await data.getFilesByIds([messageId], req.session.userId);
-        
-        if (!fileInfo || !fileInfo.file_id) {
-            return res.status(404).send('文件信息未找到');
-        }
-
-        const storage = storageManager.getStorage();
-        
-        res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(fileInfo.fileName)}`);
-        if (fileInfo.mimetype) res.setHeader('Content-Type', fileInfo.mimetype);
-        if (fileInfo.size) res.setHeader('Content-Length', fileInfo.size);
-
-        const stream = await storage.stream(fileInfo.file_id, req.session.userId);
-        handleStream(stream, res);
-
-    } catch (error) { 
-        res.status(500).send('下载代理失败: ' + error.message); 
-    }
-});
-
-app.get('/file/content/:message_id', requireLogin, async (req, res) => {
-    try {
-        const messageId = parseInt(req.params.message_id, 10);
-        const [fileInfo] = await data.getFilesByIds([messageId], req.session.userId);
-
-        if (!fileInfo || !fileInfo.file_id) {
-            return res.status(404).send('文件信息未找到');
-        }
-        
-        const storage = storageManager.getStorage();
-        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-
-        const stream = await storage.stream(fileInfo.file_id, req.session.userId);
-        handleStream(stream, res);
-    } catch (error) { 
-        res.status(500).send('无法获取文件内容'); 
-    }
-});
-
-
-app.post('/api/download-archive', requireLogin, async (req, res) => {
-    try {
-        const { messageIds = [], folderIds = [] } = req.body;
-        const userId = req.session.userId;
-        const storage = storageManager.getStorage();
-
-        if (messageIds.length === 0 && folderIds.length === 0) {
-            return res.status(400).send('未提供任何项目 ID');
-        }
-        let filesToArchive = [];
-        if (messageIds.length > 0) {
-            const directFiles = await data.getFilesByIds(messageIds, userId);
-            filesToArchive.push(...directFiles.map(f => ({ ...f, path: f.fileName })));
-        }
-        for (const folderId of folderIds) {
-            const folderInfo = (await data.getFolderPath(folderId, userId)).pop();
-            const folderName = folderInfo ? folderInfo.name : 'folder';
-            const nestedFiles = await data.getFilesRecursive(folderId, userId, folderName);
-            filesToArchive.push(...nestedFiles);
-        }
-        if (filesToArchive.length === 0) {
-            return res.status(404).send('找不到任何可下载的档案');
-        }
-        
-        const archive = archiver('zip', { zlib: { level: 9 } });
-        res.attachment('download.zip');
-        archive.pipe(res);
-
-        for (const file of filesToArchive) {
-             const stream = await storage.stream(file.file_id, userId);
-             archive.append(stream, { name: file.path });
-        }
-        await archive.finalize();
-    } catch (error) {
-        res.status(500).send('压缩档案时发生错误');
-    }
-});
-
-
-app.post('/share', requireLogin, async (req, res) => {
-    try {
-        const { itemId, itemType, expiresIn } = req.body;
-        if (!itemId || !itemType || !expiresIn) {
-            return res.status(400).json({ success: false, message: '缺少必要参数。' });
-        }
-        
-        const result = await data.createShareLink(parseInt(itemId, 10), itemType, expiresIn, req.session.userId);
-        
-        if (result.success) {
-            const shareUrl = `${req.protocol}://${req.get('host')}/share/view/${itemType}/${result.token}`;
-            res.json({ success: true, url: shareUrl });
-        } else {
-            res.status(404).json(result); 
-        }
-    } catch (error) {
-        res.status(500).json({ success: false, message: '在伺服器上建立分享连结时发生错误。' });
-    }
-});
-
-app.get('/api/shares', requireLogin, async (req, res) => {
-    try {
-        const shares = await data.getActiveShares(req.session.userId);
-        const fullUrlShares = shares.map(item => ({
-            ...item,
-            share_url: `${req.protocol}://${req.get('host')}/share/view/${item.type}/${item.share_token}`
-        }));
-        res.json(fullUrlShares);
-    } catch (error) { res.status(500).json({ success: false, message: '获取分享列表失败' }); }
-});
-
-app.post('/api/cancel-share', requireLogin, async (req, res) => {
-    try {
-        const { itemId, itemType } = req.body;
-        if (!itemId || !itemType) return res.status(400).json({ success: false, message: '缺少必要参数' });
-        const result = await data.cancelShare(parseInt(itemId, 10), itemType, req.session.userId);
-        res.json(result);
-    } catch (error) { res.status(500).json({ success: false, message: '取消分享失败' }); }
-});
-
-app.post('/api/scan/webdav', requireAdmin, async (req, res) => {
-    const { userId } = req.body;
-    const log = [];
-    try {
-        if (!userId) throw new Error('未提供使用者 ID');
-
-        const { createClient } = require('webdav');
-        const config = storageManager.readConfig();
-        if (!config.webdav || !config.webdav.url) {
-            throw new Error('WebDAV 设定不完整');
-        }
-        const client = createClient(config.webdav.url, {
-            username: config.webdav.username,
-            password: config.webdav.password
-        });
-        
-        async function scanWebdavDirectory(remotePath) {
-            const contents = await client.getDirectoryContents(remotePath, { deep: true });
-            for (const item of contents) {
-                if (item.type === 'file') {
-                    const existing = await data.findFileByFileId(item.filename, userId);
-                     if (existing) {
-                        log.push({ message: `已存在: ${item.filename}，跳过。`, type: 'info' });
-                    } else {
-                        const folderPath = path.dirname(item.filename).replace(/\\/g, '/');
-                        const folderId = await data.findOrCreateFolderByPath(folderPath, userId);
-                        
-                        const messageId = BigInt(Date.now()) * 1000000n + BigInt(crypto.randomInt(1000000));
-                        await data.addFile({
-                            message_id: messageId,
-                            fileName: item.basename,
-                            mimetype: item.mime || 'application/octet-stream',
-                            size: item.size,
-                            file_id: item.filename,
-                            date: new Date(item.lastmod).getTime(),
-                        }, folderId, userId, 'webdav');
-                        log.push({ message: `已汇入: ${item.filename}`, type: 'success' });
-                    }
-                }
-            }
-        }
-        
-        await scanWebdavDirectory('/');
-        res.json({ success: true, log });
-
-    } catch (error) {
-        let errorMessage = error.message;
-        if (error.response && error.response.status === 403) {
-            errorMessage = '存取被拒绝 (403 Forbidden)。这通常意味着您的 WebDAV 伺服器不允许列出目录内容。请检查您帐号的权限，确保它有读取和浏览目录的权限。';
-            log.push({ message: '扫描失败：无法列出远端目录内容。', type: 'error' });
-        }
-        log.push({ message: `详细错误: ${errorMessage}`, type: 'error' });
-        res.status(500).json({ success: false, message: errorMessage, log });
-    }
-});
-
-app.get('/share/view/file/:token', async (req, res) => {
-    try {
-        const token = req.params.token;
-        const fileInfo = await data.getFileByShareToken(token);
-        if (fileInfo) {
-            const downloadUrl = `/share/download/file/${token}`;
-            let textContent = null;
-            if (fileInfo.mimetype && fileInfo.mimetype.startsWith('text/')) {
-                const storage = storageManager.getStorage();
-                const stream = await storage.stream(fileInfo.file_id, fileInfo.user_id);
-                 textContent = await new Promise((resolve, reject) => {
-                    let data = '';
-                    stream.on('data', chunk => data += chunk);
-                    stream.on('end', () => resolve(data));
-                    stream.on('error', err => reject(err));
-                });
-            }
-            res.render('share-view', { file: fileInfo, downloadUrl, textContent });
-        } else {
-            res.status(404).render('share-error', { message: '此分享连结无效或已过期。' });
-        }
-    } catch (error) { res.status(500).render('share-error', { message: '处理分享请求时发生错误。' }); }
-});
-
-app.get('/share/view/folder/:token', async (req, res) => {
-    try {
-        const token = req.params.token;
-        const folderInfo = await data.getFolderByShareToken(token);
-        if (folderInfo) {
-            const contents = await data.getFolderContents(folderInfo.id, folderInfo.user_id);
-            res.render('share-folder-view', { folder: folderInfo, contents });
-        } else {
-            res.status(404).render('share-error', { message: '此分享连结无效或已过期。' });
-        }
-    } catch (error) { 
-        res.status(500).render('share-error', { message: '处理分享请求时发生错误。' }); 
-    }
-});
-
-function handleStream(stream, res) {
-    stream.on('error', (err) => {
-        if (!res.headersSent) {
-            res.status(500).send('读取文件流时发生错误');
-        }
-        stream.destroy();
-    }).on('close', () => {
-        stream.destroy();
-    }).pipe(res).on('finish', () => {
-        stream.destroy();
+        findParent(folderId);
     });
 }
 
-app.get('/share/download/file/:token', async (req, res) => {
-    try {
-        const token = req.params.token;
-        const fileInfo = await data.getFileByShareToken(token);
-        if (!fileInfo || !fileInfo.file_id) {
-             return res.status(404).send('文件信息未找到或分享链接已过期');
+function createFolder(name, parentId, userId) {
+    const sql = `INSERT INTO folders (name, parent_id, user_id) VALUES (?, ?, ?)`;
+    return new Promise((resolve, reject) => {
+        db.run(sql, [name, parentId, userId], function (err) {
+            if (err) {
+                if (err.message.includes('UNIQUE')) return reject(new Error('同目录下已存在同名资料夹。'));
+                return reject(err);
+            }
+            resolve({ success: true, id: this.lastID });
+        });
+    });
+}
+
+function findFolderByName(name, parentId, userId) {
+    return new Promise((resolve, reject) => {
+        const sql = `SELECT id FROM folders WHERE name = ? AND parent_id = ? AND user_id = ?`;
+        db.get(sql, [name, parentId, userId], (err, row) => {
+            if (err) return reject(err);
+            resolve(row);
+        });
+    });
+}
+
+async function findFolderByPath(startFolderId, pathParts, userId) {
+    let currentParentId = startFolderId;
+    for (const part of pathParts) {
+        if (!part) continue;
+        const folder = await new Promise((resolve, reject) => {
+            const sql = `SELECT id FROM folders WHERE name = ? AND parent_id = ? AND user_id = ?`;
+            db.get(sql, [part, currentParentId, userId], (err, row) => err ? reject(err) : resolve(row));
+        });
+
+        if (folder) {
+            currentParentId = folder.id;
+        } else {
+            return null; 
         }
-
-        const storage = storageManager.getStorage();
-        res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(fileInfo.fileName)}`);
-
-        const stream = await storage.stream(fileInfo.file_id, fileInfo.user_id);
-        handleStream(stream, res);
-
-    } catch (error) { res.status(500).send('下载失败'); }
-});
-
-app.get('/share/download/:folderToken/:fileId', async (req, res) => {
-    try {
-        const { folderToken, fileId } = req.params;
-        const fileInfo = await data.findFileInSharedFolder(parseInt(fileId, 10), folderToken);
-        
-        if (!fileInfo || !fileInfo.file_id) {
-             return res.status(404).send('文件信息未找到或权限不足');
-        }
-        
-        const storage = storageManager.getStorage();
-        res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(fileInfo.fileName)}`);
-
-        const stream = await storage.stream(fileInfo.file_id, fileInfo.user_id);
-        handleStream(stream, res);
-    } catch (error) {
-        res.status(500).send('下载失败');
     }
-});
+    return currentParentId;
+}
 
 
-app.listen(PORT, () => console.log(`✅ 伺服器已在 http://localhost:${PORT} 上运行`));
+function getAllFolders(userId) {
+    return new Promise((resolve, reject) => {
+        const sql = "SELECT id, name, parent_id FROM folders WHERE user_id = ? ORDER BY parent_id, name ASC";
+        db.all(sql, [userId], (err, rows) => {
+            if (err) reject(err);
+            else resolve(rows);
+        });
+    });
+}
+
+async function moveItem(itemId, itemType, targetFolderId, userId, options = {}) {
+    const report = { moved: 0, skipped: 0, errors: 0 };
+    const { resolutions = {}, pathPrefix = '' } = options;
+    
+    // --- *** 最终修正：增加根目录检查 *** ---
+    const sourceItem = (await getItemsByIds([itemId], userId))[0];
+    if (!sourceItem) {
+        report.errors++;
+        return report;
+    }
+
+    if (itemType === 'folder' && sourceItem.parent_id === null) {
+        console.error(`[DEBUG] [data.js moveItem] Attempted to move the root folder (ID: ${itemId}). This is not allowed.`);
+        report.errors++;
+        // 直接抛出错误，让上层知道这是一个无效操作
+        throw new Error("无法移动根目录。");
+    }
+    // --- *** 修正结束 *** ---
+
+    const currentRelativePath = path.posix.join(pathPrefix, sourceItem.name);
+    const existingItemInTarget = await findItemInFolder(sourceItem.name, targetFolderId, userId);
+    const action = resolutions[currentRelativePath] || (existingItemInTarget ? 'skip_default' : 'move');
+
+    try {
+        if (action === 'skip' || action === 'skip_default') {
+            report.skipped++;
+            return report;
+        }
+        
+        if (action === 'merge') {
+            if (!existingItemInTarget || existingItemInTarget.type !== 'folder' || itemType !== 'folder') {
+                report.skipped++;
+                return report;
+            }
+            
+            const children = await getChildrenOfFolder(itemId, userId);
+            let allChildrenProcessedWithoutIssues = true;
+
+            for (const child of children) {
+                const childReport = await moveItem(child.id, child.type, existingItemInTarget.id, userId, { 
+                    resolutions, 
+                    pathPrefix: currentRelativePath 
+                });
+                
+                report.moved += childReport.moved;
+                report.skipped += childReport.skipped;
+                report.errors += childReport.errors;
+                
+                if (childReport.errors > 0 || childReport.skipped > 0) {
+                    allChildrenProcessedWithoutIssues = false;
+                }
+            }
+            
+            if (allChildrenProcessedWithoutIssues) {
+                await unifiedDelete(itemId, 'folder', userId);
+            } else {
+                 console.log(`[DEBUG] [data.js moveItem] Some children of '${sourceItem.name}' were skipped or had errors. Original folder is kept.`);
+            }
+            return report;
+        }
+
+        let finalTargetFolderId = targetFolderId;
+        let finalItemName = sourceItem.name;
+        let overwriteFlag = false;
+
+        if (action === 'overwrite') {
+            if (existingItemInTarget) {
+                await unifiedDelete(existingItemInTarget.id, existingItemInTarget.type, userId);
+            }
+            overwriteFlag = true;
+        } else if (action === 'rename') {
+            finalItemName = await findAvailableName(sourceItem.name, targetFolderId, userId, itemType === 'folder');
+        }
+
+        await moveItems(
+            itemType === 'file' ? [{ id: itemId, name: finalItemName }] : [],
+            itemType === 'folder' ? [{ id: itemId, name: finalItemName }] : [],
+            finalTargetFolderId,
+            userId,
+            overwriteFlag
+        );
+
+        report.moved++;
+    } catch (e) {
+        console.error(`[DEBUG] [data.js moveItem] **** An error occurred for item '${sourceItem.name}' ****`);
+        console.error(e);
+        report.errors++;
+    }
+    return report;
+}
+
+async function unifiedDelete(itemId, itemType, userId) {
+    const storage = require('./storage').getStorage();
+    let filesForStorage = [];
+    let foldersForStorage = [];
+    
+    if (itemType === 'folder') {
+        const deletionData = await getFolderDeletionData(itemId, userId);
+        filesForStorage.push(...deletionData.files);
+        foldersForStorage.push(...deletionData.folders);
+    } else {
+        const directFiles = await getFilesByIds([itemId], userId);
+        filesForStorage.push(...directFiles);
+    }
+    
+    try {
+        await storage.remove(filesForStorage, foldersForStorage, userId);
+    } catch (err) {
+        throw new Error("实体档案删除失败，操作已中止。");
+    }
+    
+    await executeDeletion(filesForStorage.map(f => f.message_id), foldersForStorage.map(f => f.id), userId);
+}
+
+
+async function moveItems(fileItems = [], folderItems = [], targetFolderId, userId, overwrite = false) {
+    const storage = require('./storage').getStorage();
+
+    const targetPathParts = await getFolderPath(targetFolderId, userId);
+    const targetFullPath = path.posix.join(...targetPathParts.slice(1).map(p => p.name));
+
+    const fileIds = fileItems.map(item => item.id);
+    const filesToMove = await getFilesByIds(fileIds, userId);
+    const fileNameMap = new Map(fileItems.map(item => [item.id, item.name]));
+
+    for (const file of filesToMove) {
+        const newFileName = fileNameMap.get(file.message_id) || file.fileName;
+        const oldRelativePath = file.file_id;
+        const newRelativePath = path.posix.join('/', targetFullPath, newFileName);
+        try {
+            await storage.move(oldRelativePath, newRelativePath, overwrite);
+            await new Promise((res, rej) => db.run('UPDATE files SET fileName = ?, file_id = ?, folder_id = ? WHERE message_id = ?', [newFileName, newRelativePath, targetFolderId, file.message_id], (e) => e ? rej(e) : res()));
+        } catch (err) {
+            throw new Error(`物理移动文件 ${newFileName} 失败`);
+        }
+    }
+    
+    const folderIds = folderItems.map(item => item.id);
+    const folderNameMap = new Map(folderItems.map(item => [item.id, item.name]));
+    const foldersToMove = (await getItemsByIds(folderIds, userId)).filter(i => i.type === 'folder');
+
+    for (const folder of foldersToMove) {
+        const newFolderName = folderNameMap.get(folder.id) || folder.name;
+        const oldPathParts = await getFolderPath(folder.id, userId);
+        const oldFullPath = path.posix.join('/', ...oldPathParts.slice(1).map(p => p.name));
+        const newFullPath = path.posix.join('/', targetFullPath, newFolderName);
+
+        try {
+            await storage.move(oldFullPath, newFullPath, overwrite);
+            const descendantFiles = await getFilesRecursive(folder.id, userId);
+            for (const file of descendantFiles) {
+                const updatedFileId = file.file_id.replace(oldFullPath, newFullPath);
+                await new Promise((res, rej) => db.run('UPDATE files SET file_id = ? WHERE message_id = ?', [updatedFileId, file.message_id], (e) => e ? rej(e) : res()));
+            }
+
+            await new Promise((res, rej) => db.run(`UPDATE folders SET name = ?, parent_id = ? WHERE id = ?`, [newFolderName, targetFolderId, folder.id], (e) => e ? rej(e) : res()));
+
+        } catch (err) {
+            throw new Error(`物理移动文件夹 ${newFolderName} 失败`);
+        }
+    }
+}
+
+
+async function renameFile(messageId, newFileName, userId) {
+    const file = (await getFilesByIds([messageId], userId))[0];
+    if (!file) {
+        return { success: false, message: '文件未找到。' };
+    }
+
+    const conflict = await checkFullConflict(newFileName, file.folder_id, userId);
+    if (conflict) {
+        throw new Error('目标文件夹中已存在同名项目。');
+    }
+
+    const storage = require('./storage').getStorage();
+    const oldRelativePath = file.file_id;
+    const newRelativePath = path.posix.join(path.posix.dirname(oldRelativePath), newFileName);
+
+    try {
+        await storage.move(oldRelativePath, newRelativePath, false);
+    } catch(err) {
+        throw new Error(`实体档案重新命名失败: ${err.message}`);
+    }
+    
+    const sql = `UPDATE files SET fileName = ?, file_id = ? WHERE message_id = ? AND user_id = ?`;
+    return new Promise((resolve, reject) => {
+        db.run(sql, [newFileName, newRelativePath, messageId, userId], function(err) {
+             if (err) reject(err);
+             else resolve({ success: true });
+        });
+    });
+}
+
+async function renameAndMoveFile(messageId, newFileName, targetFolderId, userId) {
+    const file = (await getFilesByIds([messageId], userId))[0];
+    if (!file) throw new Error('File not found for rename and move');
+
+    const storage = require('./storage').getStorage();
+    const targetPathParts = await getFolderPath(targetFolderId, userId);
+    const targetRelativePath = path.posix.join(...targetPathParts.slice(1).map(p => p.name));
+    const newRelativePath = path.posix.join('/', targetRelativePath, newFileName);
+    const oldRelativePath = file.file_id;
+    
+    try {
+        await storage.move(oldRelativePath, newRelativePath, false);
+    } catch(err) {
+        throw new Error(`实体档案移动并重命名失败`);
+    }
+    
+    const sql = `UPDATE files SET fileName = ?, file_id = ?, folder_id = ? WHERE message_id = ? AND user_id = ?`;
+    return new Promise((resolve, reject) => {
+        db.run(sql, [newFileName, newRelativePath, targetFolderId, messageId, userId], (err) => err ? reject(err) : resolve({ success: true }));
+    });
+}
+
+
+async function renameFolder(folderId, newFolderName, userId) {
+    const folder = await new Promise((res, rej) => db.get("SELECT * FROM folders WHERE id=?", [folderId], (e,r)=>e?rej(e):res(r)));
+    if (!folder) {
+        return { success: false, message: '资料夹未找到。'};
+    }
+    
+    if (folder.parent_id === null) {
+        throw new Error('无法重新命名根目录。');
+    }
+
+    const conflict = await checkFullConflict(newFolderName, folder.parent_id, userId);
+    if (conflict) {
+        throw new Error('目标文件夹中已存在同名项目。');
+    }
+    
+    const storage = require('./storage').getStorage();
+    const oldPathParts = await getFolderPath(folderId, userId);
+    const oldFullPath = path.posix.join('/', ...oldPathParts.slice(1).map(p => p.name));
+    const newFullPath = path.posix.join(path.posix.dirname(oldFullPath), newFolderName);
+
+    try {
+        await storage.move(oldFullPath, newFullPath, false);
+        
+        const descendantFiles = await getFilesRecursive(folderId, userId);
+        for (const file of descendantFiles) {
+            const updatedFileId = file.file_id.replace(oldFullPath, newFullPath);
+            await new Promise((res, rej) => db.run('UPDATE files SET file_id = ? WHERE message_id = ?', [updatedFileId, file.message_id], (e) => e ? rej(e) : res()));
+        }
+    } catch(e) {
+        throw new Error(`物理资料夹重新命名失败: ${e.message}`);
+    }
+
+    const sql = `UPDATE folders SET name = ? WHERE id = ? AND user_id = ?`;
+    return new Promise((resolve, reject) => {
+        db.run(sql, [newFolderName, folderId, userId], function(err) {
+            if (err) reject(err);
+            else if (this.changes === 0) resolve({ success: false, message: '资料夹未找到。' });
+            else resolve({ success: true });
+        });
+    });
+}
+
+async function getFolderDeletionData(folderId, userId) {
+    let filesToDelete = [];
+    let foldersToDeleteIds = [folderId];
+
+    async function findContentsRecursive(currentFolderId) {
+        const sqlFiles = `SELECT * FROM files WHERE folder_id = ? AND user_id = ?`;
+        const files = await new Promise((res, rej) => db.all(sqlFiles, [currentFolderId, userId], (err, rows) => err ? rej(err) : res(rows)));
+        filesToDelete.push(...files);
+        
+        const sqlFolders = `SELECT id FROM folders WHERE parent_id = ? AND user_id = ?`;
+        const subFolders = await new Promise((res, rej) => db.all(sqlFolders, [currentFolderId, userId], (err, rows) => err ? rej(err) : res(rows)));
+        
+        for (const subFolder of subFolders) {
+            foldersToDeleteIds.push(subFolder.id);
+            await findContentsRecursive(subFolder.id);
+        }
+    }
+
+    await findContentsRecursive(folderId);
+
+    const allUserFolders = await getAllFolders(userId);
+    const folderMap = new Map(allUserFolders.map(f => [f.id, f]));
+    
+    function buildPath(fId) {
+        let pathParts = [];
+        let current = folderMap.get(fId);
+        while(current && current.parent_id) {
+            pathParts.unshift(current.name);
+            current = folderMap.get(current.parent_id);
+        }
+        return path.join(...pathParts);
+    }
+
+    const foldersToDeleteWithPaths = foldersToDeleteIds.map(id => ({
+        id: id,
+        path: buildPath(id)
+    }));
+
+    return { files: filesToDelete, folders: foldersToDeleteWithPaths };
+}
+
+
+function executeDeletion(fileIds, folderIds, userId) {
+    return new Promise((resolve, reject) => {
+        if (fileIds.length === 0 && folderIds.length === 0) return resolve({ success: true });
+        
+        db.serialize(() => {
+            db.run("BEGIN TRANSACTION;");
+            const promises = [];
+            
+            if (fileIds.length > 0) {
+                const place = Array.from(new Set(fileIds)).map(() => '?').join(',');
+                promises.push(new Promise((res, rej) => db.run(`DELETE FROM files WHERE message_id IN (${place}) AND user_id = ?`, [...new Set(fileIds), userId], (e) => e ? rej(e) : res())));
+            }
+            if (folderIds.length > 0) {
+                const place = Array.from(new Set(folderIds)).map(() => '?').join(',');
+                promises.push(new Promise((res, rej) => db.run(`DELETE FROM folders WHERE id IN (${place}) AND user_id = ?`, [...new Set(folderIds), userId], (e) => e ? rej(e) : res())));
+            }
+
+            Promise.all(promises)
+                .then(() => db.run("COMMIT;", (e) => e ? reject(e) : resolve({ success: true })))
+                .catch((err) => db.run("ROLLBACK;", () => reject(err)));
+        });
+    });
+}
+
+
+function addFile(fileData, folderId = 1, userId, storageType) {
+    const { message_id, fileName, mimetype, file_id, thumb_file_id, date, size } = fileData;
+    const sql = `INSERT INTO files (message_id, fileName, mimetype, file_id, thumb_file_id, date, size, folder_id, user_id, storage_type)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+    return new Promise((resolve, reject) => {
+        db.run(sql, [message_id, fileName, mimetype, file_id, thumb_file_id, date, size, folderId, userId, storageType], function(err) {
+            if (err) reject(err);
+            else resolve({ success: true, id: this.lastID, fileId: this.lastID });
+        });
+    });
+}
+
+function getFilesByIds(messageIds, userId) {
+    if (!messageIds || messageIds.length === 0) {
+        return Promise.resolve([]);
+    }
+    const placeholders = messageIds.map(() => '?').join(',');
+    const sql = `SELECT * FROM files WHERE message_id IN (${placeholders}) AND user_id = ?`;
+    return new Promise((resolve, reject) => {
+        db.all(sql, [...messageIds, userId], (err, rows) => {
+            if (err) reject(err);
+            else resolve(rows);
+        });
+    });
+}
+
+function getFileByShareToken(token) {
+     return new Promise((resolve, reject) => {
+        const sql = "SELECT * FROM files WHERE share_token = ?";
+        db.get(sql, [token], (err, row) => {
+            if (err) return reject(err);
+            if (!row) return resolve(null);
+            if (row.share_expires_at && Date.now() > row.share_expires_at) {
+                const updateSql = "UPDATE files SET share_token = NULL, share_expires_at = NULL WHERE message_id = ?";
+                db.run(updateSql, [row.message_id]);
+                resolve(null);
+            } else {
+                resolve(row);
+            }
+        });
+    });
+}
+
+function getFolderByShareToken(token) {
+     return new Promise((resolve, reject) => {
+        const sql = "SELECT * FROM folders WHERE share_token = ?";
+        db.get(sql, [token], (err, row) => {
+            if (err) return reject(err);
+            if (!row) return resolve(null);
+            if (row.share_expires_at && Date.now() > row.share_expires_at) {
+                const updateSql = "UPDATE folders SET share_token = NULL, share_expires_at = NULL WHERE id = ?";
+                db.run(updateSql, [row.id]);
+                resolve(null);
+            } else {
+                resolve(row);
+            }
+        });
+    });
+}
+
+function findFileInSharedFolder(fileId, folderToken) {
+    return new Promise((resolve, reject) => {
+        const sql = `
+            SELECT f.*
+            FROM files f
+            JOIN folders fo ON f.folder_id = fo.id
+            WHERE f.message_id = ? AND fo.share_token = ?
+        `;
+        db.get(sql, [fileId, folderToken], (err, row) => {
+            if (err) return reject(err);
+            resolve(row);
+        });
+    });
+}
+
+function createShareLink(itemId, itemType, expiresIn, userId) {
+    const token = crypto.randomBytes(16).toString('hex');
+    let expiresAt = null;
+    const now = Date.now();
+    const hours = (h) => h * 60 * 60 * 1000;
+    const days = (d) => d * 24 * hours(1);
+    switch (expiresIn) {
+        case '1h': expiresAt = now + hours(1); break;
+        case '3h': expiresAt = now + hours(3); break;
+        case '5h': expiresAt = now + hours(5); break;
+        case '7h': expiresAt = now + hours(7); break;
+        case '24h': expiresAt = now + hours(24); break;
+        case '7d': expiresAt = now + days(7); break;
+        case '0': expiresAt = null; break;
+        default: expiresAt = now + hours(24);
+    }
+
+    const table = itemType === 'folder' ? 'folders' : 'files';
+    const idColumn = itemType === 'folder' ? 'id' : 'message_id';
+
+    const sql = `UPDATE ${table} SET share_token = ?, share_expires_at = ? WHERE ${idColumn} = ? AND user_id = ?`;
+
+    return new Promise((resolve, reject) => {
+        db.run(sql, [token, expiresAt, itemId, userId], function(err) {
+            if (err) reject(err);
+            else if (this.changes === 0) resolve({ success: false, message: '项目未找到。' });
+            else resolve({ success: true, token });
+        });
+    });
+}
+
+function getActiveShares(userId) {
+    return new Promise((resolve, reject) => {
+        const now = Date.now();
+        const sqlFiles = `SELECT message_id as id, fileName as name, 'file' as type, share_token, share_expires_at FROM files WHERE share_token IS NOT NULL AND (share_expires_at IS NULL OR share_expires_at > ?) AND user_id = ?`;
+        const sqlFolders = `SELECT id, name, 'folder' as type, share_token, share_expires_at FROM folders WHERE share_token IS NOT NULL AND (share_expires_at IS NULL OR share_expires_at > ?) AND user_id = ?`;
+
+        let shares = [];
+        db.all(sqlFiles, [now, userId], (err, files) => {
+            if (err) return reject(err);
+            shares = shares.concat(files);
+            db.all(sqlFolders, [now, userId], (err, folders) => {
+                if (err) return reject(err);
+                shares = shares.concat(folders);
+                resolve(shares);
+            });
+        });
+    });
+}
+
+function cancelShare(itemId, itemType, userId) {
+    const table = itemType === 'folder' ? 'folders' : 'files';
+    const idColumn = itemType === 'folder' ? 'id' : 'message_id';
+    const sql = `UPDATE ${table} SET share_token = NULL, share_expires_at = NULL WHERE ${idColumn} = ? AND user_id = ?`;
+
+    return new Promise((resolve, reject) => {
+        db.run(sql, [itemId, userId], function(err) {
+            if (err) reject(err);
+            else if (this.changes === 0) resolve({ success: false, message: '项目未找到或无需取消' });
+            else resolve({ success: true });
+        });
+    });
+}
+
+async function getConflictingItems(itemsToMove, destinationFolderId, userId) {
+    const fileConflicts = new Set();
+    const folderConflicts = new Set();
+
+    const destContents = await getChildrenOfFolder(destinationFolderId, userId);
+    const destMap = new Map(destContents.map(item => [item.name, item.type]));
+
+    for (const item of itemsToMove) {
+        const destType = destMap.get(item.name);
+        if (destType) {
+            if (item.type === 'folder' && destType === 'folder') {
+                folderConflicts.add(item.name);
+            } else {
+                fileConflicts.add(item.name);
+            }
+        }
+    }
+    
+    return {
+        fileConflicts: Array.from(fileConflicts),
+        folderConflicts: Array.from(folderConflicts)
+    };
+}
+
+
+function checkFullConflict(name, folderId, userId) {
+    return new Promise((resolve, reject) => {
+        const sql = `
+            SELECT name FROM (
+                SELECT name FROM folders WHERE name = ? AND parent_id = ? AND user_id = ?
+                UNION ALL
+                SELECT fileName as name FROM files WHERE fileName = ? AND folder_id = ? AND user_id = ?
+            ) LIMIT 1
+        `;
+        db.get(sql, [name, folderId, userId, name, folderId, userId], (err, row) => {
+            if (err) return reject(err);
+            resolve(!!row);
+        });
+    });
+}
+
+function findFileInFolder(fileName, folderId, userId) {
+    return new Promise((resolve, reject) => {
+        const sql = `SELECT message_id FROM files WHERE fileName = ? AND folder_id = ? AND user_id = ?`;
+        db.get(sql, [fileName, folderId, userId], (err, row) => {
+            if (err) return reject(err);
+            resolve(row);
+        });
+    });
+}
+
+function findItemInFolder(name, folderId, userId) {
+    return new Promise((resolve, reject) => {
+        const sql = `
+            SELECT id, name, 'folder' as type FROM folders WHERE name = ? AND parent_id = ? AND user_id = ?
+            UNION ALL
+            SELECT message_id as id, fileName as name, 'file' as type FROM files WHERE fileName = ? AND folder_id = ? AND user_id = ?
+        `;
+        db.get(sql, [name, folderId, userId, name, folderId, userId], (err, row) => {
+            if (err) return reject(err);
+            resolve(row);
+        });
+    });
+}
+
+async function findAvailableName(originalName, folderId, userId, isFolder) {
+    let newName = originalName;
+    let counter = 1;
+    const nameWithoutExt = isFolder ? originalName : path.parse(originalName).name;
+    const ext = isFolder ? '' : path.parse(originalName).ext;
+
+    while (await findItemInFolder(newName, folderId, userId)) {
+        newName = `${nameWithoutExt} (${counter})${ext}`;
+        counter++;
+    }
+    return newName;
+}
+
+
+function findFileByFileId(fileId, userId) {
+    return new Promise((resolve, reject) => {
+        const sql = `SELECT message_id FROM files WHERE file_id = ? AND user_id = ?`;
+        db.get(sql, [fileId, userId], (err, row) => {
+            if (err) return reject(err);
+            resolve(row);
+        });
+    });
+}
+
+
+function getRootFolder(userId) {
+    return new Promise((resolve, reject) => {
+        db.get("SELECT id FROM folders WHERE user_id = ? AND parent_id IS NULL", [userId], (err, row) => {
+            if (err) return reject(err);
+            resolve(row);
+        });
+    });
+}
+
+async function findOrCreateFolderByPath(fullPath, userId) {
+    if (!fullPath || fullPath === '/') {
+        const root = await getRootFolder(userId);
+        return root.id;
+    }
+
+    const pathParts = fullPath.split('/').filter(p => p);
+    let parentId = (await getRootFolder(userId)).id;
+
+    for (const part of pathParts) {
+        let folder = await findFolderByName(part, parentId, userId);
+        if (folder) {
+            parentId = folder.id;
+        } else {
+            const result = await createFolder(part, parentId, userId);
+            parentId = result.id;
+        }
+    }
+    return parentId;
+}
+
+async function resolvePathToFolderId(startFolderId, pathParts, userId) {
+    let currentParentId = startFolderId;
+    for (const part of pathParts) {
+        if (!part) continue;
+
+        let folder = await new Promise((resolve, reject) => {
+            const sql = `SELECT id FROM folders WHERE name = ? AND parent_id = ? AND user_id = ?`;
+            db.get(sql, [part, currentParentId, userId], (err, row) => err ? reject(err) : resolve(row));
+        });
+
+        if (folder) {
+            currentParentId = folder.id;
+        } else {
+            const newFolder = await new Promise((resolve, reject) => {
+                const sql = `INSERT INTO folders (name, parent_id, user_id) VALUES (?, ?, ?)`;
+                db.run(sql, [part, currentParentId, userId], function(err) {
+                    if (err) return reject(err);
+                    resolve({ id: this.lastID });
+                });
+            });
+            currentParentId = newFolder.id;
+        }
+    }
+    return currentParentId;
+}
+
+
+module.exports = {
+    createUser,
+    findUserByName,
+    findUserById,
+    changeUserPassword,
+    listNormalUsers,
+    listAllUsers,
+    deleteUser,
+    searchItems,
+    getFolderContents,
+    getFilesRecursive,
+    getFolderPath,
+    createFolder,
+    findFolderByName,
+    getAllFolders,
+    getAllDescendantFolderIds,
+    executeDeletion,
+    getFolderDeletionData,
+    addFile,
+    getFilesByIds,
+    getItemsByIds,
+    getChildrenOfFolder,
+    moveItems,
+    moveItem,
+    getFileByShareToken,
+    getFolderByShareToken,
+    findFileInSharedFolder,
+    createShareLink,
+    getActiveShares,
+    cancelShare,
+    renameFile,
+    renameFolder,
+    findFileInFolder,
+    getConflictingItems,
+    checkFullConflict,
+    resolvePathToFolderId,
+    findFolderByPath,
+    getDescendantFiles,
+    findFileByFileId,
+    findOrCreateFolderByPath,
+    getRootFolder,
+    unifiedDelete,
+    findItemInFolder,
+    findAvailableName,
+    renameAndMoveFile,
+};
