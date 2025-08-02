@@ -697,8 +697,7 @@ app.post('/api/folder', requireLogin, async (req, res) => {
         const storage = storageManager.getStorage();
         if (storage.type === 'webdav' && storage.createDirectory) {
             const newFolderPathInfo = await data.getWebdavPathInfo(result.id, userId);
-            const finalPath = path.posix.join(newFolderPathInfo.remotePath, name);
-            await storage.createDirectory({ ...newFolderPathInfo, remotePath: finalPath });
+            await storage.createDirectory(newFolderPathInfo);
         }
 
         res.json(result);
