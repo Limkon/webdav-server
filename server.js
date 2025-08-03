@@ -900,7 +900,7 @@ app.post('/share', requireLogin, async (req, res) => {
         const result = await data.createShareLink(parseInt(itemId, 10), itemType, expiresIn, req.session.userId);
         
         if (result.success) {
-            const shareUrl = `${req.protocol}://${req.get('host')}/share/view/${itemType}/${result.token}`;
+            const shareUrl = `https://${req.get('host')}/share/view/${itemType}/${result.token}`;
             res.json({ success: true, url: shareUrl });
         } else {
             res.status(404).json(result); 
@@ -915,7 +915,7 @@ app.get('/api/shares', requireLogin, async (req, res) => {
         const shares = await data.getActiveShares(req.session.userId);
         const fullUrlShares = shares.map(item => ({
             ...item,
-            share_url: `${req.protocol}://${req.get('host')}/share/view/${item.type}/${item.share_token}`
+            share_url: `https://${req.get('host')}/share/view/${item.type}/${item.share_token}`
         }));
         res.json(fullUrlShares);
     } catch (error) { res.status(500).json({ success: false, message: '获取分享列表失败' }); }
