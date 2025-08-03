@@ -9,6 +9,7 @@ const CONFIG_FILE = path.join(__dirname, '..', 'data', 'config.json');
 
 // --- 輔助函數：日誌記錄 ---
 function log(level, message, ...args) {
+    if (level === 'debug') return; // 移除调试日志
     const timestamp = new Date().toISOString();
     console.log(`[${timestamp}] [WEBDAV] [${level.toUpperCase()}] ${message}`, ...args);
 }
@@ -83,7 +84,6 @@ async function upload(tempFilePath, fileName, mimetype, userId, folderPathInfo) 
 
     if (folderPath && folderPath !== "/") {
         try {
-            log('debug', `嘗試在 WebDAV 上創建目錄: ${folderPath}`);
             await client.createDirectory(folderPath, { recursive: true });
         } catch (e) {
             if (e.response && (e.response.status !== 405 && e.response.status !== 501)) {
