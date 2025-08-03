@@ -50,7 +50,10 @@ cleanupTempDir();
 const diskStorage = multer.diskStorage({
   destination: (req, res, cb) => cb(null, TMP_DIR)
 });
-const upload = multer({ storage: diskStorage, limits: { fileSize: 1000 * 1024 * 1024 } });
+const upload = multer({ 
+    storage: diskStorage, 
+    limits: { fileSize: '1024MB' } 
+});
 const PORT = process.env.PORT || 8100;
 
 app.use(session({
@@ -63,8 +66,8 @@ app.use(session({
 app.set('view engine', 'ejs');
 app.set('views', path.join(__dirname, 'views'));
 app.use(express.static('public'));
-app.use(express.urlencoded({ extended: true }));
-app.use(express.json());
+app.use(express.urlencoded({ extended: true, limit: '1024mb' }));
+app.use(express.json({ limit: '1024mb' }));
 
 // --- Middleware ---
 const fixFileNameEncoding = (req, res, next) => {
@@ -102,7 +105,6 @@ async function createMountPointsForUser(userId) {
     if (config.webdav && Array.isArray(config.webdav)) {
         for (const mount of config.webdav) {
             if (mount.mount_name) {
-                // 檢查文件夹是否已存在
                 const existing = await data.findFolderByName(mount.mount_name, rootFolder.id, userId);
                 if (!existing) {
                     log('info', `為使用者 ${userId} 創建掛載點資料夾: ${mount.mount_name}`);
@@ -509,7 +511,13 @@ app.post('/upload', requireLogin, async (req, res, next) => {
             res.json({ success: true, results });
         }
     } catch (error) {
-        log('error', '處理上傳時發生錯誤:', error);
+        log('error', '處理上傳時發生嚴重錯誤:', {
+            message: error.message,
+            stack: error.stack,
+            userId: req.session.userId,
+            folderId: initialFolderId,
+            fileCount: req.files.length
+        });
         for (const file of req.files) {
             if (fs.existsSync(file.path)) {
                 await fsp.unlink(file.path).catch(err => {});
@@ -571,7 +579,7 @@ app.post('/api/text-file', requireLogin, async (req, res) => {
 
         res.json({ success: true, fileId: dbResult.fileId });
     } catch (error) {
-        log('error', `儲存文字檔案失敗:`, error);
+        log('error', `储存文字档案失败:`, error);
         res.status(500).json({ success: false, message: '服务器内部错误' });
     } finally {
         if (fs.existsSync(tempFilePath)) {
@@ -677,7 +685,7 @@ app.get('/api/folder/:id', requireLogin, async (req, res) => {
 app.post('/api/folder', requireLogin, async (req, res) => {
     const { name, parentId } = req.body;
     const userId = req.session.userId;
-    log('info', `使用者 ${userId} 正在資料夾 ${parentId} 中創建 ${name}`);
+    log('info', `使用者 ${userId} 正在资料夹 ${parentId} 中创建 ${name}`);
 
     if (!name || !parentId) {
         return res.status(400).json({ success: false, message: '缺少文件夹名称或父 ID。' });
@@ -704,7 +712,7 @@ app.post('/api/folder', requireLogin, async (req, res) => {
 
         res.json(result);
     } catch (error) {
-        log('error', `創建資料夾失敗:`, error);
+        log('error', `创建资料夹失败:`, error);
          res.status(500).json({ success: false, message: error.message || '处理文件夹时发生错误。' });
     }
 });
@@ -719,7 +727,7 @@ app.post('/api/move', requireLogin, async (req, res) => {
     try {
         const { itemIds, targetFolderId, resolutions = {} } = req.body;
         const userId = req.session.userId;
-        log('info', `移動請求: items=${itemIds.join(',')} 到 folder=${targetFolderId} by user=${userId}`);
+        log('info', `移动请求: items=${itemIds.join(',')} 到 folder=${targetFolderId} by user=${userId}`);
         log('debug', 'Resolutions:', resolutions);
 
         if (!itemIds || !Array.isArray(itemIds) || itemIds.length === 0 || !targetFolderId) {
@@ -747,7 +755,7 @@ app.post('/api/move', requireLogin, async (req, res) => {
                 }
 
             } catch (err) {
-                log('error', `移動項目 ${itemId} 時出錯:`, err);
+                log('error', `移动项目 ${itemId} 时出错:`, err);
                 errors.push(err.message);
             }
         }
@@ -762,11 +770,11 @@ app.post('/api/move', requireLogin, async (req, res) => {
         } else if (totalMoved > 0) {
             message = `${totalMoved} 个项目移动成功。`;
         }
-        log('info', `移動操作完成: ${message}`);
+        log('info', `移动操作完成: ${message}`);
         res.json({ success: errors.length === 0, message: message });
 
     } catch (error) { 
-        log('error', '移動操作失敗:', error);
+        log('error', '移动操作失败:', error);
         res.status(500).json({ success: false, message: '移动失败：' + error.message }); 
     }
 });
@@ -774,13 +782,13 @@ app.post('/api/move', requireLogin, async (req, res) => {
 app.post('/delete-multiple', requireLogin, async (req, res) => {
     const { messageIds = [], folderIds = [] } = req.body;
     const userId = req.session.userId;
-    log('info', `刪除請求: files=${messageIds.join(',')}, folders=${folderIds.join(',')} by user=${userId}`);
+    log('info', `删除请求: files=${messageIds.join(',')}, folders=${folderIds.join(',')} by user=${userId}`);
     try {
         for(const id of messageIds) { await data.unifiedDelete(id, 'file', userId); }
         for(const id of folderIds) { await data.unifiedDelete(id, 'folder', userId); }
         res.json({ success: true, message: '删除成功' });
     } catch (error) {
-        log('error', '多重刪除失敗:', error);
+        log('error', '多重删除失败:', error);
         res.status(500).json({ success: false, message: '删除失败: ' + error.message });
     }
 });
@@ -790,7 +798,7 @@ app.post('/rename', requireLogin, async (req, res) => {
     try {
         const { id, newName, type } = req.body;
         const userId = req.session.userId;
-        log('info', `重命名請求: type=${type}, id=${id}, newName=${newName}, user=${userId}`);
+        log('info', `重命名请求: type=${type}, id=${id}, newName=${newName}, user=${userId}`);
         if (!id || !newName || !type) {
             return res.status(400).json({ success: false, message: '缺少必要参数。'});
         }
@@ -805,7 +813,7 @@ app.post('/rename', requireLogin, async (req, res) => {
         }
         res.json(result);
     } catch (error) { 
-        log('error', `重命名失敗:`, error);
+        log('error', `重命名失败:`, error);
         res.status(500).json({ success: false, message: '重命名失败: ' + error.message }); 
     }
 });
@@ -934,7 +942,6 @@ app.post('/api/cancel-share', requireLogin, async (req, res) => {
 
 // --- Scanner Endpoints ---
 app.post('/api/scan/webdav', requireAdmin, async (req, res) => {
-    // --- *** 关键修正 开始 *** ---
     const { userId, mountId } = req.body;
     const log = [];
     try {
@@ -987,7 +994,6 @@ app.post('/api/scan/webdav', requireAdmin, async (req, res) => {
         log.push({ message: `挂载点 ${mountConfig.mount_name} 扫描完成。`, type: 'success' });
         
         res.json({ success: true, log });
-    // --- *** 关键修正 结束 *** ---
     } catch (error) {
         let errorMessage = error.message;
         if (error.response && error.response.status === 403) {
@@ -1007,20 +1013,15 @@ app.get('/share/view/file/:token', async (req, res) => {
         if (fileInfo) {
             const downloadUrl = `/share/download/file/${token}`;
             
-            // --- *** 关键修正 开始 *** ---
-            // 检查是否为纯文字文件
             if (fileInfo.mimetype && fileInfo.mimetype.startsWith('text/')) {
                 const storage = storageManager.getStorage();
                 const stream = await storage.stream(fileInfo.file_id);
                 
-                // 直接以纯文字形式输出，不渲染 HTML
                 res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-                handleStream(stream, res); // 使用已有的 handleStream 函数处理流
-                return; // 结束执行，防止后续代码渲染模板
+                handleStream(stream, res);
+                return;
             }
-            // --- *** 关键修正 结束 *** ---
 
-            // 对于非文字文件，保持原有的预览页面逻辑
             res.render('share-view', { file: fileInfo, downloadUrl, textContent: null });
         } else {
             res.status(404).render('share-error', { message: '此分享链接无效或已过期。' });
@@ -1051,7 +1052,7 @@ function handleStream(stream, res) {
         if (!res.headersSent) {
             res.status(500).send('读取文件流时发生错误');
         }
-        res.end(); // 确保响应结束
+        res.end();
     }).pipe(res);
 }
 
