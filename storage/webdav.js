@@ -1,31 +1,31 @@
-// storage/webdav.js - 完整重构版
+// storage/webdav.js - 完整重構版
 
-// CommonJS 模块保持不变
+// CommonJS 模塊保持不變
 const crypto = require('crypto');
 const fsp = require('fs').promises;
 const fs = require('fs');
 const path = require('path');
 
-// --- WebDAV 模块加载器 ---
-// 为动态导入的 ES Module 创建一个占位符
+// --- WebDAV 模塊加載器 ---
+// 為動態導入的 ES Module 創建一個佔位符
 let createClient;
 
-// 使用一个异步函数来动态导入 ES Module
+// 使用一個異步函數來動態導入 ES Module
 async function initializeWebdavModule() {
-    // 这个if判断确保了 'webdav' 包在整个应用生命周期中只被导入一次
+    // 這個if判斷確保了 'webdav' 包在整個應用生命周期中只被導入一次
     if (!createClient) {
-        // 使用动态 import() 异步加载 ES Module
+        // 使用動態 import() 異步加載 ES Module
         const webdavModule = await import('webdav');
         createClient = webdavModule.createClient;
-        log('info', 'WebDAV 模块已动态加载。');
+        log('info', 'WebDAV 模塊已動態加載。');
     }
 }
 
 const CONFIG_FILE = path.join(__dirname, '..', 'data', 'config.json');
 
-// --- 辅助函数：日志记录 ---
+// --- 輔助函數：日誌記錄 ---
 function log(level, message, ...args) {
-    if (level === 'debug') return; // 移除调试日志
+    if (level === 'debug') return; // 移除調試日誌
     const timestamp = new Date().toISOString();
     console.log(`[${timestamp}] [WEBDAV] [${level.toUpperCase()}] ${message}`, ...args);
 }
@@ -33,7 +33,7 @@ function log(level, message, ...args) {
 let clients = {};
 let webdavConfigs = [];
 
-// 独立加载配置的函数
+// 獨立加載配置的函數
 function loadWebdavConfigs() {
     try {
         if (fs.existsSync(CONFIG_FILE)) {
@@ -54,26 +54,26 @@ function loadWebdavConfigs() {
         } else {
             webdavConfigs = [];
         }
-        log('info', `已加载 ${webdavConfigs.length} 个 WebDAV 配置。`);
+        log('info', `已加載 ${webdavConfigs.length} 個 WebDAV 配置。`);
     } catch (error) {
-        log('error', "在 webdav.js 中读取设置文件失败:", error);
+        log('error', "在 webdav.js 中讀取設置文件失敗:", error);
         webdavConfigs = [];
     }
 }
 
-// 在模块加载时立即读取配置
+// 在模塊加載時立即讀取配置
 loadWebdavConfigs();
 
-// getClient 函数现在必须是异步的，因为它依赖于异步加载的 createClient
+// getClient 函數現在必須是異步的，因為它依賴於異步加載的 createClient
 async function getClient(config) {
-    await initializeWebdavModule(); // 确保在使用 createClient 之前它已经被加载
+    await initializeWebdavModule(); // 確保在使用 createClient 之前它已經被加載
 
     if (!config || !config.id) {
-        throw new Error('无效的 WebDAV 配置传入 getClient');
+        throw new Error('無效的 WebDAV 配置傳入 getClient');
     }
     if (!clients[config.id]) {
-        if (!config.url || !config.username) throw new Error(`WebDAV 设置不完整 (ID: ${config.id})。`);
-        // 现在可以安全地使用 createClient
+        if (!config.url || !config.username) throw new Error(`WebDAV 設置不完整 (ID: ${config.id})。`);
+        // 現在可以安全地使用 createClient
         clients[config.id] = createClient(config.url, {
             username: config.username,
             password: config.password
@@ -92,7 +92,7 @@ function resetClient() {
 function getConfigForMount(mountName) {
     if (webdavConfigs.length === 0) loadWebdavConfigs();
     const config = webdavConfigs.find(c => c.mount_name === mountName);
-    if (!config) throw new Error(`找不到名为 "${mountName}" 的 WebDAV 挂载点。`);
+    if (!config) throw new Error(`找不到名為 "${mountName}" 的 WebDAV 掛載點。`);
     return config;
 }
 
@@ -100,7 +100,6 @@ async function upload(tempFilePath, fileName, mimetype, userId, folderPathInfo) 
     const { mountName, remotePath: folderPath } = folderPathInfo;
     log('info', `開始上傳到 WebDAV: mount=${mountName}, path=${folderPath}, file=${fileName}`);
     const config = getConfigForMount(mountName);
-    // 由于 getClient 是异步的，这里必须使用 await
     const client = await getClient(config);
     const remoteFilePath = path.posix.join(folderPath, fileName);
 
@@ -108,20 +107,19 @@ async function upload(tempFilePath, fileName, mimetype, userId, folderPathInfo) 
         try {
             await client.createDirectory(folderPath, { recursive: true });
         } catch (e) {
-            // 405 Method Not Allowed, 501 Not Implemented: 某些服务器不支持创建已存在的目录，可忽略
             if (e.response && (e.response.status !== 405 && e.response.status !== 501)) {
-                 throw new Error(`创建 WebDAV 目录失败 (${e.response.status}): ${e.message}`);
+                 throw new Error(`創建 WebDAV 目錄失敗 (${e.response.status}): ${e.message}`);
             }
         }
     }
 
-    const fileBuffer = await fsp.readFile(tempFilePath);
-    await client.putFileContents(remoteFilePath, fileBuffer, { overwrite: true });
+    const readStream = fs.createReadStream(tempFilePath);
+    await client.putFileContents(remoteFilePath, readStream, { overwrite: true });
+
     log('info', `檔案 ${remoteFilePath} 已成功上傳到 WebDAV。`);
     
     const stat = await client.stat(remoteFilePath);
     const messageId = Date.now() * 1000 + crypto.randomInt(1000);
-    
     const fullDbPath = path.posix.join('/', mountName, remoteFilePath);
 
     return {
@@ -151,11 +149,9 @@ async function remove(itemsToRemove) {
     for (const mountName in itemsByMount) {
         try {
             const config = getConfigForMount(mountName);
-            // 由于 getClient 是异步的，这里必须使用 await
             const client = await getClient(config);
             const allItems = itemsByMount[mountName];
 
-            // 优先删除子项，所以按路径深度降序排序
             allItems.sort((a, b) => b.remotePath.length - a.remotePath.length);
 
             for (const item of allItems) {
@@ -167,9 +163,8 @@ async function remove(itemsToRemove) {
                         log('warn', `試圖刪除但遠端路徑不存在: [${mountName}]${item.remotePath}`);
                     }
                 } catch (error) {
-                    // 404 Not Found 错误可以安全忽略
                     if (!(error.response && error.response.status === 404)) {
-                        const errorMessage = `删除 WebDAV [${mountName}${item.remotePath}] 失败: ${error.message}`;
+                        const errorMessage = `刪除 WebDAV [${mountName}${item.remotePath}] 失敗: ${error.message}`;
                         results.errors.push(errorMessage);
                         results.success = false;
                         log('error', errorMessage);
@@ -177,7 +172,7 @@ async function remove(itemsToRemove) {
                 }
             }
         } catch (error) {
-             results.errors.push(`处理挂载点 "${mountName}" 的删除时出错: ${error.message}`);
+             results.errors.push(`處理掛載點 "${mountName}" 的刪除時出錯: ${error.message}`);
              results.success = false;
              log('error', `處理掛載點 "${mountName}" 的刪除時出錯:`, error);
         }
@@ -186,14 +181,12 @@ async function remove(itemsToRemove) {
 }
 
 async function stream(fileDbPath) {
-    // 确保在使用 createClient 之前它已经被加载
     await initializeWebdavModule();
     const parts = fileDbPath.split('/').filter(Boolean);
     const mountName = parts[0];
     const remotePath = '/' + parts.slice(1).join('/');
 
     const config = getConfigForMount(mountName);
-    // 此处每次都创建新客户端，以确保流操作的独立性
     const streamClient = createClient(config.url, {
         username: config.username,
         password: config.password
@@ -208,7 +201,6 @@ async function moveFile(oldPathInfo, newPathInfo) {
     log('info', `物理移動: from=${oldRemotePath} to=${newRemotePath} on mount=${mountName}`);
 
     const config = getConfigForMount(mountName);
-    // 由于 getClient 是异步的，这里必须使用 await
     const client = await getClient(config);
 
     try {
@@ -224,7 +216,7 @@ async function moveFile(oldPathInfo, newPathInfo) {
         }
     } catch(err) {
         if (!(err.response && err.response.status === 404)) {
-           throw new Error(`物理移动文件失败: ${err.message}`);
+           throw new Error(`物理移動文件失敗: ${err.message}`);
         }
     }
 }
@@ -232,7 +224,6 @@ async function moveFile(oldPathInfo, newPathInfo) {
 async function createDirectory(folderPathInfo) {
     const { mountName, remotePath } = folderPathInfo;
     const config = getConfigForMount(mountName);
-    // 由于 getClient 是异步的，这里必须使用 await
     const client = await getClient(config);
     try {
         if (remotePath && remotePath !== '/') {
@@ -246,11 +237,10 @@ async function createDirectory(folderPathInfo) {
             return true; 
         }
         log('error', `創建 WebDAV 目錄失敗:`, e);
-        throw new Error(`创建 WebDAV 目录失败: ${e.message}`);
+        throw new Error(`創建 WebDAV 目錄失敗: ${e.message}`);
     }
 }
 
-// 导出的接口保持不变
 module.exports = { 
     type: 'webdav',
     upload, 
