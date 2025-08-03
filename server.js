@@ -54,7 +54,7 @@ const upload = multer({
     storage: diskStorage, 
     limits: { fileSize: '1024MB' } 
 });
-const PORT = process.env.PORT || 8100;
+const PORT = process.env.PORT || 25800;
 
 app.use(session({
   secret: process.env.SESSION_SECRET || 'your-strong-random-secret-here-please-change',
@@ -1093,3 +1093,4 @@ app.get('/share/download/:folderToken/:fileId', async (req, res) => {
 
 
 app.listen(PORT, () => console.log(`✅ 服务器已在 http://localhost:${PORT} 上运行`));
+
