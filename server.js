@@ -1,3 +1,5 @@
+// server.js
+
 require('dotenv').config();
 const express = require('express');
 const session = require('express-session');
@@ -1004,22 +1006,28 @@ app.get('/share/view/file/:token', async (req, res) => {
         const fileInfo = await data.getFileByShareToken(token);
         if (fileInfo) {
             const downloadUrl = `/share/download/file/${token}`;
-            let textContent = null;
+            
+            // --- *** 关键修正 开始 *** ---
+            // 检查是否为纯文字文件
             if (fileInfo.mimetype && fileInfo.mimetype.startsWith('text/')) {
                 const storage = storageManager.getStorage();
                 const stream = await storage.stream(fileInfo.file_id);
-                 textContent = await new Promise((resolve, reject) => {
-                    let data = '';
-                    stream.on('data', chunk => data += chunk);
-                    stream.on('end', () => resolve(data));
-                    stream.on('error', err => reject(err));
-                });
+                
+                // 直接以纯文字形式输出，不渲染 HTML
+                res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+                handleStream(stream, res); // 使用已有的 handleStream 函数处理流
+                return; // 结束执行，防止后续代码渲染模板
             }
-            res.render('share-view', { file: fileInfo, downloadUrl, textContent });
+            // --- *** 关键修正 结束 *** ---
+
+            // 对于非文字文件，保持原有的预览页面逻辑
+            res.render('share-view', { file: fileInfo, downloadUrl, textContent: null });
         } else {
             res.status(404).render('share-error', { message: '此分享链接无效或已过期。' });
         }
-    } catch (error) { res.status(500).render('share-error', { message: '处理分享请求时发生错误。' }); }
+    } catch (error) { 
+        res.status(500).render('share-error', { message: '处理分享请求时发生错误。' }); 
+    }
 });
 
 app.get('/share/view/folder/:token', async (req, res) => {
