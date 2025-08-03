@@ -10,6 +10,7 @@ const UPLOAD_DIR = path.resolve(__dirname, 'data', 'uploads');
 
 // --- 輔助函數：日誌記錄 ---
 function log(level, message, ...args) {
+    if (level === 'debug') return; // 移除调试日志
     const timestamp = new Date().toISOString();
     console.log(`[${timestamp}] [DATA] [${level.toUpperCase()}] ${message}`, ...args);
 }
@@ -24,7 +25,6 @@ async function getWebdavPathInfo(folderId, userId) {
     }
     const mountName = pathParts[1].name;
     const remotePath = '/' + pathParts.slice(2).map(p => p.name).join('/');
-    log('debug', `getWebdavPathInfo: folderId=${folderId}, mountName=${mountName}, remotePath=${remotePath}`);
     return { mountName, remotePath: remotePath || '/' };
 }
 
@@ -321,7 +321,6 @@ function getAllFolders(userId) {
 async function moveItem(itemId, itemType, targetFolderId, userId, options = {}) {
     const { resolutions = {}, pathPrefix = '' } = options;
     const report = { moved: 0, skipped: 0, errors: 0 };
-    log('debug', `moveItem: itemId=${itemId}, type=${itemType}, target=${targetFolderId}, prefix=${pathPrefix}`);
     
     const sourceMount = await getMountNameForId(itemId, itemType, userId);
     const targetMount = await getMountNameForId(targetFolderId, 'folder', userId);
@@ -340,7 +339,6 @@ async function moveItem(itemId, itemType, targetFolderId, userId, options = {}) 
     const currentPath = path.posix.join(pathPrefix, sourceItem.name).replace(/\\/g, '/');
     const existingItemInTarget = await findItemInFolder(sourceItem.name, targetFolderId, userId);
     const resolutionAction = resolutions[currentPath] || (existingItemInTarget ? 'skip_default' : 'move');
-    log('debug', `moveItem: currentPath=${currentPath}, resolution=${resolutionAction}`);
 
     switch (resolutionAction) {
         case 'skip':
@@ -435,14 +433,12 @@ async function unifiedDelete(itemId, itemType, userId) {
         }
     }
     
-    log('debug', 'unifiedDelete: Physical items to delete:', itemsForStorage);
     try {
         await storage.remove(itemsForStorage);
     } catch (err) {
         throw new Error(`实体删除失败，操作已中止: ${err.message}`);
     }
     
-    log('debug', `unifiedDelete: DB files to delete: ${fileIdsToDelete.join(',')}, folders: ${folderIdsToDelete.join(',')}`);
     await executeDeletion(fileIdsToDelete, folderIdsToDelete, userId);
 }
 
@@ -458,7 +454,6 @@ async function moveSingleItem(itemId, itemType, targetFolderId, userId) {
             if(!file) throw new Error("找不到要移动的文件");
             const oldPathInfo = getWebdavPathInfoFromFileId(file.file_id);
             const newPath = { ...newPathInfo, remotePath: path.posix.join(newPathInfo.remotePath, file.fileName) };
-            log('debug', `moveSingleItem (file): Moving from ${oldPathInfo.remotePath} to ${newPath.remotePath}`);
             
             await storage.moveFile(oldPathInfo, newPath);
 
@@ -473,7 +468,6 @@ async function moveSingleItem(itemId, itemType, targetFolderId, userId) {
             const oldRemotePath = '/' + oldPathParts.slice(1).map(p => p.name).join('/');
             
             const newPath = { ...newPathInfo, remotePath: path.posix.join(newPathInfo.remotePath, folder.name) };
-            log('debug', `moveSingleItem (folder): Moving from ${oldRemotePath} to ${newPath.remotePath}`);
 
             await storage.moveFile({mountName: oldMountName, remotePath: oldRemotePath}, newPath);
 
