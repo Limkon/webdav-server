@@ -11,6 +11,7 @@ const bcrypt = require('bcrypt');
 const fs = require('fs');
 const fsp = require('fs').promises;
 const crypto = require('crypto');
+const { Readable } = require('stream'); // *** 新增：为纯流式文字上传引入模組 ***
 const db = require('./database.js'); 
 
 const data = require('./data.js');
@@ -28,7 +29,7 @@ function log(level, message, ...args) {
 function WebDAVStreamStorage() {}
 
 WebDAVStreamStorage.prototype._handleFile = async function _handleFile(req, file, cb) {
-    // --- *** 关键修正 开始 *** ---
+    // --- *** 关键修正 #1：总是正确处理档名编码 *** ---
     const originalname = Buffer.from(file.originalname, 'latin1').toString('utf8');
     
     try {
@@ -36,30 +37,39 @@ WebDAVStreamStorage.prototype._handleFile = async function _handleFile(req, file
         const userId = req.session.userId;
         const resolutions = req.body.resolutions ? JSON.parse(req.body.resolutions) : {};
 
+        // --- *** 关键修正 #2：增加对 folderId 的有效性检查 *** ---
+        if (isNaN(initialFolderId)) {
+            throw new Error('无效或缺失的目标文件夹ID (folderId)');
+        }
+
         if (req.fileProcessingIndex === undefined) {
             req.fileProcessingIndex = 0;
         }
         
-        let relativePath;
-        if (Array.isArray(req.body.relativePaths)) {
-            relativePath = req.body.relativePaths[req.fileProcessingIndex];
-        } else if (typeof req.body.relativePaths === 'string') {
-            relativePath = req.fileProcessingIndex === 0 ? req.body.relativePaths : originalname;
-        } else {
-            relativePath = originalname;
+        // --- *** 关键修正 #3：更稳健地获取 relativePath *** ---
+        let relativePath = originalname; // 默认为原始文件名
+        if (req.body.relativePaths) {
+            if (Array.isArray(req.body.relativePaths) && req.body.relativePaths[req.fileProcessingIndex]) {
+                relativePath = req.body.relativePaths[req.fileProcessingIndex];
+            } else if (typeof req.body.relativePaths === 'string') {
+                 // 如果只有一个 relativePaths 字段，只对第一个文件使用它
+                relativePath = req.fileProcessingIndex === 0 ? req.body.relativePaths : originalname;
+            }
         }
         req.fileProcessingIndex++;
-        // --- *** 关键修正 结束 *** ---
         
         const pathParts = (relativePath || originalname).split('/');
         let fileName = pathParts.pop() || originalname;
         const folderPathParts = pathParts;
 
         const targetFolderId = await data.resolvePathToFolderId(initialFolderId, folderPathParts, userId);
+        
         if (!targetFolderId) {
+             // 这个错误现在不太可能发生，因为 resolvePathToFolderId 会创建路径，但保留以防万一
             throw new Error(`无法为路径 "${relativePath}" 解析或创建目标文件夹`);
         }
         
+        // --- 冲突处理逻辑 ---
         const conflict = await data.findItemInFolder(fileName, targetFolderId, userId);
         const action = resolutions[relativePath] || (conflict ? 'skip_default' : 'upload');
 
@@ -497,19 +507,17 @@ app.post('/api/text-file', requireLogin, async (req, res) => {
     const { mode, fileId, folderId, fileName, content } = req.body;
     const userId = req.session.userId;
     const storage = storageManager.getStorage();
-    log('info', `文字檔案操作: mode=${mode}, fileId=${fileId}, fileName=${fileName}`);
+    log('info', `文字档案操作: mode=${mode}, fileId=${fileId}, fileName=${fileName}`);
 
     if (!fileName || !fileName.endsWith('.txt')) {
         return res.status(400).json({ success: false, message: '文件名无效或不是 .txt 文件' });
     }
-
-    const tempFilePath = path.join(__dirname, 'data', 'tmp', `${Date.now()}-${crypto.randomBytes(8).toString('hex')}.txt`);
+    
+    // --- *** 关键修正：直接从内容创建流，不写暂存盘 *** ---
+    const contentStream = Readable.from([content]);
+    const contentLength = Buffer.byteLength(content, 'utf8');
 
     try {
-        await fsp.writeFile(tempFilePath, content, 'utf8');
-        const fileStats = await fsp.stat(tempFilePath);
-        const readStream = fs.createReadStream(tempFilePath);
-        
         let result;
         let finalFolderId;
 
@@ -522,43 +530,31 @@ app.post('/api/text-file', requireLogin, async (req, res) => {
                 if (fileName !== originalFile.fileName) {
                     const conflict = await data.checkFullConflict(fileName, finalFolderId, userId);
                     if (conflict) {
-                        readStream.destroy();
-                        await fsp.unlink(tempFilePath).catch(err => {});
                         return res.status(409).json({ success: false, message: '同目录下已存在同名文件或文件夹。' });
                     }
                 }
                 await data.unifiedDelete(originalFile.message_id, 'file', userId);
             } else {
-                 readStream.destroy();
-                 await fsp.unlink(tempFilePath).catch(err => {});
                  return res.status(404).json({ success: false, message: '找不到要编辑的原始文件' });
             }
         } else if (mode === 'create' && folderId) {
              const conflict = await data.checkFullConflict(fileName, folderId, userId);
             if (conflict) {
-                readStream.destroy();
-                await fsp.unlink(tempFilePath).catch(err => {});
                 return res.status(409).json({ success: false, message: '同目录下已存在同名文件或文件夹。' });
             }
             finalFolderId = folderId;
         } else {
-            readStream.destroy();
-            await fsp.unlink(tempFilePath).catch(err => {});
             return res.status(400).json({ success: false, message: '请求参数无效' });
         }
         
         const folderPathInfo = await data.getWebdavPathInfo(finalFolderId, userId);
-        result = await storage.upload(readStream, fileName, 'text/plain', userId, folderPathInfo, { contentLength: fileStats.size });
+        result = await storage.upload(contentStream, fileName, 'text/plain', userId, folderPathInfo, { contentLength });
         const dbResult = await data.addFile(result.dbData, finalFolderId, userId, 'webdav');
 
         res.json({ success: true, fileId: dbResult.fileId });
     } catch (error) {
         log('error', `储存文字档案失败:`, error);
         res.status(500).json({ success: false, message: '服务器内部错误' });
-    } finally {
-        if (fs.existsSync(tempFilePath)) {
-            await fsp.unlink(tempFilePath).catch(err => {});
-        }
     }
 });
 
