@@ -6,12 +6,12 @@ const session = require('express-session');
 const multer = require('multer');
 const path = require('path');
 const axios = require('axios');
-const archiver = require('archiver');
+const archiver =require('archiver');
 const bcrypt = require('bcrypt');
 const fs = require('fs');
 const fsp = require('fs').promises;
 const crypto = require('crypto');
-const { Readable } = require('stream'); // *** 新增：为纯流式文字上传引入模組 ***
+const { Readable } = require('stream');
 const db = require('./database.js'); 
 
 const data = require('./data.js');
@@ -29,30 +29,31 @@ function log(level, message, ...args) {
 function WebDAVStreamStorage() {}
 
 WebDAVStreamStorage.prototype._handleFile = async function _handleFile(req, file, cb) {
-    // --- *** 关键修正 #1：总是正确处理档名编码 *** ---
     const originalname = Buffer.from(file.originalname, 'latin1').toString('utf8');
     
     try {
-        const initialFolderId = parseInt(req.body.folderId, 10);
+        // --- *** 关键修正：从 URL 查询参数获取 folderId 来避免竞争条件 *** ---
+        const initialFolderId = parseInt(req.query.folderId, 10);
         const userId = req.session.userId;
+        
+        // Multer 处理完所有文本字段后，req.body 才可用。resolutions 可以在这里安全读取
         const resolutions = req.body.resolutions ? JSON.parse(req.body.resolutions) : {};
 
-        // --- *** 关键修正 #2：增加对 folderId 的有效性检查 *** ---
+        // 增加对 folderId 的有效性检查
         if (isNaN(initialFolderId)) {
-            throw new Error('无效或缺失的目标文件夹ID (folderId)');
+            throw new Error('无效或缺失的目标文件夹ID (folderId)。请确保 folderId 作为 URL 查询参数提供，例如：/upload?folderId=123');
         }
 
         if (req.fileProcessingIndex === undefined) {
             req.fileProcessingIndex = 0;
         }
         
-        // --- *** 关键修正 #3：更稳健地获取 relativePath *** ---
-        let relativePath = originalname; // 默认为原始文件名
+        // 稳健地获取 relativePath
+        let relativePath = originalname;
         if (req.body.relativePaths) {
             if (Array.isArray(req.body.relativePaths) && req.body.relativePaths[req.fileProcessingIndex]) {
                 relativePath = req.body.relativePaths[req.fileProcessingIndex];
             } else if (typeof req.body.relativePaths === 'string') {
-                 // 如果只有一个 relativePaths 字段，只对第一个文件使用它
                 relativePath = req.fileProcessingIndex === 0 ? req.body.relativePaths : originalname;
             }
         }
@@ -65,11 +66,9 @@ WebDAVStreamStorage.prototype._handleFile = async function _handleFile(req, file
         const targetFolderId = await data.resolvePathToFolderId(initialFolderId, folderPathParts, userId);
         
         if (!targetFolderId) {
-             // 这个错误现在不太可能发生，因为 resolvePathToFolderId 会创建路径，但保留以防万一
             throw new Error(`无法为路径 "${relativePath}" 解析或创建目标文件夹`);
         }
         
-        // --- 冲突处理逻辑 ---
         const conflict = await data.findItemInFolder(fileName, targetFolderId, userId);
         const action = resolutions[relativePath] || (conflict ? 'skip_default' : 'upload');
 
@@ -115,8 +114,22 @@ WebDAVStreamStorage.prototype._handleFile = async function _handleFile(req, file
     }
 };
 
+
 WebDAVStreamStorage.prototype._removeFile = function _removeFile(req, file, cb) {
   cb(null);
+};
+
+// 在 Multer 的 fileFilter 中等待正文解析完成
+const waitForBody = (req, res, next) => {
+    if (req.body) {
+        return next();
+    }
+    const busboy = req.busboy;
+    if (busboy) {
+        busboy.on('finish', () => next());
+    } else {
+        next();
+    }
 };
 
 const streamUpload = multer({
@@ -477,6 +490,9 @@ app.delete('/api/admin/webdav/:id', requireAdmin, async (req, res) => {
     }
 });
 
+
+// 在调用 multer 中间件之前，我们确保其他字段（如果需要）已被解析
+// 但对于此特定问题，将 folderId 移至查询参数是更根本的解决方案
 app.post('/upload', requireLogin, (req, res) => {
     const uploadProcessor = streamUpload.any();
     
@@ -486,11 +502,13 @@ app.post('/upload', requireLogin, (req, res) => {
             if (err.code === 'LIMIT_FILE_SIZE') {
                 return res.status(413).json({ success: false, message: '文件大小超出限制。' });
             }
+            // 将我们的自定义错误消息传递给客户端
             return res.status(500).json({ success: false, message: '上传时发生错误: ' + err.message });
         }
         
-        const results = req.files.filter(f => !f.skipped);
-        const skippedCount = req.files.length - results.length;
+        // 确保 req.files 存在
+        const results = req.files ? req.files.filter(f => !f.skipped) : [];
+        const skippedCount = req.files ? (req.files.length - results.length) : 0;
         
         log('info', `上传处理完成: ${results.length} 个文件成功, ${skippedCount} 个文件跳过。`);
 
@@ -513,7 +531,7 @@ app.post('/api/text-file', requireLogin, async (req, res) => {
         return res.status(400).json({ success: false, message: '文件名无效或不是 .txt 文件' });
     }
     
-    // --- *** 关键修正：直接从内容创建流，不写暂存盘 *** ---
+    // 从内容创建流，不写暂存盘
     const contentStream = Readable.from([content]);
     const contentLength = Buffer.byteLength(content, 'utf8');
 
@@ -575,12 +593,17 @@ app.get('/api/file-info/:id', requireLogin, async (req, res) => {
 
 app.post('/api/check-existence', requireLogin, async (req, res) => {
     try {
-        const { files: filesToCheck, folderId: initialFolderId } = req.body;
+        // *** 重要：确保这里也从查询参数获取 folderId ***
+        const { files: filesToCheck } = req.body;
+        const initialFolderId = parseInt(req.query.folderId, 10);
         const userId = req.session.userId;
 
-        if (!filesToCheck || !Array.isArray(filesToCheck) || !initialFolderId) {
-            return res.status(400).json({ success: false, message: '无效的请求参数。' });
+        if (!filesToCheck || !Array.isArray(filesToCheck) || isNaN(initialFolderId)) {
+            return res.status(400).json({ success: false, message: '无效的请求参数。请确保 folderId 在 URL 查询中提供。' });
         }
+
+        // multer 处理后，req.body 才完整，所以我们可以在这里读取 resolutions
+        const resolutions = req.body.resolutions ? JSON.parse(req.body.resolutions) : {};
 
         const existenceChecks = await Promise.all(
             filesToCheck.map(async (fileInfo) => {
