@@ -28,32 +28,38 @@ function log(level, message, ...args) {
 function WebDAVStreamStorage() {}
 
 WebDAVStreamStorage.prototype._handleFile = async function _handleFile(req, file, cb) {
+    // --- *** 关键修正 开始 *** ---
+    const originalname = Buffer.from(file.originalname, 'latin1').toString('utf8');
+    
     try {
-        // Multer 会先处理表单字段，所以 req.body 在这里是可用的
         const initialFolderId = parseInt(req.body.folderId, 10);
         const userId = req.session.userId;
         const resolutions = req.body.resolutions ? JSON.parse(req.body.resolutions) : {};
-        const originalname = Buffer.from(file.originalname, 'latin1').toString('utf8');
 
-        // 为每个请求维护一个档案计数器，以正确匹配 relativePaths
         if (req.fileProcessingIndex === undefined) {
             req.fileProcessingIndex = 0;
         }
-        const relativePaths = Array.isArray(req.body.relativePaths) ? req.body.relativePaths : [req.body.relativePaths];
-        const relativePath = relativePaths[req.fileProcessingIndex];
+        
+        let relativePath;
+        if (Array.isArray(req.body.relativePaths)) {
+            relativePath = req.body.relativePaths[req.fileProcessingIndex];
+        } else if (typeof req.body.relativePaths === 'string') {
+            relativePath = req.fileProcessingIndex === 0 ? req.body.relativePaths : originalname;
+        } else {
+            relativePath = originalname;
+        }
         req.fileProcessingIndex++;
+        // --- *** 关键修正 结束 *** ---
         
         const pathParts = (relativePath || originalname).split('/');
         let fileName = pathParts.pop() || originalname;
         const folderPathParts = pathParts;
 
-        // *** 关键修正：确保在上传前解析或创建完整的文件夹路径 ***
         const targetFolderId = await data.resolvePathToFolderId(initialFolderId, folderPathParts, userId);
         if (!targetFolderId) {
             throw new Error(`无法为路径 "${relativePath}" 解析或创建目标文件夹`);
         }
         
-        // --- 冲突处理逻辑 ---
         const conflict = await data.findItemInFolder(fileName, targetFolderId, userId);
         const action = resolutions[relativePath] || (conflict ? 'skip_default' : 'upload');
 
@@ -80,14 +86,12 @@ WebDAVStreamStorage.prototype._handleFile = async function _handleFile(req, file
         const storage = storageManager.getStorage();
         const folderPathInfo = await data.getWebdavPathInfo(targetFolderId, userId);
 
-        // --- 核心：将档案流直接上传到 WebDAV ---
         const result = await storage.upload(file.stream, fileName, file.mimetype, userId, folderPathInfo, {
-            contentLength: req.headers['content-length'] // 传递整个请求的大小以供参考
+            contentLength: req.headers['content-length']
         });
         
         const dbResult = await data.addFile(result.dbData, targetFolderId, userId, storage.type);
 
-        // 将成功的结果传递给 multer，最终会附加到 req.files
         cb(null, {
             ...result,
             ...dbResult,
@@ -96,20 +100,18 @@ WebDAVStreamStorage.prototype._handleFile = async function _handleFile(req, file
             relativePath: relativePath
         });
     } catch (err) {
-        log('error', `流式上传处理档案 ${file.originalname} 时失败:`, err);
-        // 消耗掉流以防止请求挂起
+        log('error', `流式上传处理档案 ${originalname} 时失败:`, err);
         file.stream.on('error', (e) => cb(e)).on('data', () => {}).on('end', () => cb(err));
     }
 };
 
 WebDAVStreamStorage.prototype._removeFile = function _removeFile(req, file, cb) {
-  // 因为没有暂存档案，所以这里什么都不用做
   cb(null);
 };
 
 const streamUpload = multer({
     storage: new WebDAVStreamStorage(),
-    limits: { fileSize: '1024MB' } // 限制依然有效
+    limits: { fileSize: '1024MB' }
 });
 
 const PORT = process.env.PORT || 25800;
