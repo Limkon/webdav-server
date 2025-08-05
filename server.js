@@ -47,12 +47,12 @@ WebDAVStreamStorage.prototype._handleFile = async function _handleFile(req, file
         let fileName = pathParts.pop() || originalname;
         const folderPathParts = pathParts;
 
-        // 解析路径并确保目标资料夹存在
-        let targetFolderId = await data.findFolderByPath(initialFolderId, folderPathParts, userId);
-        if (targetFolderId === null) { 
-             targetFolderId = await data.resolvePathToFolderId(initialFolderId, folderPathParts, userId);
+        // *** 关键修正：确保在上传前解析或创建完整的文件夹路径 ***
+        const targetFolderId = await data.resolvePathToFolderId(initialFolderId, folderPathParts, userId);
+        if (!targetFolderId) {
+            throw new Error(`无法为路径 "${relativePath}" 解析或创建目标文件夹`);
         }
-
+        
         // --- 冲突处理逻辑 ---
         const conflict = await data.findItemInFolder(fileName, targetFolderId, userId);
         const action = resolutions[relativePath] || (conflict ? 'skip_default' : 'upload');
@@ -501,7 +501,7 @@ app.post('/api/text-file', requireLogin, async (req, res) => {
         return res.status(400).json({ success: false, message: '文件名无效或不是 .txt 文件' });
     }
 
-    const tempFilePath = path.join(TMP_DIR, `${Date.now()}-${crypto.randomBytes(8).toString('hex')}.txt`);
+    const tempFilePath = path.join(__dirname, 'data', 'tmp', `${Date.now()}-${crypto.randomBytes(8).toString('hex')}.txt`);
 
     try {
         await fsp.writeFile(tempFilePath, content, 'utf8');
