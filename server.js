@@ -119,22 +119,8 @@ WebDAVStreamStorage.prototype._removeFile = function _removeFile(req, file, cb) 
   cb(null);
 };
 
-// 在 Multer 的 fileFilter 中等待正文解析完成
-const waitForBody = (req, res, next) => {
-    if (req.body) {
-        return next();
-    }
-    const busboy = req.busboy;
-    if (busboy) {
-        busboy.on('finish', () => next());
-    } else {
-        next();
-    }
-};
-
 const streamUpload = multer({
-    storage: new WebDAVStreamStorage(),
-    limits: { fileSize: '1024MB' }
+    storage: new WebDAVStreamStorage()
 });
 
 const PORT = process.env.PORT || 25800;
@@ -491,8 +477,6 @@ app.delete('/api/admin/webdav/:id', requireAdmin, async (req, res) => {
 });
 
 
-// 在调用 multer 中间件之前，我们确保其他字段（如果需要）已被解析
-// 但对于此特定问题，将 folderId 移至查询参数是更根本的解决方案
 app.post('/upload', requireLogin, (req, res) => {
     const uploadProcessor = streamUpload.any();
     
@@ -502,11 +486,9 @@ app.post('/upload', requireLogin, (req, res) => {
             if (err.code === 'LIMIT_FILE_SIZE') {
                 return res.status(413).json({ success: false, message: '文件大小超出限制。' });
             }
-            // 将我们的自定义错误消息传递给客户端
             return res.status(500).json({ success: false, message: '上传时发生错误: ' + err.message });
         }
         
-        // 确保 req.files 存在
         const results = req.files ? req.files.filter(f => !f.skipped) : [];
         const skippedCount = req.files ? (req.files.length - results.length) : 0;
         
@@ -531,7 +513,6 @@ app.post('/api/text-file', requireLogin, async (req, res) => {
         return res.status(400).json({ success: false, message: '文件名无效或不是 .txt 文件' });
     }
     
-    // 从内容创建流，不写暂存盘
     const contentStream = Readable.from([content]);
     const contentLength = Buffer.byteLength(content, 'utf8');
 
@@ -593,7 +574,6 @@ app.get('/api/file-info/:id', requireLogin, async (req, res) => {
 
 app.post('/api/check-existence', requireLogin, async (req, res) => {
     try {
-        // *** 重要：确保这里也从查询参数获取 folderId ***
         const { files: filesToCheck } = req.body;
         const initialFolderId = parseInt(req.query.folderId, 10);
         const userId = req.session.userId;
@@ -601,9 +581,6 @@ app.post('/api/check-existence', requireLogin, async (req, res) => {
         if (!filesToCheck || !Array.isArray(filesToCheck) || isNaN(initialFolderId)) {
             return res.status(400).json({ success: false, message: '无效的请求参数。请确保 folderId 在 URL 查询中提供。' });
         }
-
-        // multer 处理后，req.body 才完整，所以我们可以在这里读取 resolutions
-        const resolutions = req.body.resolutions ? JSON.parse(req.body.resolutions) : {};
 
         const existenceChecks = await Promise.all(
             filesToCheck.map(async (fileInfo) => {
