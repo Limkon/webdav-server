@@ -1,20 +1,15 @@
 // storage/webdav.js - 完整重构版
 
-// CommonJS 模块保持不变
 const crypto = require('crypto');
 const fsp = require('fs').promises;
 const fs = require('fs');
 const path = require('path');
 
 // --- WebDAV 模块加载器 ---
-// 为动态导入的 ES Module 创建一个占位符
 let createClient;
 
-// 使用一个异步函数来动态导入 ES Module
 async function initializeWebdavModule() {
-    // 这个if判断确保了 'webdav' 包在整个应用生命周期中只被导入一次
     if (!createClient) {
-        // 使用动态 import() 异步加载 ES Module
         const webdavModule = await import('webdav');
         createClient = webdavModule.createClient;
         log('info', 'WebDAV 模块已动态加载。');
@@ -25,7 +20,7 @@ const CONFIG_FILE = path.join(__dirname, '..', 'data', 'config.json');
 
 // --- 輔助函數：日誌記錄 ---
 function log(level, message, ...args) {
-    if (level === 'debug') return; // 移除调试日志
+    if (level === 'debug') return;
     const timestamp = new Date().toISOString();
     console.log(`[${timestamp}] [WEBDAV] [${level.toUpperCase()}] ${message}`, ...args);
 }
@@ -33,7 +28,6 @@ function log(level, message, ...args) {
 let clients = {};
 let webdavConfigs = [];
 
-// 独立加载配置的函数
 function loadWebdavConfigs() {
     try {
         if (fs.existsSync(CONFIG_FILE)) {
@@ -61,19 +55,16 @@ function loadWebdavConfigs() {
     }
 }
 
-// 在模块加载时立即读取配置
 loadWebdavConfigs();
 
-// getClient 函数现在必须是异步的，因为它依赖于异步加载的 createClient
 async function getClient(config) {
-    await initializeWebdavModule(); // 确保在使用 createClient 之前它已经被加载
+    await initializeWebdavModule(); 
 
     if (!config || !config.id) {
         throw new Error('无效的 WebDAV 配置传入 getClient');
     }
     if (!clients[config.id]) {
         if (!config.url || !config.username) throw new Error(`WebDAV 设置不完整 (ID: ${config.id})。`);
-        // 现在可以安全地使用 createClient
         clients[config.id] = createClient(config.url, {
             username: config.username,
             password: config.password
