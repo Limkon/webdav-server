@@ -31,6 +31,7 @@
             gap: 15px;
             align-items: center;
             margin-bottom: 15px;
+            flex-wrap: wrap;
         }
         .scan-controls select, .scan-controls button {
             padding: 10px;
@@ -47,14 +48,18 @@
 
         <div class="setting-card">
             <h2>扫描控制器</h2>
-            <p>选择要将文件汇入的使用者，然后开始扫描 WebDAV。系统会自动跳过数据库中已存在的记录。</p>
+            <p>选择一个使用者和要扫描的 WebDAV 挂载点。系统会自动将远端档案汇入到对应的使用者帐号，并跳过数据库中已存在的记录。</p>
             <div class="scan-controls">
                 <label for="user-select">汇入到使用者：</label>
                 <select id="user-select">
                     <option value="">正在加载使用者...</option>
                 </select>
+                <label for="webdav-select">扫描挂载点：</label>
+                <select id="webdav-select">
+                    <option value="">请先设定 WebDAV</option>
+                </select>
                 <button id="scan-webdav-btn" class="upload-link-btn" style="background-color: #17a2b8;">
-                    <i class="fas fa-server"></i> 扫描 WebDAV
+                    <i class="fas fa-server"></i> 开始扫描
                 </button>
             </div>
         </div>
