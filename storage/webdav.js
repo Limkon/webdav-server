@@ -9,7 +9,7 @@ const CONFIG_FILE = path.join(__dirname, '..', 'data', 'config.json');
 
 // --- 輔助函數：日誌記錄 ---
 function log(level, message, ...args) {
-    if (level === 'debug') return; // 移除调试日志
+    // 调试日志现在将被打印
     const timestamp = new Date().toISOString();
     console.log(`[${timestamp}] [WEBDAV] [${level.toUpperCase()}] ${message}`, ...args);
 }
@@ -75,44 +75,70 @@ function getConfigForMount(mountName) {
     return config;
 }
 
-async function upload(tempFilePath, fileName, mimetype, userId, folderPathInfo) {
+// --- *** 关键修正：修改 upload 函数以接收流 *** ---
+async function upload(fileStream, fileName, mimetype, userId, folderPathInfo) {
     const { mountName, remotePath: folderPath } = folderPathInfo;
-    log('info', `開始上傳到 WebDAV: mount=${mountName}, path=${folderPath}, file=${fileName}`);
+    log('info', `开始流式上传到 WebDAV: mount=${mountName}, path=${folderPath}, file=${fileName}`);
     const config = getConfigForMount(mountName);
     const client = getClient(config);
     const remoteFilePath = path.posix.join(folderPath, fileName);
 
+    // 确保目标目录存在
     if (folderPath && folderPath !== "/") {
         try {
             await client.createDirectory(folderPath, { recursive: true });
+            log('debug', `WebDAV 目录已确认/创建: ${folderPath}`);
         } catch (e) {
+            // 忽略“方法不允许”的错误，这通常意味着目录已存在
             if (e.response && (e.response.status !== 405 && e.response.status !== 501)) {
                  throw new Error(`创建 WebDAV 目录失败 (${e.response.status}): ${e.message}`);
             }
         }
     }
 
-    const fileBuffer = await fsp.readFile(tempFilePath);
-    await client.putFileContents(remoteFilePath, fileBuffer, { overwrite: true });
-    log('info', `檔案 ${remoteFilePath} 已成功上傳到 WebDAV。`);
+    // 使用 putFileContents 并传入流
+    const writeStream = client.createWriteStream(remoteFilePath, { overwrite: true });
     
-    const stat = await client.stat(remoteFilePath);
-    const messageId = Date.now() * 1000 + crypto.randomInt(1000);
-    
-    const fullDbPath = path.posix.join('/', mountName, remoteFilePath);
+    return new Promise((resolve, reject) => {
+        fileStream.pipe(writeStream);
 
-    return {
-        dbData: {
-            message_id: messageId,
-            fileName,
-            mimetype,
-            size: stat.size,
-            file_id: fullDbPath,
-            date: new Date(stat.lastmod).getTime(),
-        },
-        success: true
-    };
+        writeStream.on('finish', async () => {
+            log('info', `文件 ${remoteFilePath} 已成功流式上传到 WebDAV。`);
+            try {
+                const stat = await client.stat(remoteFilePath);
+                const messageId = Date.now() * 1000 + crypto.randomInt(1000);
+                const fullDbPath = path.posix.join('/', mountName, remoteFilePath);
+
+                resolve({
+                    dbData: {
+                        message_id: messageId,
+                        fileName,
+                        mimetype,
+                        size: stat.size,
+                        file_id: fullDbPath,
+                        date: new Date(stat.lastmod).getTime(),
+                    },
+                    success: true
+                });
+            } catch (statError) {
+                log('error', `上传后获取文件状态失败: ${remoteFilePath}`, statError);
+                reject(statError);
+            }
+        });
+
+        writeStream.on('error', (err) => {
+            log('error', `WebDAV 写出流错误: ${remoteFilePath}`, err);
+            reject(err);
+        });
+
+        fileStream.on('error', (err) => {
+            log('error', `文件读取流错误: ${fileName}`, err);
+            writeStream.end(); // 确保WebDAV流被关闭
+            reject(err);
+        });
+    });
 }
+
 
 async function remove(itemsToRemove) {
     const results = { success: true, errors: [] };
