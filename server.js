@@ -18,9 +18,8 @@ const storageManager = require('./storage');
 
 const app = express();
 
-// --- 辅助函数：日志记录 ---
+// --- 輔助函數：日誌記錄 ---
 function log(level, message, ...args) {
-    // 调试日志现在将被打印
     const timestamp = new Date().toISOString();
     console.log(`[${timestamp}] [${level.toUpperCase()}] ${message}`, ...args);
 }
@@ -69,7 +68,7 @@ function requireAdmin(req, res, next) {
     res.status(403).send('权限不足');
 }
 
-// 輔助函數：為新用戶创建掛載點
+// *** 关键修正: 强化 createMountPointsForUser 函数 ***
 async function createMountPointsForUser(userId) {
     log('info', `為使用者 ${userId} 檢查並創建掛載點...`);
     const rootFolder = await data.getRootFolder(userId);
@@ -77,20 +76,32 @@ async function createMountPointsForUser(userId) {
         log('error', `無法為使用者 ${userId} 找到根目錄。`);
         return;
     }
+    
     const config = storageManager.readConfig();
-    if (config.webdav && Array.isArray(config.webdav)) {
-        for (const mount of config.webdav) {
-            if (mount.mount_name) {
-                // 檢查文件夹是否已存在
+    const webdavConfigs = config.webdav || [];
+
+    if (webdavConfigs.length === 0) {
+        log('warn', '找不到任何 WebDAV 設定，無法創建掛載點。請檢查 data/config.json 檔案。');
+        return;
+    }
+
+    log('info', `找到 ${webdavConfigs.length} 個 WebDAV 設定，開始同步資料夾...`);
+
+    for (const mount of webdavConfigs) {
+        if (mount.mount_name) {
+            try {
                 const existing = await data.findFolderByName(mount.mount_name, rootFolder.id, userId);
                 if (!existing) {
                     log('info', `為使用者 ${userId} 創建掛載點資料夾: ${mount.mount_name}`);
                     await data.createFolder(mount.mount_name, rootFolder.id, userId);
                 }
+            } catch (error) {
+                log('error', `為使用者 ${userId} 處理掛載點 ${mount.mount_name} 時出錯:`, error);
             }
         }
     }
 }
+
 
 // --- Routes ---
 app.get('/login', (req, res) => res.sendFile(path.join(__dirname, 'views/login.html')));
@@ -334,19 +345,7 @@ app.post('/api/admin/webdav', requireAdmin, async (req, res) => {
         try {
             const users = await data.listAllUsers();
             for (const user of users) {
-                const rootFolder = await data.getRootFolder(user.id);
-                if (rootFolder) {
-                    if (isEditing && oldMountName && oldMountName !== mount_name) {
-                        const mountFolder = await data.findFolderByName(oldMountName, rootFolder.id, user.id);
-                        if(mountFolder) {
-                            await data.renameFolder(mountFolder.id, mount_name, user.id);
-                        } else {
-                            await data.createFolder(mount_name, rootFolder.id, user.id);
-                        }
-                    } else if (!isEditing) {
-                        await data.createFolder(mount_name, rootFolder.id, user.id);
-                    }
-                }
+                await createMountPointsForUser(user.id); // 直接调用更新函数
             }
              res.json({ success: true, message: 'WebDAV 设置已保存' });
         } catch(dbError) {
@@ -379,12 +378,13 @@ app.delete('/api/admin/webdav/:id', requireAdmin, async (req, res) => {
                 if (rootFolder) {
                     const mountFolder = await data.findFolderByName(mountNameToDelete, rootFolder.id, user.id);
                     if (mountFolder) {
-                        await data.unifiedDelete(mountFolder.id, 'folder', user.id);
+                        // 只删除数据库记录，不删除远程文件
+                        await data.deleteFolder(mountFolder.id, user.id);
                     }
                 }
             }
-            log('info', `WebDAV 掛載點 ${mountNameToDelete} 已成功刪除。`);
-            res.json({ success: true, message: 'WebDAV 设置及相关文件已删除' });
+            log('info', `WebDAV 掛載點 ${mountNameToDelete} 已成功從資料庫移除。`);
+            res.json({ success: true, message: 'WebDAV 设置及相关数据库记录已删除' });
          } catch(dbError) {
             log('error', `刪除 WebDAV 掛載點 ${mountNameToDelete} 的資料時出錯:`, dbError);
             res.status(500).json({ success: false, message: `设置已删除，但清理用户文件夹时出错: ${dbError.message}` });
@@ -394,7 +394,7 @@ app.delete('/api/admin/webdav/:id', requireAdmin, async (req, res) => {
     }
 });
 
-// --- *** 关键修正: 重写 /upload 路由 *** ---
+// --- 上传路由 ---
 app.post('/upload', requireLogin, (req, res) => {
     log('info', '收到新的上传请求');
     const bb = busboy({ headers: req.headers });
@@ -402,44 +402,39 @@ app.post('/upload', requireLogin, (req, res) => {
     const storage = storageManager.getStorage();
     
     const fields = {};
-    const fileQueue = [];
     const promises = [];
+    
+    let resolveFields;
+    const fieldsReady = new Promise(resolve => {
+        resolveFields = resolve;
+    });
 
     bb.on('field', (name, val) => {
-        log('debug', `Busboy: 收到字段: ${name} = ${val}`);
+        log('debug', `Busboy: 收到字段: ${name}`);
         fields[name] = val;
     });
 
     bb.on('file', (name, fileStream, info) => {
         const { filename: rawFilename, mimeType } = info;
         const filename = Buffer.from(rawFilename, 'latin1').toString('utf8');
-        log('debug', `Busboy: 开始接收文件流: ${filename} (mimetype: ${mimeType})`);
+        log('debug', `Busboy: 开始接收文件流: ${filename}`);
 
-        // 将文件信息和流存入队列，但不在这里处理
-        fileQueue.push({ fileStream, filename, mimeType });
-        // **重要**: 必须消耗流，否则 busboy 会暂停
-        fileStream.resume();
-    });
-
-    bb.on('finish', async () => {
-        log('debug', 'Busboy: 所有文件和字段已接收完毕。开始处理文件队列。');
-
-        const processFile = async ({ fileStream, filename, mimeType }) => {
+        const filePromise = async () => {
+            await fieldsReady;
+            log('debug', `字段已就绪，开始处理文件: ${filename}`);
+            
             try {
                 const initialFolderId = parseInt(fields.folderId, 10);
-                if (isNaN(initialFolderId)) {
-                    throw new Error("无效的 folderId");
-                }
+                if (isNaN(initialFolderId)) throw new Error("无效或缺失的 folderId");
                 
                 const resolutions = fields.resolutions ? JSON.parse(fields.resolutions) : {};
                 const relativePath = filename;
                 const action = resolutions[relativePath] || 'upload';
 
-                log('debug', `处理文件: ${filename}, 动作: ${action}`);
-
                 if (action === 'skip') {
                     log('info', `跳过文件: ${filename}`);
-                    return; // 直接返回
+                    fileStream.resume();
+                    return;
                 }
                 
                 const pathParts = relativePath.split('/');
@@ -447,53 +442,61 @@ app.post('/upload', requireLogin, (req, res) => {
                 const folderPathParts = pathParts;
                 const targetFolderId = await data.resolvePathToFolderId(initialFolderId, folderPathParts, userId);
                 
+                const folderPathInfo = await data.getWebdavPathInfo(targetFolderId, userId);
+                const mountConfig = storageManager.getMountConfig(folderPathInfo.mountName); // 获取特定挂载点配置
+                if (!mountConfig) throw new Error(`找不到名为 ${folderPathInfo.mountName} 的挂载点配置`);
+
                 if (action === 'overwrite') {
                     const existingItem = await data.findItemInFolder(finalFileName, targetFolderId, userId);
                     if (existingItem) {
                          await data.unifiedDelete(existingItem.id, existingItem.type, userId);
-                         log('info', `已覆盖旧文件: ${finalFileName}`);
                     }
                 } else if (action === 'rename') {
                     finalFileName = await data.findAvailableName(finalFileName, targetFolderId, userId, false);
-                    log('info', `文件已重命名为: ${finalFileName}`);
                 } else {
                     const conflict = await data.findItemInFolder(finalFileName, targetFolderId, userId);
                     if (conflict) {
                         log('info', `文件冲突且未解决，跳过: ${finalFileName}`);
+                        fileStream.resume();
                         return;
                     }
                 }
                 
-                const folderPathInfo = await data.getWebdavPathInfo(targetFolderId, userId);
-                log('debug', `开始上传 ${finalFileName} 到 WebDAV...`);
-                const result = await storage.upload(fileStream, finalFileName, mimeType, userId, folderPathInfo);
-                log('debug', `WebDAV 上传完成，正在将 ${finalFileName} 添加到数据库...`);
+                const result = await storage.upload(fileStream, finalFileName, mimeType, userId, folderPathInfo, mountConfig);
                 await data.addFile(result.dbData, targetFolderId, userId, 'webdav');
                 log('info', `成功处理并保存文件: ${finalFileName}`);
             } catch (err) {
                 log('error', `处理文件 ${filename} 时发生错误:`, err);
-                throw err; // 将错误往上传递
+                fileStream.resume();
+                throw err;
             }
         };
 
-        for (const fileData of fileQueue) {
-            promises.push(processFile(fileData));
-        }
+        promises.push(filePromise());
+    });
 
+    bb.on('finish', async () => {
+        log('debug', 'Busboy: 所有字段已接收完毕，解锁文件处理程序。');
+        resolveFields();
+        
         try {
             await Promise.all(promises);
             log('info', '所有文件处理完成');
             res.json({ success: true, message: '上传成功！' });
         } catch (error) {
             log('error', '在完成上传过程中捕获到错误:', error);
-            res.status(500).json({ success: false, message: '处理上传时发生错误: ' + error.message });
+            if (!res.headersSent) {
+                res.status(500).json({ success: false, message: '处理上传时发生错误: ' + error.message });
+            }
         }
     });
 
     bb.on('error', err => {
         log('error', 'Busboy 发生错误:', err);
         req.unpipe(bb);
-        res.status(500).json({ success: false, message: '文件解析失败' });
+        if (!res.headersSent) {
+            res.status(500).json({ success: false, message: '文件解析失败' });
+        }
     });
 
     req.pipe(bb);
@@ -510,7 +513,6 @@ app.post('/api/text-file', requireLogin, async (req, res) => {
         return res.status(400).json({ success: false, message: '文件名无效或不是 .txt 文件' });
     }
     
-    // 使用 stream.Readable 从字符串创建流
     const { Readable } = require('stream');
     const contentStream = Readable.from([content]);
 
@@ -545,7 +547,10 @@ app.post('/api/text-file', requireLogin, async (req, res) => {
         }
         
         const folderPathInfo = await data.getWebdavPathInfo(finalFolderId, userId);
-        const result = await storage.upload(contentStream, finalFileName, 'text/plain', userId, folderPathInfo);
+        const mountConfig = storageManager.getMountConfig(folderPathInfo.mountName);
+        if (!mountConfig) throw new Error(`找不到名为 ${folderPathInfo.mountName} 的挂载点配置`);
+
+        const result = await storage.upload(contentStream, finalFileName, 'text/plain', userId, folderPathInfo, mountConfig);
         const dbResult = await data.addFile(result.dbData, finalFolderId, userId, 'webdav');
 
         res.json({ success: true, fileId: dbResult.fileId });
@@ -659,22 +664,25 @@ app.post('/api/folder', requireLogin, async (req, res) => {
     }
     
     try {
-        const parentPath = await data.getFolderPath(parentId, userId);
-        if (parentPath.length <= 1) { // 根目录的路径长度为1
-            return res.status(403).json({ success: false, message: '禁止在根目录下直接创建文件夹。' });
+        const parentPathInfo = await data.getWebdavPathInfo(parentId, userId);
+        if (!parentPathInfo.isMount) { // 禁止在非挂载点下创建文件夹
+             return res.status(403).json({ success: false, message: '只能在挂载点根目录下创建文件夹。' });
         }
 
         const conflict = await data.checkFullConflict(name, parentId, userId);
         if (conflict) {
             return res.status(409).json({ success: false, message: '同目录下已存在同名文件或文件夹。' });
         }
-
+        
+        const mountConfig = storageManager.getMountConfig(parentPathInfo.mountName);
+        if (!mountConfig) throw new Error(`找不到名为 ${parentPathInfo.mountName} 的挂载点配置`);
+        
         const result = await data.createFolder(name, parentId, userId);
         
         const storage = storageManager.getStorage();
         if (storage.type === 'webdav' && storage.createDirectory) {
             const newFolderPathInfo = await data.getWebdavPathInfo(result.id, userId);
-            await storage.createDirectory(newFolderPathInfo);
+            await storage.createDirectory(newFolderPathInfo, mountConfig);
         }
 
         res.json(result);
@@ -695,50 +703,21 @@ app.post('/api/move', requireLogin, async (req, res) => {
         const { itemIds, targetFolderId, resolutions = {} } = req.body;
         const userId = req.session.userId;
         log('info', `移動請求: items=${itemIds.join(',')} 到 folder=${targetFolderId} by user=${userId}`);
-        log('debug', 'Resolutions:', resolutions);
-
-        if (!itemIds || !Array.isArray(itemIds) || itemIds.length === 0 || !targetFolderId) {
-            return res.status(400).json({ success: false, message: '无效的请求参数。' });
-        }
         
-        let totalMoved = 0;
-        let totalSkipped = 0;
-        const errors = [];
-        
-        for (const itemId of itemIds) {
-            try {
-                const items = await data.getItemsByIds([itemId], userId);
-                if (items.length === 0) {
-                    totalSkipped++;
-                    continue; 
-                }
-                
-                const item = items[0];
-                const report = await data.moveItem(item.id, item.type, targetFolderId, userId, { resolutions });
-                totalMoved += report.moved;
-                totalSkipped += report.skipped;
-                if (report.errors > 0) {
-                    errors.push(`项目 "${item.name}" 处理失败。`);
-                }
-
-            } catch (err) {
-                log('error', `移動項目 ${itemId} 時出錯:`, err);
-                errors.push(err.message);
-            }
-        }
+        const report = await data.moveItems(itemIds, targetFolderId, userId, resolutions);
         
         let message = "操作完成。";
-        if (errors.length > 0) {
-            message = `操作完成，但出现错误: ${errors.join(', ')}`;
-        } else if (totalMoved > 0 && totalSkipped > 0) {
-            message = `操作完成，${totalMoved} 个项目已移动，${totalSkipped} 个项目被跳过。`;
-        } else if (totalMoved === 0 && totalSkipped > 0) {
+        if (report.errors > 0) {
+            message = `操作完成，但有 ${report.errors} 个项目失败。`;
+        } else if (report.moved > 0 && report.skipped > 0) {
+            message = `操作完成，${report.moved} 个项目已移动，${report.skipped} 个项目被跳过。`;
+        } else if (report.moved === 0 && report.skipped > 0) {
             message = "所有选定项目均被跳过。";
-        } else if (totalMoved > 0) {
-            message = `${totalMoved} 个项目移动成功。`;
+        } else if (report.moved > 0) {
+            message = `${report.moved} 个项目移动成功。`;
         }
         log('info', `移動操作完成: ${message}`);
-        res.json({ success: errors.length === 0, message: message });
+        res.json({ success: report.errors === 0, message: message });
 
     } catch (error) { 
         log('error', '移動操作失敗:', error);
@@ -751,6 +730,7 @@ app.post('/delete-multiple', requireLogin, async (req, res) => {
     const userId = req.session.userId;
     log('info', `刪除請求: files=${messageIds.join(',')}, folders=${folderIds.join(',')} by user=${userId}`);
     try {
+        // 使用统一的删除入口
         for(const id of messageIds) { await data.unifiedDelete(id, 'file', userId); }
         for(const id of folderIds) { await data.unifiedDelete(id, 'folder', userId); }
         res.json({ success: true, message: '删除成功' });
@@ -785,6 +765,16 @@ app.post('/rename', requireLogin, async (req, res) => {
     }
 });
 
+function handleStream(stream, res) {
+    stream.on('error', (err) => {
+        log('error', `读取文件流时发生错误:`, err);
+        if (!res.headersSent) {
+            res.status(500).send('读取文件流时发生错误');
+        }
+        res.end();
+    }).pipe(res);
+}
+
 app.get('/download/proxy/:message_id', requireLogin, async (req, res) => {
     try {
         const messageId = parseInt(req.params.message_id, 10);
@@ -795,15 +785,18 @@ app.get('/download/proxy/:message_id', requireLogin, async (req, res) => {
         }
 
         const storage = storageManager.getStorage();
-        
+        const mountConfig = storageManager.getMountConfigForPath(fileInfo.file_id);
+        if (!mountConfig) throw new Error(`找不到路径 ${fileInfo.file_id} 的挂载点配置`);
+
         res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(fileInfo.fileName)}`);
         if (fileInfo.mimetype) res.setHeader('Content-Type', fileInfo.mimetype);
         if (fileInfo.size) res.setHeader('Content-Length', fileInfo.size);
 
-        const stream = await storage.stream(fileInfo.file_id);
+        const stream = await storage.stream(fileInfo.file_id, mountConfig);
         handleStream(stream, res);
 
     } catch (error) { 
+        log('error', '代理下载失败:', error);
         res.status(500).send('下载代理失败: ' + error.message); 
     }
 });
@@ -818,11 +811,15 @@ app.get('/file/content/:message_id', requireLogin, async (req, res) => {
         }
         
         const storage = storageManager.getStorage();
+        const mountConfig = storageManager.getMountConfigForPath(fileInfo.file_id);
+        if (!mountConfig) throw new Error(`找不到路径 ${fileInfo.file_id} 的挂载点配置`);
+        
         res.setHeader('Content-Type', 'text/plain; charset=utf-8');
 
-        const stream = await storage.stream(fileInfo.file_id);
+        const stream = await storage.stream(fileInfo.file_id, mountConfig);
         handleStream(stream, res);
     } catch (error) { 
+        log('error', '获取文件内容失败:', error);
         res.status(500).send('无法获取文件内容'); 
     }
 });
@@ -857,11 +854,17 @@ app.post('/api/download-archive', requireLogin, async (req, res) => {
         archive.pipe(res);
 
         for (const file of filesToArchive) {
-            const stream = await storage.stream(file.file_id);
-            archive.append(stream, { name: file.path });
+            const mountConfig = storageManager.getMountConfigForPath(file.file_id);
+            if(mountConfig){
+                const stream = await storage.stream(file.file_id, mountConfig);
+                archive.append(stream, { name: file.path });
+            } else {
+                log('warn', `找不到文件 ${file.path} 的挂载点配置，已跳过压缩。`);
+            }
         }
         await archive.finalize();
     } catch (error) {
+        log('error', '压缩文件时发生错误:', error);
         res.status(500).send('压缩文件时发生错误');
     }
 });
@@ -909,68 +912,61 @@ app.post('/api/cancel-share', requireLogin, async (req, res) => {
 
 // --- Scanner Endpoints ---
 app.post('/api/scan/webdav', requireAdmin, async (req, res) => {
-    // --- *** 关键修正 开始 *** ---
     const { userId, mountId } = req.body;
-    const log = [];
+    const logOutput = [];
     try {
         if (!userId) throw new Error('未提供用户 ID');
         if (!mountId) throw new Error('未提供 WebDAV 挂载点 ID');
 
         const { createClient } = require('webdav');
-        const config = storageManager.readConfig();
-        
-        const mountConfig = config.webdav.find(m => m.id === mountId);
+        const mountConfig = storageManager.getMountConfigById(mountId);
 
         if (!mountConfig) {
             throw new Error(`找不到 ID 为 "${mountId}" 的 WebDAV 挂载点`);
         }
-
-        log.push({ message: `开始扫描挂载点: ${mountConfig.mount_name}`, type: 'info' });
+        
+        logOutput.push({ message: `开始扫描挂载点: ${mountConfig.mount_name}`, type: 'info' });
         
         const client = createClient(mountConfig.url, {
             username: mountConfig.username,
             password: mountConfig.password
         });
         
-        async function scanWebdavDirectory(remotePath) {
-            const contents = await client.getDirectoryContents(remotePath, { deep: true });
-            for (const item of contents) {
-                if (item.type === 'file') {
-                    const fileIdToFind = path.posix.join('/', mountConfig.mount_name, item.filename);
-                    const existing = await data.findFileByFileId(fileIdToFind, userId);
-                     if (existing) {
-                        log.push({ message: `已存在: ${fileIdToFind}，跳过。`, type: 'info' });
-                    } else {
-                        const folderPathInDb = path.posix.join('/', mountConfig.mount_name, path.dirname(item.filename));
-                        const folderId = await data.findOrCreateFolderByPath(folderPathInDb, userId);
-                        
-                        const messageId = Date.now() * 1000 + crypto.randomInt(1000);
-                        await data.addFile({
-                            message_id: messageId,
-                            fileName: item.basename,
-                            mimetype: item.mime || 'application/octet-stream',
-                            size: item.size,
-                            file_id: fileIdToFind,
-                            date: new Date(item.lastmod).getTime(),
-                        }, folderId, userId, 'webdav');
-                        log.push({ message: `已导入: ${fileIdToFind}`, type: 'success' });
-                    }
+        const contents = await client.getDirectoryContents('/', { deep: true });
+        for (const item of contents) {
+            if (item.type === 'file') {
+                const fileIdToFind = path.posix.join('/', mountConfig.mount_name, item.filename);
+                const existing = await data.findFileByFileId(fileIdToFind, userId);
+                 if (existing) {
+                    logOutput.push({ message: `已存在: ${fileIdToFind}，跳过。`, type: 'info' });
+                } else {
+                    const folderPathInDb = path.posix.join('/', mountConfig.mount_name, path.dirname(item.filename));
+                    const folderId = await data.findOrCreateFolderByPath(folderPathInDb, userId);
+                    
+                    const messageId = Date.now() * 1000 + crypto.randomInt(1000);
+                    await data.addFile({
+                        message_id: messageId,
+                        fileName: item.basename,
+                        mimetype: item.mime || 'application/octet-stream',
+                        size: item.size,
+                        file_id: fileIdToFind,
+                        date: new Date(item.lastmod).getTime(),
+                    }, folderId, userId, 'webdav');
+                    logOutput.push({ message: `已导入: ${fileIdToFind}`, type: 'success' });
                 }
             }
         }
-        await scanWebdavDirectory('/');
-        log.push({ message: `挂载点 ${mountConfig.mount_name} 扫描完成。`, type: 'success' });
         
-        res.json({ success: true, log });
-    // --- *** 关键修正 结束 *** ---
+        logOutput.push({ message: `挂载点 ${mountConfig.mount_name} 扫描完成。`, type: 'success' });
+        
+        res.json({ success: true, log: logOutput });
     } catch (error) {
         let errorMessage = error.message;
         if (error.response && error.response.status === 403) {
-            errorMessage = '访问被拒绝 (403 Forbidden)。这通常意味着您的 WebDAV 服务器不允许列出目录内容。请检查您帐号的权限，确保它有读取和浏览目录的权限。';
-            log.push({ message: '扫描失败：无法列出远程目录内容。', type: 'error' });
+            errorMessage = '访问被拒绝 (403 Forbidden)。请检查帐号权限。';
         }
-        log.push({ message: `详细错误: ${errorMessage}`, type: 'error' });
-        res.status(500).json({ success: false, message: errorMessage, log });
+        logOutput.push({ message: `详细错误: ${errorMessage}`, type: 'error' });
+        res.status(500).json({ success: false, message: errorMessage, log: logOutput });
     }
 });
 
@@ -982,25 +978,23 @@ app.get('/share/view/file/:token', async (req, res) => {
         if (fileInfo) {
             const downloadUrl = `/share/download/file/${token}`;
             
-            // --- *** 关键修正 开始 *** ---
-            // 检查是否为纯文字文件
             if (fileInfo.mimetype && fileInfo.mimetype.startsWith('text/')) {
                 const storage = storageManager.getStorage();
-                const stream = await storage.stream(fileInfo.file_id);
+                const mountConfig = storageManager.getMountConfigForPath(fileInfo.file_id);
+                if (!mountConfig) throw new Error(`找不到分享文件 ${fileInfo.file_id} 的挂载点配置`);
                 
-                // 直接以纯文字形式输出，不渲染 HTML
                 res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-                handleStream(stream, res); // 使用已有的 handleStream 函数处理流
-                return; // 结束执行，防止后续代码渲染模板
+                const stream = await storage.stream(fileInfo.file_id, mountConfig);
+                handleStream(stream, res);
+                return;
             }
-            // --- *** 关键修正 结束 *** ---
 
-            // 对于非文字文件，保持原有的预览页面逻辑
             res.render('share-view', { file: fileInfo, downloadUrl, textContent: null });
         } else {
             res.status(404).render('share-error', { message: '此分享链接无效或已过期。' });
         }
     } catch (error) { 
+        log('error', `处理文件分享页面失败:`, error);
         res.status(500).render('share-error', { message: '处理分享请求时发生错误。' }); 
     }
 });
@@ -1016,19 +1010,10 @@ app.get('/share/view/folder/:token', async (req, res) => {
             res.status(404).render('share-error', { message: '此分享链接无效或已过期。' });
         }
     } catch (error) { 
+        log('error', `处理文件夹分享页面失败:`, error);
         res.status(500).render('share-error', { message: '处理分享请求时发生错误。' }); 
     }
 });
-
-function handleStream(stream, res) {
-    stream.on('error', (err) => {
-        log('error', `读取文件流时发生错误:`, err);
-        if (!res.headersSent) {
-            res.status(500).send('读取文件流时发生错误');
-        }
-        res.end(); // 确保响应结束
-    }).pipe(res);
-}
 
 app.get('/share/download/file/:token', async (req, res) => {
     try {
@@ -1039,11 +1024,17 @@ app.get('/share/download/file/:token', async (req, res) => {
         }
 
         const storage = storageManager.getStorage();
+        const mountConfig = storageManager.getMountConfigForPath(fileInfo.file_id);
+        if (!mountConfig) throw new Error(`找不到分享文件 ${fileInfo.file_id} 的挂载点配置`);
+
         res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(fileInfo.fileName)}`);
 
-        const stream = await storage.stream(fileInfo.file_id);
+        const stream = await storage.stream(fileInfo.file_id, mountConfig);
         handleStream(stream, res);
-    } catch (error) { res.status(500).send('下载失败'); }
+    } catch (error) { 
+        log('error', `处理文件分享下载失败:`, error);
+        res.status(500).send('下载失败'); 
+    }
 });
 
 app.get('/share/download/:folderToken/:fileId', async (req, res) => {
@@ -1056,11 +1047,15 @@ app.get('/share/download/:folderToken/:fileId', async (req, res) => {
         }
         
         const storage = storageManager.getStorage();
+        const mountConfig = storageManager.getMountConfigForPath(fileInfo.file_id);
+        if (!mountConfig) throw new Error(`找不到分享文件 ${fileInfo.file_id} 的挂载点配置`);
+        
         res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(fileInfo.fileName)}`);
 
-        const stream = await storage.stream(fileInfo.file_id);
+        const stream = await storage.stream(fileInfo.file_id, mountConfig);
         handleStream(stream, res);
     } catch (error) {
+        log('error', `处理文件夹内文件分享下载失败:`, error);
         res.status(500).send('下载失败');
     }
 });
