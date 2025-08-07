@@ -10,26 +10,23 @@ function readConfig() {
         if (fs.existsSync(CONFIG_FILE)) {
             const rawData = fs.readFileSync(CONFIG_FILE);
             const config = JSON.parse(rawData);
-            // 确保 webdav 设定存在且为物件
-            if (!config.webdav || Array.isArray(config.webdav)) {
-                config.webdav = {}; 
+            // 确保 webdav 设定存在且为阵列
+            if (!config.webdav || !Array.isArray(config.webdav)) {
+                config.webdav = [];
             }
             return config;
         }
     } catch (error) {
         // console.error("读取设定档失败:", error);
     }
-    // 预设返回一个空的 webdav 配置
-    return { webdav: {} }; 
+    return { webdav: [] };
 }
 
 function writeConfig(config) {
     try {
-        // 确保存储模式始终是 webdav
-        config.storageMode = 'webdav';
+        // 确保 storageMode 字段被移除或固定
+        delete config.storageMode; 
         fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
-        // 重置客户端以使用新设定
-        webdavStorage.resetClient();
         return true;
     } catch (error) {
         // console.error("写入设定档失败:", error);
@@ -37,13 +34,21 @@ function writeConfig(config) {
     }
 }
 
-// 现在 getStorage 始终返回 webdavStorage
+// 始终返回 WebDAV 存储引擎
 function getStorage() {
     return webdavStorage;
 }
 
+// 新增：根据挂载点名称获取特定 WebDAV 设定
+function getWebdavConfigByName(name) {
+    const config = readConfig();
+    return config.webdav.find(c => c.name === name);
+}
+
+
 module.exports = {
     getStorage,
     readConfig,
-    writeConfig
+    writeConfig,
+    getWebdavConfigByName
 };
