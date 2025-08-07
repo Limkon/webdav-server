@@ -39,16 +39,13 @@ function resetAllClients() {
 }
 
 // --- 上传函数 ---
-// *** 关键修正: upload 函数现在接收 `mountConfig` 作为参数 ***
 async function upload(fileStream, fileName, mimetype, userId, folderPathInfo, mountConfig) {
     const { mountName, remotePath: folderPath } = folderPathInfo;
     log('info', `开始流式上传到 WebDAV: mount=${mountName}, path=${folderPath}, file=${fileName}`);
     
-    // 不再从内部状态获取 config，而是直接使用传入的 mountConfig
     const client = getClient(mountConfig);
     const remoteFilePath = path.posix.join(folderPath, fileName);
 
-    // 确保目标目录存在
     if (folderPath && folderPath !== "/") {
         try {
             await client.createDirectory(folderPath, { recursive: true });
@@ -124,13 +121,11 @@ async function upload(fileStream, fileName, mimetype, userId, folderPathInfo, mo
     });
 }
 
-// *** 关键修正: remove 函数现在接收 `mountConfig` ***
 async function remove(itemsToRemove, mountConfig) {
     const client = getClient(mountConfig);
     const mountName = mountConfig.mount_name;
     const results = { success: true, errors: [] };
 
-    // 确保深层路径优先被删除
     itemsToRemove.sort((a, b) => b.remotePath.length - a.remotePath.length);
 
     for (const item of itemsToRemove) {
@@ -153,12 +148,10 @@ async function remove(itemsToRemove, mountConfig) {
     return results;
 }
 
-// *** 关键修正: stream 函数现在接收 `mountConfig` ***
 async function stream(fileDbPath, mountConfig) {
     const parts = fileDbPath.split('/').filter(Boolean);
     const remotePath = '/' + parts.slice(1).join('/');
 
-    // 使用传入的配置创建一次性客户端，避免状态混淆
     const streamClient = createClient(mountConfig.url, {
         username: mountConfig.username,
         password: mountConfig.password
@@ -167,7 +160,6 @@ async function stream(fileDbPath, mountConfig) {
     return streamClient.createReadStream(remotePath);
 }
 
-// *** 关键修正: moveFile 函数现在接收 `mountConfig` ***
 async function moveFile(oldPathInfo, newPathInfo, mountConfig) {
     const { remotePath: oldRemotePath } = oldPathInfo;
     const { remotePath: newRemotePath } = newPathInfo;
@@ -193,7 +185,6 @@ async function moveFile(oldPathInfo, newPathInfo, mountConfig) {
     }
 }
 
-// *** 关键修正: createDirectory 函数现在接收 `mountConfig` ***
 async function createDirectory(folderPathInfo, mountConfig) {
     const { remotePath } = folderPathInfo;
     const client = getClient(mountConfig);
@@ -220,5 +211,5 @@ module.exports = {
     stream, 
     moveFile,
     createDirectory,
-    resetAllClients, // 函数名修改得更清晰
+    resetAllClients,
 };
