@@ -11,7 +11,7 @@ const fs = require('fs');
 const fsp = require('fs').promises;
 const crypto = require('crypto');
 const busboy = require('busboy');
-const { PassThrough } = require('stream'); // --- 引入 PassThrough ---
+const { PassThrough } = require('stream');
 const db = require('./database.js'); 
 const data = require('./data.js');
 const storageManager = require('./storage'); 
@@ -396,157 +396,128 @@ app.delete('/api/admin/webdav/:id', requireAdmin, async (req, res) => {
     }
 });
 
-// --- 核心修正：上傳路由 ---
-app.post('/upload', requireLogin, (req, res) => {
+// --- 核心修正：上傳路由的最終解決方案 ---
+app.post('/upload', requireLogin, async (req, res) => {
     log('info', '接收到流式上傳請求...');
-    
-    const bb = busboy({ 
-        headers: req.headers,
-        defParamCharset: 'utf8' 
-    });
-    
     const userId = req.session.userId;
     const storage = storageManager.getStorage();
-    
-    const fields = {};
-    const filePromises = [];
-    const filesData = [];
-    
-    // 這個 Promise 將在所有非文件欄位都解析完畢後 resolve
-    const fieldsParsedPromise = new Promise(resolve => {
-        bb.on('fieldsLimit', resolve);
-        // 也監聽 finish 事件，以防萬一
-        bb.on('finish', resolve);
-    });
 
-    bb.on('field', (name, val) => {
-        log('debug', `Busboy: 收到欄位: ${name}`);
-        if (name.endsWith('[]')) { // 處理陣列欄位
-            const arrayName = name.slice(0, -2);
-            if (!fields[arrayName]) fields[arrayName] = [];
-            fields[arrayName].push(val);
-        } else {
-            fields[name] = val;
-        }
-    });
+    try {
+        const { fields, files } = await parseMultipart(req);
+        log('info', `請求解析完成，收到 ${files.length} 個檔案。`);
 
-    bb.on('file', (name, fileStream, info) => {
-        const { filename, encoding, mimeType } = info;
-        log('info', `Busboy: 開始接收檔案流: ${filename}, MIME: ${mimeType}`);
+        const fileProcessingPromises = files.map(async (file, index) => {
+            const { stream, filename, mimetype } = file;
+            
+            const relativePath = (fields.relativePaths && fields.relativePaths[index]) 
+                ? fields.relativePaths[index] 
+                : filename;
 
-        // 立即創建 PassThrough 中繼流
-        const passThrough = new PassThrough();
-        fileStream.pipe(passThrough); // 立刻開始消耗用戶上傳的流，防止阻塞
-        
-        // 將 fileStream 上的錯誤轉發到 passThrough
-        fileStream.on('error', (err) => {
-            log('error', `Busboy 原始檔案流出錯 for ${filename}:`, err);
-            passThrough.emit('error', err);
-        });
+            log('debug', `開始處理檔案: ${relativePath}`);
+            const initialFolderId = parseInt(fields.folderId, 10);
+            const resolutions = fields.resolutions ? JSON.parse(fields.resolutions) : {};
+            const action = resolutions[relativePath] || 'upload';
 
-        const fileIndex = filesData.length;
-        const fileData = {
-            stream: passThrough, // *** 使用中繼流進行後續處理 ***
-            filename: filename,
-            mimetype: mimeType,
-            relativePath: null 
-        };
-        filesData.push(fileData);
-        
-        const filePromise = (async () => {
-            try {
-                // 等待所有非文件欄位都處理完畢
-                await fieldsParsedPromise;
-                
-                fileData.relativePath = (fields.relativePaths && fields.relativePaths[fileIndex]) 
-                    ? fields.relativePaths[fileIndex] 
-                    : fileData.filename;
+            const pathParts = relativePath.split('/');
+            let finalFilename = pathParts.pop() || filename;
+            const folderPathParts = pathParts;
+            
+            if (action === 'skip') {
+                log('info', `跳過檔案: ${relativePath}`);
+                stream.resume(); // 確保消耗流
+                return { skipped: true };
+            }
 
-                const initialFolderId = parseInt(fields.folderId, 10);
-                const resolutions = fields.resolutions ? JSON.parse(fields.resolutions) : {};
-                const action = resolutions[fileData.relativePath] || 'upload';
-                log('debug', `處理檔案: ${fileData.relativePath}, Action: ${action}`);
-
-                const pathParts = (fileData.relativePath || fileData.filename).split('/');
-                let finalFilename = pathParts.pop() || fileData.filename;
-                const folderPathParts = pathParts;
-
-                if (action === 'skip') {
-                    log('info', `跳過檔案: ${fileData.relativePath}`);
-                    fileData.stream.resume(); // 消耗掉中繼流中的數據
+            const targetFolderId = await data.resolvePathToFolderId(initialFolderId, folderPathParts, userId);
+            
+            if (action === 'overwrite') {
+                const existingItem = await data.findItemInFolder(finalFilename, targetFolderId, userId);
+                if (existingItem) {
+                    log('info', `覆蓋檔案: ${finalFilename}`);
+                    await data.unifiedDelete(existingItem.id, existingItem.type, userId);
+                }
+            } else if (action === 'rename') {
+                finalFilename = await data.findAvailableName(finalFilename, targetFolderId, userId, false);
+                log('info', `檔案重命名為: ${finalFilename}`);
+            } else {
+                const conflict = await data.findItemInFolder(finalFilename, targetFolderId, userId);
+                if (conflict) {
+                    log('info', `檔案衝突，跳過: ${finalFilename}`);
+                    stream.resume(); // 確保消耗流
                     return { skipped: true };
                 }
-
-                const targetFolderId = await data.resolvePathToFolderId(initialFolderId, folderPathParts, userId);
-                
-                if (action === 'overwrite') {
-                    const existingItem = await data.findItemInFolder(finalFilename, targetFolderId, userId);
-                    if (existingItem) {
-                        log('info', `覆蓋檔案: ${finalFilename}`);
-                        await data.unifiedDelete(existingItem.id, existingItem.type, userId);
-                    }
-                } else if (action === 'rename') {
-                    finalFilename = await data.findAvailableName(finalFilename, targetFolderId, userId, false);
-                    log('info', `檔案重命名為: ${finalFilename}`);
-                } else {
-                    const conflict = await data.findItemInFolder(finalFilename, targetFolderId, userId);
-                    if (conflict) {
-                        log('info', `檔案衝突，跳過: ${finalFilename}`);
-                        fileData.stream.resume();
-                        return { skipped: true };
-                    }
-                }
-                
-                const folderPathInfo = await data.getWebdavPathInfo(targetFolderId, userId);
-                log('debug', `準備將中繼流傳遞給 storage.uploadStream: ${finalFilename}`);
-                const result = await storage.uploadStream(fileData.stream, finalFilename, fileData.mimetype, userId, folderPathInfo);
-                const dbResult = await data.addFile(result.dbData, targetFolderId, userId, 'webdav');
-                log('info', `檔案 ${finalFilename} 已成功流式上傳並存入資料庫。`);
-                return { ...result, fileId: dbResult.fileId };
-
-            } catch (err) {
-                log('error', `處理檔案流 ${fileData.filename} 時出錯:`, err);
-                fileData.stream.resume(); // 確保在任何錯誤情況下都消耗掉流
-                throw err; // 向上拋出錯誤，讓 Promise.all 捕捉
             }
-        })();
-        filePromises.push(filePromise);
-    });
+            
+            const folderPathInfo = await data.getWebdavPathInfo(targetFolderId, userId);
+            log('debug', `準備將流傳遞給 storage.uploadStream: ${finalFilename}`);
+            const result = await storage.uploadStream(stream, finalFilename, mimetype, userId, folderPathInfo);
+            const dbResult = await data.addFile(result.dbData, targetFolderId, userId, 'webdav');
+            log('info', `檔案 ${finalFilename} 已成功流式上傳並存入資料庫。`);
+            return { ...result, fileId: dbResult.fileId };
+        });
 
-    bb.on('close', async () => {
-        log('info', 'Busboy: 所有欄位和檔案流接收完成。');
-        try {
-            const results = await Promise.all(filePromises);
-            const uploadedFiles = results.filter(r => !r.skipped);
-            const skippedCount = results.length - uploadedFiles.length;
+        const results = await Promise.all(fileProcessingPromises);
+        const uploadedFiles = results.filter(r => r && !r.skipped);
+        const skippedCount = results.length - uploadedFiles.length;
 
-            if (!res.headersSent) {
-                if (uploadedFiles.length === 0 && skippedCount > 0) {
-                    log('info', '所有檔案均因衝突而被跳過。');
-                    res.json({ success: true, skippedAll: true, message: '所有文件因冲突而被跳过。' });
-                } else {
-                    log('info', `上傳成功 ${uploadedFiles.length} 個檔案, 跳過 ${skippedCount} 個。`);
-                    res.json({ success: true, results: uploadedFiles });
-                }
-            }
-        } catch (error) {
-            log('error', '完成上傳處理時發生錯誤:', error);
-            if (!res.headersSent) {
-                res.status(500).json({ success: false, message: '处理上传时发生错误: ' + error.message });
-            }
-        }
-    });
-    
-    bb.on('error', (err) => {
-        log('error', 'Busboy 發生錯誤:', err);
-        req.unpipe(bb);
         if (!res.headersSent) {
-            res.status(500).json({ success: false, message: '檔案解析錯誤。' });
+            if (uploadedFiles.length === 0 && skippedCount > 0) {
+                log('info', '所有檔案均因衝突而被跳過。');
+                res.json({ success: true, skippedAll: true, message: '所有文件因冲突而被跳过。' });
+            } else {
+                log('info', `上傳成功 ${uploadedFiles.length} 個檔案, 跳過 ${skippedCount} 個。`);
+                res.json({ success: true, results: uploadedFiles });
+            }
         }
-    });
 
-    req.pipe(bb);
+    } catch (error) {
+        log('error', '上傳處理過程中發生致命錯誤:', error);
+        if (!res.headersSent) {
+            res.status(500).json({ success: false, message: '處理上傳時發生錯誤: ' + error.message });
+        }
+    }
 });
+
+// -- 輔助函數：將 busboy 的回調模式包裝成 Promise ---
+function parseMultipart(req) {
+    return new Promise((resolve, reject) => {
+        const bb = busboy({ 
+            headers: req.headers,
+            defParamCharset: 'utf8' 
+        });
+
+        const fields = {};
+        const files = [];
+
+        bb.on('field', (name, val) => {
+            if (name.endsWith('[]')) {
+                const arrayName = name.slice(0, -2);
+                if (!fields[arrayName]) fields[arrayName] = [];
+                fields[arrayName].push(val);
+            } else {
+                fields[name] = val;
+            }
+        });
+
+        bb.on('file', (name, fileStream, info) => {
+            const { filename, encoding, mimeType } = info;
+            log('debug', `Busboy 在 parseMultipart 中偵測到檔案: ${filename}`);
+            files.push({ stream: fileStream, filename, mimetype });
+        });
+
+        bb.on('close', () => {
+            log('debug', 'Busboy `close` event: 解析完成。');
+            resolve({ fields, files });
+        });
+        
+        bb.on('error', (err) => {
+            log('error', 'Busboy 解析時出錯:', err);
+            reject(err);
+        });
+
+        req.pipe(bb);
+    });
+}
 
 
 app.post('/api/text-file', requireLogin, async (req, res) => {
