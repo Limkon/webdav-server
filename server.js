@@ -6,24 +6,23 @@ const session = require('express-session');
 const path = require('path');
 const axios = require('axios');
 const archiver = require('archiver');
-const bcrypt = require('bcrypt'); // --- 修正: 正確引入 bcrypt ---
+const bcrypt = require('bcrypt');
 const fs = require('fs');
 const fsp = require('fs').promises;
 const crypto = require('crypto');
 const busboy = require('busboy');
+const { PassThrough } = require('stream'); // --- 引入 PassThrough ---
 const db = require('./database.js'); 
 const data = require('./data.js');
 const storageManager = require('./storage'); 
 
 const app = express();
 
-// --- 輔助函數：日誌記錄 ---
 function log(level, message, ...args) {
     const timestamp = new Date().toISOString();
     console.log(`[${timestamp}] [SERVER] [${level.toUpperCase()}] ${message}`, ...args);
 }
 
-// --- Temp File Directory and Cleanup ---
 const TMP_DIR = path.join(__dirname, 'data', 'tmp');
 
 async function cleanupTempDir() {
@@ -61,7 +60,6 @@ app.use(express.static('public'));
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// --- Middleware ---
 function requireLogin(req, res, next) {
   if (req.session.loggedIn) return next();
   log('info', '未登入，重定向到 /login');
@@ -76,7 +74,6 @@ function requireAdmin(req, res, next) {
     res.status(403).send('权限不足');
 }
 
-// 輔助函數：為新用戶创建掛載點
 async function createMountPointsForUser(userId) {
     log('info', `為使用者 ${userId} 檢查並創建掛載點...`);
     const rootFolder = await data.getRootFolder(userId);
@@ -98,7 +95,6 @@ async function createMountPointsForUser(userId) {
     }
 }
 
-// --- Routes ---
 app.get('/login', (req, res) => res.sendFile(path.join(__dirname, 'views/login.html')));
 app.get('/register', (req, res) => res.sendFile(path.join(__dirname, 'views/register.html')));
 app.get('/editor', requireLogin, (req, res) => res.sendFile(path.join(__dirname, 'views/editor.html')));
@@ -136,8 +132,8 @@ app.post('/register', async (req, res) => {
         const hashedPassword = await bcrypt.hash(password, salt);
         const newUser = await data.createUser(username, hashedPassword);
         
-        await data.createFolder('/', null, newUser.id); // 创建根目录
-        await createMountPointsForUser(newUser.id); // 创建挂载点
+        await data.createFolder('/', null, newUser.id);
+        await createMountPointsForUser(newUser.id);
         log('info', `使用者 ${username} (ID: ${newUser.id}) 註冊成功。`);
         res.redirect('/login');
     } catch (error) {
@@ -175,7 +171,6 @@ app.get('/admin', requireAdmin, (req, res) => res.sendFile(path.join(__dirname, 
 app.get('/scan', requireAdmin, (req, res) => res.sendFile(path.join(__dirname, 'views/scan.html')));
 
 
-// --- API Endpoints ---
 app.post('/api/user/change-password', requireLogin, async (req, res) => {
     const { oldPassword, newPassword } = req.body;
     log('info', `使用者 ${req.session.userId} 正在嘗試修改密碼。`);
@@ -401,7 +396,7 @@ app.delete('/api/admin/webdav/:id', requireAdmin, async (req, res) => {
     }
 });
 
-// --- 上傳路由 ---
+// --- 核心修正：上傳路由 ---
 app.post('/upload', requireLogin, (req, res) => {
     log('info', '接收到流式上傳請求...');
     
@@ -413,16 +408,23 @@ app.post('/upload', requireLogin, (req, res) => {
     const userId = req.session.userId;
     const storage = storageManager.getStorage();
     
-    let fields = {};
-    let filePromises = [];
-    let filesData = [];
-    let fieldProcessingDone = new Promise(resolve => bb.on('fieldsLimit', resolve));
+    const fields = {};
+    const filePromises = [];
+    const filesData = [];
+    
+    // 這個 Promise 將在所有非文件欄位都解析完畢後 resolve
+    const fieldsParsedPromise = new Promise(resolve => {
+        bb.on('fieldsLimit', resolve);
+        // 也監聽 finish 事件，以防萬一
+        bb.on('finish', resolve);
+    });
 
     bb.on('field', (name, val) => {
         log('debug', `Busboy: 收到欄位: ${name}`);
-        if (name === 'relativePaths' || name === 'relativePaths[]') {
-            if (!fields.relativePaths) fields.relativePaths = [];
-            fields.relativePaths.push(val);
+        if (name.endsWith('[]')) { // 處理陣列欄位
+            const arrayName = name.slice(0, -2);
+            if (!fields[arrayName]) fields[arrayName] = [];
+            fields[arrayName].push(val);
         } else {
             fields[name] = val;
         }
@@ -432,20 +434,33 @@ app.post('/upload', requireLogin, (req, res) => {
         const { filename, encoding, mimeType } = info;
         log('info', `Busboy: 開始接收檔案流: ${filename}, MIME: ${mimeType}`);
 
+        // 立即創建 PassThrough 中繼流
+        const passThrough = new PassThrough();
+        fileStream.pipe(passThrough); // 立刻開始消耗用戶上傳的流，防止阻塞
+        
+        // 將 fileStream 上的錯誤轉發到 passThrough
+        fileStream.on('error', (err) => {
+            log('error', `Busboy 原始檔案流出錯 for ${filename}:`, err);
+            passThrough.emit('error', err);
+        });
+
+        const fileIndex = filesData.length;
         const fileData = {
-            stream: fileStream,
+            stream: passThrough, // *** 使用中繼流進行後續處理 ***
             filename: filename,
             mimetype: mimeType,
             relativePath: null 
         };
         filesData.push(fileData);
         
-        const filePromise = new Promise(async (resolve, reject) => {
+        const filePromise = (async () => {
             try {
-                await fieldProcessingDone;
+                // 等待所有非文件欄位都處理完畢
+                await fieldsParsedPromise;
                 
-                const fileIndex = filesData.findIndex(fd => fd.stream === fileStream);
-                fileData.relativePath = (fields.relativePaths && fields.relativePaths[fileIndex]) ? fields.relativePaths[fileIndex] : fileData.filename;
+                fileData.relativePath = (fields.relativePaths && fields.relativePaths[fileIndex]) 
+                    ? fields.relativePaths[fileIndex] 
+                    : fileData.filename;
 
                 const initialFolderId = parseInt(fields.folderId, 10);
                 const resolutions = fields.resolutions ? JSON.parse(fields.resolutions) : {};
@@ -458,8 +473,8 @@ app.post('/upload', requireLogin, (req, res) => {
 
                 if (action === 'skip') {
                     log('info', `跳過檔案: ${fileData.relativePath}`);
-                    fileStream.resume(); 
-                    return resolve({ skipped: true });
+                    fileData.stream.resume(); // 消耗掉中繼流中的數據
+                    return { skipped: true };
                 }
 
                 const targetFolderId = await data.resolvePathToFolderId(initialFolderId, folderPathParts, userId);
@@ -477,24 +492,24 @@ app.post('/upload', requireLogin, (req, res) => {
                     const conflict = await data.findItemInFolder(finalFilename, targetFolderId, userId);
                     if (conflict) {
                         log('info', `檔案衝突，跳過: ${finalFilename}`);
-                        fileStream.resume(); 
-                        return resolve({ skipped: true });
+                        fileData.stream.resume();
+                        return { skipped: true };
                     }
                 }
                 
                 const folderPathInfo = await data.getWebdavPathInfo(targetFolderId, userId);
-                log('debug', `準備將檔案流傳遞給 storage.uploadStream: ${finalFilename}`);
-                const result = await storage.uploadStream(fileStream, finalFilename, fileData.mimetype, userId, folderPathInfo);
+                log('debug', `準備將中繼流傳遞給 storage.uploadStream: ${finalFilename}`);
+                const result = await storage.uploadStream(fileData.stream, finalFilename, fileData.mimetype, userId, folderPathInfo);
                 const dbResult = await data.addFile(result.dbData, targetFolderId, userId, 'webdav');
                 log('info', `檔案 ${finalFilename} 已成功流式上傳並存入資料庫。`);
-                resolve({ ...result, fileId: dbResult.fileId });
+                return { ...result, fileId: dbResult.fileId };
 
             } catch (err) {
                 log('error', `處理檔案流 ${fileData.filename} 時出錯:`, err);
-                fileStream.resume(); 
-                reject(err);
+                fileData.stream.resume(); // 確保在任何錯誤情況下都消耗掉流
+                throw err; // 向上拋出錯誤，讓 Promise.all 捕捉
             }
-        });
+        })();
         filePromises.push(filePromise);
     });
 
@@ -505,12 +520,14 @@ app.post('/upload', requireLogin, (req, res) => {
             const uploadedFiles = results.filter(r => !r.skipped);
             const skippedCount = results.length - uploadedFiles.length;
 
-            if (uploadedFiles.length === 0 && skippedCount > 0) {
-                log('info', '所有檔案均因衝突而被跳過。');
-                res.json({ success: true, skippedAll: true, message: '所有文件因冲突而被跳过。' });
-            } else {
-                log('info', `上傳成功 ${uploadedFiles.length} 個檔案, 跳過 ${skippedCount} 個。`);
-                res.json({ success: true, results: uploadedFiles });
+            if (!res.headersSent) {
+                if (uploadedFiles.length === 0 && skippedCount > 0) {
+                    log('info', '所有檔案均因衝突而被跳過。');
+                    res.json({ success: true, skippedAll: true, message: '所有文件因冲突而被跳过。' });
+                } else {
+                    log('info', `上傳成功 ${uploadedFiles.length} 個檔案, 跳過 ${skippedCount} 個。`);
+                    res.json({ success: true, results: uploadedFiles });
+                }
             }
         } catch (error) {
             log('error', '完成上傳處理時發生錯誤:', error);
@@ -523,7 +540,9 @@ app.post('/upload', requireLogin, (req, res) => {
     bb.on('error', (err) => {
         log('error', 'Busboy 發生錯誤:', err);
         req.unpipe(bb);
-        res.status(500).json({ success: false, message: '檔案解析錯誤。' });
+        if (!res.headersSent) {
+            res.status(500).json({ success: false, message: '檔案解析錯誤。' });
+        }
     });
 
     req.pipe(bb);
@@ -696,7 +715,7 @@ app.post('/api/folder', requireLogin, async (req, res) => {
     
     try {
         const parentPath = await data.getFolderPath(parentId, userId);
-        if (parentPath.length <= 1) { // 根目录的路径长度为1
+        if (parentPath.length <= 1) {
             return res.status(403).json({ success: false, message: '禁止在根目录下直接创建文件夹。' });
         }
 
@@ -943,7 +962,6 @@ app.post('/api/cancel-share', requireLogin, async (req, res) => {
     } catch (error) { res.status(500).json({ success: false, message: '取消分享失败' }); }
 });
 
-// --- Scanner Endpoints ---
 app.post('/api/scan/webdav', requireAdmin, async (req, res) => {
     const { userId, mountId } = req.body;
     const log = [];
@@ -1008,7 +1026,6 @@ app.post('/api/scan/webdav', requireAdmin, async (req, res) => {
     }
 });
 
-// --- Share Routes ---
 app.get('/share/view/file/:token', async (req, res) => {
     try {
         const token = req.params.token;
