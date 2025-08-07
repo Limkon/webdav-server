@@ -11,10 +11,10 @@ const fs = require('fs');
 const fsp = require('fs').promises;
 const crypto = require('crypto');
 const busboy = require('busboy');
-const db = require('./database.js');
+const db = require('./database.js'); 
 
 const data = require('./data.js');
-const storageManager = require('./storage');
+const storageManager = require('./storage'); 
 
 const app = express();
 
@@ -401,14 +401,12 @@ app.delete('/api/admin/webdav/:id', requireAdmin, async (req, res) => {
     }
 });
 
-// --- 主要修改: 使用 busboy 並修正中文檔名亂碼 ---
 app.post('/upload', requireLogin, (req, res) => {
     log('info', '接收到流式上傳請求...');
     
-    // --- 關鍵修正: 設定 busboy 來正確解碼 UTF-8 檔名 ---
     const bb = busboy({ 
         headers: req.headers,
-        defCharset: 'utf8' 
+        defParamCharset: 'utf8' 
     });
     
     const userId = req.session.userId;
@@ -419,8 +417,13 @@ app.post('/upload', requireLogin, (req, res) => {
     let filesData = [];
 
     bb.on('field', (name, val) => {
-        log('debug', `Busboy: 收到欄位: ${name} = ${val.substring(0, 100)}...`);
-        fields[name] = val;
+        log('debug', `Busboy: 收到欄位: ${name}`);
+        if (name === 'relativePaths') {
+            if (!fields[name]) fields[name] = [];
+            fields[name].push(val);
+        } else {
+            fields[name] = val;
+        }
     });
 
     bb.on('file', (name, fileStream, info) => {
@@ -431,28 +434,30 @@ app.post('/upload', requireLogin, (req, res) => {
             stream: fileStream,
             filename: filename,
             mimetype: mimeType,
-            relativePath: null
+            relativePath: null 
         };
-        filesData.push(fileData);
-
+        
         const filePromise = new Promise(async (resolve, reject) => {
             try {
-                // 等待所有欄位都被解析
-                await new Promise(resolve => {
-                    const checkFields = () => {
-                        if(fields.folderId !== undefined && fields.relativePaths !== undefined) {
-                            resolve();
-                        } else {
-                           setTimeout(checkFields, 50);
-                        }
-                    };
-                    checkFields();
+                await new Promise(resolveFields => {
+                    const fieldsReady = () => fields.folderId !== undefined && fields.relativePaths !== undefined;
+                    if(fieldsReady()){
+                       resolveFields();
+                       return;
+                    }
+                    bb.on('fieldsLimit', resolveFields).on('finish', () => {
+                       // In case finish fires before fields are all processed
+                       if(!fieldsReady()) setTimeout(() => resolveFields(), 100);
+                       else resolveFields();
+                    });
                 });
                 
+                const fileIndex = filesData.length;
+                filesData.push(fileData);
+
                 let relativePaths = fields.relativePaths;
                 if(relativePaths && !Array.isArray(relativePaths)) relativePaths = [relativePaths];
                 
-                const fileIndex = filesData.findIndex(f => f.stream === fileStream);
                 fileData.relativePath = relativePaths ? relativePaths[fileIndex] : fileData.filename;
 
                 const initialFolderId = parseInt(fields.folderId, 10);
@@ -977,7 +982,7 @@ app.post('/api/scan/webdav', requireAdmin, async (req, res) => {
                     const fileIdToFind = path.posix.join('/', mountConfig.mount_name, item.filename);
                     const existing = await data.findFileByFileId(fileIdToFind, userId);
                      if (existing) {
-                        log.push({ message: `已存在: ${fileIdToFind}，跳过。`, type: 'info' });
+                        log.push({ message: `已存在: ${fileIdToFind}，跳過。`, type: 'info' });
                     } else {
                         const folderPathInDb = path.posix.join('/', mountConfig.mount_name, path.dirname(item.filename));
                         const folderId = await data.findOrCreateFolderByPath(folderPathInDb, userId);
