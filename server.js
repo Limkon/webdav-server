@@ -94,10 +94,8 @@ app.post('/register', async (req, res) => {
         const hashedPassword = await bcrypt.hash(password, salt);
         const newUser = await data.createUser(username, hashedPassword);
         
-        // 建立使用者根目录
         const root = await data.createFolder('/', null, newUser.id);
 
-        // 为新使用者建立所有已存在的挂载点资料夹
         const config = storageManager.readConfig();
         for(const mount of config.webdav) {
             await data.createFolder(mount.name, root.id, newUser.id);
@@ -140,6 +138,7 @@ app.get('/admin', requireAdmin, (req, res) => res.sendFile(path.join(__dirname, 
 app.get('/scan', requireAdmin, (req, res) => res.sendFile(path.join(__dirname, 'views/scan.html')));
 
 app.post('/upload', requireLogin, (req, res) => {
+    // console.log(`[DEBUG] [Server] /upload request received from user ${req.session.userId}`);
     const userId = req.session.userId;
     const storage = storageManager.getStorage();
     const busboy = Busboy({ 
@@ -180,6 +179,8 @@ app.post('/upload', requireLogin, (req, res) => {
             const relativePaths = JSON.parse(fields.relativePathsJSON || '[]');
             const caption = fields.caption || '';
             let allSkipped = true;
+            
+            // console.log(`[DEBUG] [Server] Upload params: initialFolderId=${initialFolderId}, fileCount=${fileBuffers.length}, resolutions=${JSON.stringify(resolutions)}`);
 
             const rootFolder = await data.getRootFolder(userId);
             if (initialFolderId === rootFolder.id) {
@@ -196,6 +197,8 @@ app.post('/upload', requireLogin, (req, res) => {
                 const { buffer, mimeType } = fileData;
                 const decodedFilename = relativePath;
                 const action = resolutions[decodedFilename] || 'upload';
+
+                // console.log(`[DEBUG] [Server] Processing file #${i}: ${decodedFilename} with action: ${action}`);
 
                 if (action === 'skip') continue;
 
@@ -225,10 +228,12 @@ app.post('/upload', requireLogin, (req, res) => {
 
                 await storage.upload(readableStream, finalFilename, mimeType, userId, targetFolderId, caption);
             }
-
+            
+            // console.log(`[DEBUG] [Server] Finished processing all files for upload request.`);
             res.json({ success: true, message: '上传完成', skippedAll: allSkipped });
 
         } catch (err) {
+            // console.error(`[DEBUG] [Server] Error during upload processing: ${err.stack}`);
             res.status(500).json({ success: false, message: err.message || '处理上传文件时发生内部错误。' });
         }
     });
@@ -254,12 +259,11 @@ app.get('/api/initial-data', requireLogin, async (req, res) => {
 app.get('/api/mounts', requireLogin, async (req, res) => {
     const config = storageManager.readConfig();
     const mounts = config.webdav.map(c => ({
-        id: -1, // Special ID for mount points
+        id: -1, 
         name: c.name,
         type: 'folder'
     }));
     
-    // 为了面包屑导航，创建一个虚拟的根路径
     const rootPath = [{ id: (await data.getRootFolder(req.session.userId)).id, name: '/' }];
 
     res.json({ mounts, path: rootPath });
@@ -423,7 +427,6 @@ app.get('/api/folder/:id', requireLogin, async (req, res) => {
 
         if (folderId === rootFolder.id) {
              const config = storageManager.readConfig();
-             // 将挂载点转换为前端期望的资料夹格式
              const mountFolders = await Promise.all(config.webdav.map(async c => {
                 const folder = await data.findFolderByName(c.name, rootFolder.id, req.session.userId);
                 return {
@@ -468,7 +471,6 @@ app.post('/api/folder', requireLogin, async (req, res) => {
         const storage = storageManager.getStorage();
         if (storage.createDirectory) {
             const newFolderPathParts = await data.getFolderPath(result.id, userId);
-            // 路径需要包含挂载点
             const newFullPath = path.posix.join(...newFolderPathParts.slice(1).map(p => p.name));
             await storage.createDirectory(newFullPath);
         }
@@ -490,23 +492,30 @@ app.post('/api/move', requireLogin, async (req, res) => {
         const { itemIds, targetFolderId, resolutions = {} } = req.body;
         const userId = req.session.userId;
 
+        // console.log(`[DEBUG] [Server] /api/move request from user ${userId}: items=${itemIds.join(',')}, target=${targetFolderId}, resolutions=${JSON.stringify(resolutions)}`);
+
         if (!itemIds || !Array.isArray(itemIds) || itemIds.length === 0 || !targetFolderId) {
             return res.status(400).json({ success: false, message: '无效的请求参数。' });
         }
         
-        // --- ** 挂载点隔离检查 ** ---
         const getMountName = async (folderId) => {
+            if (!folderId) return null;
             const pathParts = await data.getFolderPath(folderId, userId);
-            if (pathParts.length < 2) return null; // 根目录
+            if (pathParts.length < 2) {
+                const root = await data.getRootFolder(userId);
+                return (folderId === root.id) ? '__ROOT__' : null;
+            }
             return pathParts[1].name;
         };
+
         const targetMount = await getMountName(targetFolderId);
-        if (!targetMount) return res.status(400).json({ success: false, message: '移动目标不能是根目录。'});
+        if (targetMount === '__ROOT__') return res.status(400).json({ success: false, message: '移动目标不能是根目录。'});
         
         const items = await data.getItemsByIds(itemIds, userId);
         for (const item of items) {
              const sourceMount = await getMountName(item.parent_id);
              if (sourceMount !== targetMount) {
+                 // console.warn(`[DEBUG] [Server] Cross-mount move blocked: from '${sourceMount}' to '${targetMount}'`);
                  return res.status(400).json({ success: false, message: `无法将项目从 '${sourceMount}' 移动到 '${targetMount}'。不允许跨挂载点移动。`});
              }
         }
@@ -530,10 +539,12 @@ app.post('/api/move', requireLogin, async (req, res) => {
         else if (totalMoved > 0 && totalSkipped > 0) message = `操作完成，${totalMoved} 个项目已移动，${totalSkipped} 个项目被跳过。`;
         else if (totalMoved === 0 && totalSkipped > 0) message = "所有选定项目均被跳过。";
         else if (totalMoved > 0) message = `${totalMoved} 个项目移动成功。`;
-
+        
+        // console.log(`[DEBUG] [Server] Move operation completed. Moved: ${totalMoved}, Skipped: ${totalSkipped}, Errors: ${errors.length}`);
         res.json({ success: errors.length === 0, message: message });
 
     } catch (error) {
+        // console.error(`[DEBUG] [Server] Move operation failed: ${error.stack}`);
         res.status(500).json({ success: false, message: '移动失败：' + error.message });
     }
 });
@@ -728,7 +739,6 @@ app.post('/api/scan/webdav', requireAdmin, async (req, res) => {
             const contents = await client.getDirectoryContents(remotePath, { deep: true });
             for (const item of contents) {
                 if (item.type === 'file') {
-                    // file_id 现在包含挂载点名称
                     const fileIdForDb = path.posix.join(mountName, item.filename);
                     const existing = await data.findFileByFileId(fileIdForDb, userId);
                      if (existing) {
@@ -935,7 +945,6 @@ app.post('/api/admin/add-user', requireAdmin, async (req, res) => {
         const hashedPassword = await bcrypt.hash(password, salt);
         const newUser = await data.createUser(username, hashedPassword);
         
-        // 为新使用者建立根目录和所有已存在的挂载点资料夹
         const root = await data.createFolder('/', null, newUser.id);
         const config = storageManager.readConfig();
         for(const mount of config.webdav) {
@@ -982,6 +991,7 @@ app.get('/api/admin/webdav', requireAdmin, (req, res) => {
 });
 
 app.post('/api/admin/webdav', requireAdmin, async (req, res) => {
+    // console.log(`[DEBUG] [Server] /api/admin/webdav (POST) request with body:`, req.body);
     const { originalName, name, url, username, password } = req.body;
     if (!name || !url || !username) {
         return res.status(400).json({ success: false, message: '缺少必要参数' });
@@ -989,7 +999,6 @@ app.post('/api/admin/webdav', requireAdmin, async (req, res) => {
 
     const config = storageManager.readConfig();
     
-    // 如果是编辑，先找到旧的设定
     let isEditing = false;
     if (originalName) {
         const existingIndex = config.webdav.findIndex(c => c.name === originalName);
@@ -1004,7 +1013,6 @@ app.post('/api/admin/webdav', requireAdmin, async (req, res) => {
         }
     }
     
-    // 如果不是编辑（或找不到旧的），则视为新增
     if (!isEditing) {
         if (config.webdav.some(c => c.name === name)) {
             return res.status(409).json({ success: false, message: '此挂载名称已被使用。' });
@@ -1027,6 +1035,7 @@ app.post('/api/admin/webdav', requireAdmin, async (req, res) => {
 
 app.delete('/api/admin/webdav/:name', requireAdmin, async (req, res) => {
     const nameToDelete = req.params.name;
+    // console.log(`[DEBUG] [Server] /api/admin/webdav (DELETE) request for name:`, nameToDelete);
     const config = storageManager.readConfig();
     const initialLength = config.webdav.length;
     
