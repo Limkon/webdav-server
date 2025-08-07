@@ -3,7 +3,7 @@
 require('dotenv').config();
 const express = require('express');
 const session = require('express-session');
-const busboy = require('busboy'); // *** 新增 busboy ***
+const busboy = require('busboy');
 const path = require('path');
 const axios = require('axios');
 const archiver = require('archiver');
@@ -402,6 +402,7 @@ app.post('/upload', requireLogin, (req, res) => {
     const storage = storageManager.getStorage();
     
     const fields = {};
+    const fileQueue = [];
     const filePromises = [];
     
     let allFilesSkipped = true;
@@ -412,27 +413,22 @@ app.post('/upload', requireLogin, (req, res) => {
     });
 
     bb.on('file', (name, fileStream, info) => {
-        // --- *** 文件名乱码修复 *** ---
         const { filename: rawFilename, encoding, mimeType } = info;
         const filename = Buffer.from(rawFilename, 'latin1').toString('utf8');
-        // --- *** 修复结束 *** ---
         log('debug', `Busboy: 开始接收文件流: ${filename} (mimetype: ${mimeType})`);
+        
+        // 先将文件流和信息存入队列
+        fileQueue.push({ fileStream, filename, mimeType });
+    });
 
-        const processFile = async () => {
+    bb.on('finish', async () => {
+        log('debug', 'Busboy: 所有文件和字段已接收完毕');
+        
+        const processFile = async ({ fileStream, filename, mimeType }) => {
             try {
-                // 等待所有字段被解析
-                await new Promise(resolve => {
-                    if (fields.folderId) return resolve();
-                    bb.on('field', (name) => {
-                        if (name === 'folderId') resolve();
-                    });
-                });
-                
                 const initialFolderId = parseInt(fields.folderId, 10);
                 const resolutions = fields.resolutions ? JSON.parse(fields.resolutions) : {};
                 
-                // busboy 不像 multer 那样提供 relativePaths 数组，我们需要自己构建
-                // 在这个实现中，我们假设前端发送的是扁平的文件列表
                 const relativePath = filename;
                 const action = resolutions[relativePath] || 'upload';
 
@@ -440,7 +436,7 @@ app.post('/upload', requireLogin, (req, res) => {
 
                 if (action === 'skip') {
                     log('info', `跳过文件: ${filename}`);
-                    fileStream.resume(); // 消耗掉流
+                    fileStream.resume(); 
                     return;
                 }
                 
@@ -472,20 +468,19 @@ app.post('/upload', requireLogin, (req, res) => {
                 log('info', `成功处理并保存文件: ${finalFileName}`);
             } catch (err) {
                 log('error', `处理文件 ${filename} 时发生错误:`, err);
-                fileStream.resume(); // 确保流被消费掉
-                throw err; // 将错误往上传递
+                fileStream.resume();
+                throw err;
             }
         };
+        
+        for(const file of fileQueue) {
+            filePromises.push(processFile(file));
+        }
 
-        filePromises.push(processFile());
-    });
-
-    bb.on('finish', async () => {
-        log('debug', 'Busboy: 所有文件和字段已接收完毕');
         try {
             await Promise.all(filePromises);
             log('info', '所有文件处理完成');
-            if (allFilesSkipped && filePromises.length > 0) {
+            if (allFilesSkipped && fileQueue.length > 0) {
                  res.json({ success: true, skippedAll: true, message: '所有文件因冲突而被跳过。' });
             } else {
                 res.json({ success: true, message: '上传成功！' });
