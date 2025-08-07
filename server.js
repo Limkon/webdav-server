@@ -20,8 +20,15 @@ const app = express();
 
 // --- 輔助函數：日誌記錄 ---
 function log(level, message, ...args) {
+    // 调试日志保持原样，按需开启
+    if (level === 'debug') {
+        // 要启用调试日志，请取消下面的注释
+        // const timestamp = new Date().toISOString();
+        // console.log(`[${timestamp}] [SERVER] [${level.toUpperCase()}] ${message}`, ...args);
+        return;
+    }
     const timestamp = new Date().toISOString();
-    console.log(`[${timestamp}] [${level.toUpperCase()}] ${message}`, ...args);
+    console.log(`[${timestamp}] [SERVER] [${level.toUpperCase()}] ${message}`, ...args);
 }
 
 // --- Temp File Directory and Cleanup ---
@@ -437,6 +444,9 @@ app.post('/upload', requireLogin, async (req, res, next) => {
     next();
 }, uploadMiddleware, fixFileNameEncoding, async (req, res) => {
     log('info', `收到 ${req.files.length} 個檔案的上傳請求。`);
+    log('debug', `請求 body: ${JSON.stringify(req.body)}`);
+    log('debug', `收到文件列表: ${JSON.stringify(req.files.map(f => ({ fieldname: f.fieldname, originalname: f.originalname, mimetype: f.mimetype, size: f.size, path: f.path })))}`);
+
     if (!req.files || req.files.length === 0) {
         return res.status(400).json({ success: false, message: '没有选择文件' });
     }
@@ -465,10 +475,13 @@ app.post('/upload', requireLogin, async (req, res, next) => {
             const tempFilePath = file.path;
             const relativePath = relativePaths[i];
             const action = resolutions[relativePath] || 'upload';
+            
+            log('debug', `處理文件: originalName=${file.originalname}, relativePath=${relativePath}, action=${action}`);
 
             try {
                 if (action === 'skip') {
                     skippedCount++;
+                    log('debug', `跳過文件: ${relativePath}`);
                     continue;
                 }
 
@@ -477,17 +490,23 @@ app.post('/upload', requireLogin, async (req, res, next) => {
                 const folderPathParts = pathParts;
                 const targetFolderId = await data.resolvePathToFolderId(initialFolderId, folderPathParts, userId);
                 
+                log('debug', `目標資料夾 ID: ${targetFolderId} for ${relativePath}`);
+
                 if (action === 'overwrite') {
                     const existingItem = await data.findItemInFolder(fileName, targetFolderId, userId);
                     if (existingItem) {
+                        log('debug', `覆蓋模式：刪除已存在項目 ${fileName} (ID: ${existingItem.id}, Type: ${existingItem.type})`);
                         await data.unifiedDelete(existingItem.id, existingItem.type, userId);
                     }
                 } else if (action === 'rename') {
+                    const oldFileName = fileName;
                     fileName = await data.findAvailableName(fileName, targetFolderId, userId, false);
+                    log('debug', `重命名模式： ${oldFileName} -> ${fileName}`);
                 } else {
                     const conflict = await data.findItemInFolder(fileName, targetFolderId, userId);
                     if (conflict) {
                         skippedCount++;
+                        log('debug', `檢測到衝突，跳過文件: ${fileName}`);
                         continue;
                     }
                 }
@@ -496,10 +515,13 @@ app.post('/upload', requireLogin, async (req, res, next) => {
                 const result = await storage.upload(tempFilePath, fileName, file.mimetype, userId, folderPathInfo);
                 const dbResult = await data.addFile(result.dbData, targetFolderId, userId, 'webdav');
                 results.push({ ...result, fileId: dbResult.fileId });
+                log('debug', `文件 ${fileName} 處理成功。`);
 
             } finally {
                 if (fs.existsSync(tempFilePath)) {
-                    await fsp.unlink(tempFilePath).catch(err => {});
+                    await fsp.unlink(tempFilePath).catch(err => {
+                        log('warn', `刪除臨時文件失敗: ${tempFilePath}`, err.message);
+                    });
                 }
             }
         }
