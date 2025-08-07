@@ -75,9 +75,9 @@ function getConfigForMount(mountName) {
     return config;
 }
 
-async function upload(tempFilePath, fileName, mimetype, userId, folderPathInfo) {
+async function upload(fileStream, fileName, mimetype, userId, folderPathInfo) {
     const { mountName, remotePath: folderPath } = folderPathInfo;
-    log('info', `開始上傳到 WebDAV: mount=${mountName}, path=${folderPath}, file=${fileName}`);
+    log('info', `開始流式上傳到 WebDAV: mount=${mountName}, path=${folderPath}, file=${fileName}`);
     const config = getConfigForMount(mountName);
     const client = getClient(config);
     const remoteFilePath = path.posix.join(folderPath, fileName);
@@ -91,10 +91,12 @@ async function upload(tempFilePath, fileName, mimetype, userId, folderPathInfo) 
             }
         }
     }
-
-    const fileBuffer = await fsp.readFile(tempFilePath);
-    await client.putFileContents(remoteFilePath, fileBuffer, { overwrite: true });
-    log('info', `檔案 ${remoteFilePath} 已成功上傳到 WebDAV。`);
+    
+    const passThrough = fileStream; // 直接使用传入的流
+    await client.putFileContents(remoteFilePath, passThrough, { overwrite: true, onUploadProgress: (progress) => {
+        log('debug', `Uploading ${fileName}: ${Math.round(progress.loaded/progress.total * 100)}%`);
+    }});
+    log('info', `檔案 ${remoteFilePath} 已成功流式上傳到 WebDAV。`);
     
     const stat = await client.stat(remoteFilePath);
     const messageId = Date.now() * 1000 + crypto.randomInt(1000);
