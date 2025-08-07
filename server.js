@@ -396,7 +396,7 @@ app.delete('/api/admin/webdav/:id', requireAdmin, async (req, res) => {
     }
 });
 
-// --- 核心修正：上傳路由的最終解決方案 ---
+// --- 上傳路由 ---
 app.post('/upload', requireLogin, async (req, res) => {
     log('info', '接收到流式上傳請求...');
     const userId = req.session.userId;
@@ -424,7 +424,7 @@ app.post('/upload', requireLogin, async (req, res) => {
             
             if (action === 'skip') {
                 log('info', `跳過檔案: ${relativePath}`);
-                stream.resume(); // 確保消耗流
+                stream.resume();
                 return { skipped: true };
             }
 
@@ -443,7 +443,7 @@ app.post('/upload', requireLogin, async (req, res) => {
                 const conflict = await data.findItemInFolder(finalFilename, targetFolderId, userId);
                 if (conflict) {
                     log('info', `檔案衝突，跳過: ${finalFilename}`);
-                    stream.resume(); // 確保消耗流
+                    stream.resume();
                     return { skipped: true };
                 }
             }
@@ -478,7 +478,7 @@ app.post('/upload', requireLogin, async (req, res) => {
     }
 });
 
-// -- 輔助函數：將 busboy 的回調模式包裝成 Promise ---
+// --- 輔助函數：將 busboy 的回調模式包裝成 Promise ---
 function parseMultipart(req) {
     return new Promise((resolve, reject) => {
         const bb = busboy({ 
@@ -500,9 +500,10 @@ function parseMultipart(req) {
         });
 
         bb.on('file', (name, fileStream, info) => {
+            // *** 關鍵修正 ***
             const { filename, encoding, mimeType } = info;
             log('debug', `Busboy 在 parseMultipart 中偵測到檔案: ${filename}`);
-            files.push({ stream: fileStream, filename, mimetype });
+            files.push({ stream: fileStream, filename, mimetype: mimeType });
         });
 
         bb.on('close', () => {
