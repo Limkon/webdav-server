@@ -44,7 +44,6 @@ function writeConfig(config) {
 }
 
 function getStorage() {
-    // 强制返回 webdav 储存模式
     return webdavStorage;
 }
 
