@@ -73,7 +73,7 @@ function getConfigForMount(mountName) {
     return config;
 }
 
-// --- 主要修改: 修正流式上傳和背壓問題 ---
+// --- 核心修正：使用最標準的 .pipe() 進行流式上傳 ---
 async function uploadStream(fileStream, fileName, mimetype, userId, folderPathInfo) {
     const { mountName, remotePath: folderPath } = folderPathInfo;
     log('info', `開始流式上傳到 WebDAV: mount=${mountName}, path=${folderPath}, file=${fileName}`);
@@ -82,43 +82,26 @@ async function uploadStream(fileStream, fileName, mimetype, userId, folderPathIn
     const client = getClient(config);
     const remoteFilePath = path.posix.join(folderPath, fileName);
 
+    // 確保遠端目錄存在
     if (folderPath && folderPath !== "/") {
         try {
             log('debug', `檢查或創建 WebDAV 目錄: ${folderPath}`);
             await client.createDirectory(folderPath, { recursive: true });
         } catch (e) {
+            // 忽略 "Method Not Allowed" 或 "Not Implemented"，這通常表示目錄已存在
             if (e.response && (e.response.status !== 405 && e.response.status !== 501)) {
                  throw new Error(`创建 WebDAV 目录失败 (${e.response.status}): ${e.message}`);
             }
         }
     }
-
-    const writeStream = client.createWriteStream(remoteFilePath, { overwrite: true });
-
-    // --- 關鍵修正：處理背壓 ---
-    // 當 WebDAV 寫入流的緩衝區滿了，它會發出 'drain' 事件。
-    // 我們監聽這個事件來恢復讀取流，從而避免記憶體溢出。
-    writeStream.on('drain', () => {
-        log('debug', `WebDAV writeStream 'drain' event for ${fileName}, resuming fileStream.`);
-        fileStream.resume();
-    });
-
-    fileStream.on('data', (chunk) => {
-        // 如果 writeStream 返回 false，表示其緩衝區已滿，我們應暫停讀取。
-        if (!writeStream.write(chunk)) {
-            log('debug', `WebDAV writeStream buffer full for ${fileName}, pausing fileStream.`);
-            fileStream.pause();
-        }
-    });
-
+    
+    // 使用 pipe 進行流式上傳，並將整個操作包裝在 Promise 中
     return new Promise((resolve, reject) => {
-        fileStream.on('end', () => {
-            log('debug', `fileStream 'end' event for ${fileName}. Ending writeStream.`);
-            writeStream.end();
-        });
+        log('debug', `正在為 ${remoteFilePath} 創建 WebDAV 寫入流...`);
+        const writeStream = client.createWriteStream(remoteFilePath, { overwrite: true });
 
         writeStream.on('finish', async () => {
-            log('info', `檔案 ${remoteFilePath} 已成功流式上傳到 WebDAV。`);
+            log('info', `WebDAV 寫入流 'finish' 事件觸發: ${remoteFilePath}。上傳完成。`);
             try {
                 const stat = await client.stat(remoteFilePath);
                 const messageId = Date.now() * 1000 + crypto.randomInt(1000);
@@ -143,15 +126,18 @@ async function uploadStream(fileStream, fileName, mimetype, userId, folderPathIn
 
         writeStream.on('error', (err) => {
             log('error', `WebDAV 寫入流錯誤 for ${remoteFilePath}:`, err);
-            fileStream.unpipe(writeStream); // 發生錯誤時解除 pipe
             reject(new Error(`写入 WebDAV 失败: ${err.message}`));
         });
         
         fileStream.on('error', (err) => {
-            log('error', `來源檔案讀取流錯誤 for ${fileName}:`, err);
-            writeStream.end(); 
-            reject(new Error(`读取来源文件流时出错: ${err.message}`));
+             log('error', `來源檔案讀取流錯誤 for ${fileName}:`, err);
+             // 如果來源流出錯，確保寫入流被終止以避免掛起
+             writeStream.end();
+             reject(new Error(`读取来源文件流时出错: ${err.message}`));
         });
+
+        log('debug', `正在將讀取流 .pipe() 到 WebDAV 寫入流: ${fileName}`);
+        fileStream.pipe(writeStream);
     });
 }
 
