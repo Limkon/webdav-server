@@ -402,13 +402,14 @@ app.delete('/api/admin/webdav/:id', requireAdmin, async (req, res) => {
 });
 
 // --- *** 关键修正 开始 *** ---
-// 最终的 "乐观处理" 模式
+// 最终的 "暂停/恢复" 模式
 app.post('/upload', requireLogin, (req, res) => {
     log('info', '收到文件上传请求，开始使用 busboy 处理...');
     const userId = req.session.userId;
     const storage = storageManager.getStorage();
     
     const fields = {};
+    const fileQueue = [];
     const processingPromises = [];
 
     const busboy = Busboy({ headers: req.headers });
@@ -420,65 +421,68 @@ app.post('/upload', requireLogin, (req, res) => {
 
     busboy.on('file', (fieldname, fileStream, { filename, mimeType }) => {
         const originalFilename = Buffer.from(filename, 'latin1').toString('utf8');
-        log('debug', `Busboy: 开始处理文件流: ${originalFilename}`);
-        
-        // 立即为每个文件创建一个处理 Promise
-        const promise = (async () => {
-            // 乐观地假设 `folderId` 已经或即将被解析。
-            // 实际上，由于 JS 事件循环机制，这里的 await 会给 'field' 事件足够的时间去执行
-            const initialFolderId = parseInt(fields.folderId, 10);
-            if (isNaN(initialFolderId)) {
-                // 如果到这里 folderId 仍然无效，说明客户端发送顺序有问题
-                fileStream.resume(); // 消费掉流以防挂起
-                throw new Error(`请求无效：文件 '${originalFilename}' 在 'folderId' 之前被处理。`);
-            }
-            const resolutions = fields.resolutions ? JSON.parse(fields.resolutions) : {};
-            
-            const action = resolutions[originalFilename] || 'upload';
-            log('debug', `处理文件: fileName=${originalFilename}, action=${action}`);
-
-            if (action === 'skip') {
-                log('debug', `跳过文件: ${originalFilename}`);
-                fileStream.resume();
-                return { skipped: true };
-            }
-
-            const pathParts = originalFilename.split('/');
-            let fileName = pathParts.pop() || originalFilename;
-            const folderPathParts = pathParts;
-            const targetFolderId = await data.resolvePathToFolderId(initialFolderId, folderPathParts, userId);
-            
-            log('debug', `目标文件夹 ID: ${targetFolderId} for ${originalFilename}`);
-
-            if (action === 'overwrite') {
-                const existingItem = await data.findItemInFolder(fileName, targetFolderId, userId);
-                if (existingItem) {
-                    await data.unifiedDelete(existingItem.id, existingItem.type, userId);
-                }
-            } else if (action === 'rename') {
-                fileName = await data.findAvailableName(fileName, targetFolderId, userId, false);
-            } else {
-                const conflict = await data.findItemInFolder(fileName, targetFolderId, userId);
-                if (conflict) {
-                    fileStream.resume();
-                    return { skipped: true };
-                }
-            }
-            
-            const folderPathInfo = await data.getWebdavPathInfo(targetFolderId, userId);
-            // 核心：直接将流传递给上传函数
-            const result = await storage.upload(fileStream, undefined, fileName, mimeType, userId, folderPathInfo);
-            await data.addFile(result.dbData, targetFolderId, userId, 'webdav');
-            log('info', `文件 ${fileName} 已成功上传并处理。`);
-            return { success: true };
-        })();
-
-        processingPromises.push(promise.catch(err => ({ error: err, filename: originalFilename })));
+        log('debug', `Busboy: 侦测到文件: ${originalFilename}，立即暂停。`);
+        fileStream.pause(); // 关键：立即暂停流
+        fileQueue.push({ fileStream, originalFilename, mimeType });
     });
 
     busboy.on('finish', async () => {
-        log('info', `Busboy 解析完成，等待所有文件处理承诺完成...`);
+        log('info', `Busboy 解析完成。共收到 ${Object.keys(fields).length} 个字段和 ${fileQueue.length} 个待处理文件。开始处理...`);
+
         try {
+            const initialFolderId = parseInt(fields.folderId, 10);
+            if (isNaN(initialFolderId)) {
+                throw new Error('无效或缺失的 folderId');
+            }
+            const resolutions = fields.resolutions ? JSON.parse(fields.resolutions) : {};
+
+            for (const file of fileQueue) {
+                const { fileStream, originalFilename, mimeType } = file;
+                
+                const promise = (async () => {
+                    const action = resolutions[originalFilename] || 'upload';
+                    log('debug', `处理文件: fileName=${originalFilename}, action=${action}`);
+
+                    if (action === 'skip') {
+                        log('debug', `跳过文件: ${originalFilename}`);
+                        fileStream.resume(); // 必须消费掉流
+                        return { skipped: true };
+                    }
+
+                    const pathParts = originalFilename.split('/');
+                    let fileName = pathParts.pop() || originalFilename;
+                    const folderPathParts = pathParts;
+                    const targetFolderId = await data.resolvePathToFolderId(initialFolderId, folderPathParts, userId);
+                    
+                    log('debug', `目标文件夹 ID: ${targetFolderId} for ${originalFilename}`);
+
+                    if (action === 'overwrite') {
+                        const existingItem = await data.findItemInFolder(fileName, targetFolderId, userId);
+                        if (existingItem) {
+                            await data.unifiedDelete(existingItem.id, existingItem.type, userId);
+                        }
+                    } else if (action === 'rename') {
+                        fileName = await data.findAvailableName(fileName, targetFolderId, userId, false);
+                    } else {
+                        const conflict = await data.findItemInFolder(fileName, targetFolderId, userId);
+                        if (conflict) {
+                            fileStream.resume();
+                            return { skipped: true };
+                        }
+                    }
+                    
+                    const folderPathInfo = await data.getWebdavPathInfo(targetFolderId, userId);
+                    log('info', `准备就绪，恢复文件流并开始上传: ${fileName}`);
+                    fileStream.resume(); // 关键：恢复流并开始上传
+                    const result = await storage.upload(fileStream, undefined, fileName, mimeType, userId, folderPathInfo);
+                    await data.addFile(result.dbData, targetFolderId, userId, 'webdav');
+                    log('info', `文件 ${fileName} 已成功上传并处理。`);
+                    return { success: true };
+                })();
+
+                processingPromises.push(promise.catch(err => ({ error: err, filename: originalFilename })));
+            }
+            
             const results = await Promise.all(processingPromises);
             log('info', '所有文件处理承诺已完成。');
 
@@ -489,7 +493,7 @@ app.post('/upload', requireLogin, (req, res) => {
             }
 
             const skippedCount = results.filter(r => r && r.skipped).length;
-            if (processingPromises.length > 0 && skippedCount === processingPromises.length) {
+            if (fileQueue.length > 0 && skippedCount === fileQueue.length) {
                 res.json({ success: true, skippedAll: true, message: '所有文件因冲突而被跳过。' });
             } else {
                 res.json({ success: true, message: '上传成功' });
@@ -497,7 +501,11 @@ app.post('/upload', requireLogin, (req, res) => {
             log('info', '已发送最终响应。');
 
         } catch (error) {
-            log('error', '处理上传队列时发生严重错误:', error.message);
+            log('error', '处理上传队列时发生严重错误:', error);
+            // 确保所有暂停的流都被消费掉，防止挂起
+            for (const file of fileQueue) {
+                file.fileStream.resume();
+            }
             if (!res.headersSent) {
                 res.status(500).json({ success: false, message: '上传处理失败: ' + error.message });
             }
