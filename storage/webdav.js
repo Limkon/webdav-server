@@ -10,14 +10,12 @@ const CONFIG_FILE = path.join(__dirname, '..', 'data', 'config.json');
 // --- 輔助函數：日誌記錄 ---
 function log(level, message, ...args) {
     const timestamp = new Date().toISOString();
-    // 為了調試，暫時打開 debug 日誌
     console.log(`[${timestamp}] [WEBDAV] [${level.toUpperCase()}] ${message}`, ...args);
 }
 
 let clients = {};
 let webdavConfigs = [];
 
-// 独立加载配置的函数，不再依赖 index.js
 function loadWebdavConfigs() {
     try {
         if (fs.existsSync(CONFIG_FILE)) {
@@ -75,7 +73,7 @@ function getConfigForMount(mountName) {
     return config;
 }
 
-// --- 主要修改: 从接收文件路径改为接收文件流 ---
+// --- 主要修改: 修正流式上傳和背壓問題 ---
 async function uploadStream(fileStream, fileName, mimetype, userId, folderPathInfo) {
     const { mountName, remotePath: folderPath } = folderPathInfo;
     log('info', `開始流式上傳到 WebDAV: mount=${mountName}, path=${folderPath}, file=${fileName}`);
@@ -84,24 +82,40 @@ async function uploadStream(fileStream, fileName, mimetype, userId, folderPathIn
     const client = getClient(config);
     const remoteFilePath = path.posix.join(folderPath, fileName);
 
-    // 確保遠端目錄存在
     if (folderPath && folderPath !== "/") {
         try {
             log('debug', `檢查或創建 WebDAV 目錄: ${folderPath}`);
             await client.createDirectory(folderPath, { recursive: true });
         } catch (e) {
-            // 忽略 "Method Not Allowed" 或 "Not Implemented"，這通常表示目錄已存在或伺服器不支持檢查
             if (e.response && (e.response.status !== 405 && e.response.status !== 501)) {
                  throw new Error(`创建 WebDAV 目录失败 (${e.response.status}): ${e.message}`);
             }
         }
     }
 
-    // 使用 pipe 進行流式上傳
     const writeStream = client.createWriteStream(remoteFilePath, { overwrite: true });
-    
+
+    // --- 關鍵修正：處理背壓 ---
+    // 當 WebDAV 寫入流的緩衝區滿了，它會發出 'drain' 事件。
+    // 我們監聽這個事件來恢復讀取流，從而避免記憶體溢出。
+    writeStream.on('drain', () => {
+        log('debug', `WebDAV writeStream 'drain' event for ${fileName}, resuming fileStream.`);
+        fileStream.resume();
+    });
+
+    fileStream.on('data', (chunk) => {
+        // 如果 writeStream 返回 false，表示其緩衝區已滿，我們應暫停讀取。
+        if (!writeStream.write(chunk)) {
+            log('debug', `WebDAV writeStream buffer full for ${fileName}, pausing fileStream.`);
+            fileStream.pause();
+        }
+    });
+
     return new Promise((resolve, reject) => {
-        fileStream.pipe(writeStream);
+        fileStream.on('end', () => {
+            log('debug', `fileStream 'end' event for ${fileName}. Ending writeStream.`);
+            writeStream.end();
+        });
 
         writeStream.on('finish', async () => {
             log('info', `檔案 ${remoteFilePath} 已成功流式上傳到 WebDAV。`);
@@ -129,12 +143,13 @@ async function uploadStream(fileStream, fileName, mimetype, userId, folderPathIn
 
         writeStream.on('error', (err) => {
             log('error', `WebDAV 寫入流錯誤 for ${remoteFilePath}:`, err);
+            fileStream.unpipe(writeStream); // 發生錯誤時解除 pipe
             reject(new Error(`写入 WebDAV 失败: ${err.message}`));
         });
         
         fileStream.on('error', (err) => {
             log('error', `來源檔案讀取流錯誤 for ${fileName}:`, err);
-            writeStream.end(); // 確保目標流關閉
+            writeStream.end(); 
             reject(new Error(`读取来源文件流时出错: ${err.message}`));
         });
     });
@@ -248,7 +263,7 @@ async function createDirectory(folderPathInfo) {
 
 module.exports = { 
     type: 'webdav',
-    uploadStream, // --- 修改: 導出 uploadStream ---
+    uploadStream,
     remove, 
     stream, 
     moveFile,
