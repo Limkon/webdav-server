@@ -20,11 +20,10 @@ function log(level, message, ...args) {
     console.log(`[${timestamp}] [WEBDAV] [${level.toUpperCase()}] ${message}`, ...args);
 }
 
-
 let clients = {};
 let webdavConfigs = [];
 
-// 独立加载配置的函数，不再依赖 index.js
+// 独立加载配置的函数
 function loadWebdavConfigs() {
     try {
         if (fs.existsSync(CONFIG_FILE)) {
@@ -82,10 +81,11 @@ function getConfigForMount(mountName) {
     return config;
 }
 
-async function upload(tempFilePath, fileName, mimetype, userId, folderPathInfo) {
+// --- *** 关键修正 开始 *** ---
+// 重构 upload 函数以接受流
+async function upload(fileStream, fileSize, fileName, mimetype, userId, folderPathInfo) {
     const { mountName, remotePath: folderPath } = folderPathInfo;
     log('info', `開始流式上傳到 WebDAV: mount=${mountName}, path=${folderPath}, file=${fileName}`);
-    log('debug', `臨時文件路徑: ${tempFilePath}`);
 
     const config = getConfigForMount(mountName);
     const client = getClient(config);
@@ -105,65 +105,56 @@ async function upload(tempFilePath, fileName, mimetype, userId, folderPathInfo) 
         }
     }
 
-    return new Promise(async (resolve, reject) => {
-        try {
-            const stats = await fsp.stat(tempFilePath);
-            const fileSize = stats.size;
-            log('debug', `獲取文件大小: ${fileSize} bytes`);
+    return new Promise((resolve, reject) => {
+        const writeStream = client.createWriteStream(remoteFilePath, {
+            headers: {
+                // 如果文件大小已知，则设置 Content-Length，这对某些 WebDAV 服务器是必要的
+                ...(fileSize !== undefined && { 'Content-Length': fileSize })
+            }
+        });
 
-            const readStream = fs.createReadStream(tempFilePath);
-            const writeStream = client.createWriteStream(remoteFilePath, {
-                headers: {
-                    'Content-Length': fileSize
-                }
-            });
+        writeStream.on('finish', async () => {
+            log('info', `檔案 ${remoteFilePath} 已成功上傳到 WebDAV。`);
+            try {
+                const stat = await client.stat(remoteFilePath);
+                log('debug', `獲取遠端文件信息成功: size=${stat.size}, lastmod=${stat.lastmod}`);
+                const messageId = Date.now() * 1000 + crypto.randomInt(1000);
+                const fullDbPath = path.posix.join('/', mountName, remoteFilePath);
 
-            writeStream.on('finish', async () => {
-                log('info', `檔案 ${remoteFilePath} 已成功上傳到 WebDAV。`);
-                try {
-                    const stat = await client.stat(remoteFilePath);
-                    log('debug', `獲取遠端文件信息成功: size=${stat.size}, lastmod=${stat.lastmod}`);
-                    const messageId = Date.now() * 1000 + crypto.randomInt(1000);
-                    const fullDbPath = path.posix.join('/', mountName, remoteFilePath);
+                resolve({
+                    dbData: {
+                        message_id: messageId,
+                        fileName,
+                        mimetype,
+                        size: stat.size,
+                        file_id: fullDbPath,
+                        date: new Date(stat.lastmod).getTime(),
+                    },
+                    success: true
+                });
+            } catch (statError) {
+                log('error', `上傳後獲取 WebDAV 文件狀態失敗:`, statError);
+                reject(new Error(`上传后获取 WebDAV 文件状态失败: ${statError.message}`));
+            }
+        });
 
-                    resolve({
-                        dbData: {
-                            message_id: messageId,
-                            fileName,
-                            mimetype,
-                            size: stat.size,
-                            file_id: fullDbPath,
-                            date: new Date(stat.lastmod).getTime(),
-                        },
-                        success: true
-                    });
-                } catch (statError) {
-                    log('error', `上傳後獲取 WebDAV 文件狀態失敗:`, statError);
-                    reject(new Error(`上传后获取 WebDAV 文件状态失败: ${statError.message}`));
-                }
-            });
-
-            writeStream.on('error', (err) => {
-                log('error', `WebDAV 寫入流錯誤 for ${remoteFilePath}:`, err);
-                readStream.destroy(); // 確保讀取流也關閉
-                reject(new Error(`写入 WebDAV 失败: ${err.message}`));
-            });
-            
-            readStream.on('error', (err) => {
-                log('error', `讀取臨時文件流錯誤 for ${tempFilePath}:`, err);
-                writeStream.destroy(); // 確保寫入流也關閉
-                reject(new Error(`读取临时文件失败: ${err.message}`));
-            });
-
-            log('debug', `開始管道傳輸: ${tempFilePath} -> ${remoteFilePath}`);
-            readStream.pipe(writeStream);
-
-        } catch (error) {
-            log('error', `準備上傳流時出錯:`, error);
-            reject(error);
-        }
+        writeStream.on('error', (err) => {
+            log('error', `WebDAV 寫入流錯誤 for ${remoteFilePath}:`, err);
+            fileStream.unpipe(writeStream);
+            reject(new Error(`写入 WebDAV 失败: ${err.message}`));
+        });
+        
+        fileStream.on('error', (err) => {
+            log('error', `读取上传文件流时出错:`, err);
+            writeStream.destroy(err);
+            reject(new Error(`读取上传文件流失败: ${err.message}`));
+        });
+        
+        log('debug', `开始管道传输到 ${remoteFilePath}`);
+        fileStream.pipe(writeStream);
     });
 }
+// --- *** 关键修正 结束 *** ---
 
 async function remove(itemsToRemove) {
     const results = { success: true, errors: [] };
