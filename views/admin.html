@@ -9,7 +9,7 @@
     <style>
         .form-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
             gap: 15px;
             align-items: flex-end;
         }
@@ -38,13 +38,14 @@
         </div>
 
         <div class="setting-card" id="webdav-settings-card">
-            <h2>系统共用 WebDAV 设定</h2>
-            <p>此设定将应用于所有使用者。</p>
+            <h2>WebDAV 挂载点设定</h2>
+            <p>在此处新增、编辑或删除您的 WebDAV 储存位置。每个位置都将作为根目录下的一个资料夹显示。</p>
             
             <div class="table-container">
                 <table class="user-table" id="webdav-table">
                     <thead>
                         <tr>
+                            <th>挂载名称</th>
                             <th>URL</th>
                             <th>使用者名称</th>
                             <th>操作</th>
@@ -55,10 +56,11 @@
                 </table>
             </div>
 
-            <h3 style="margin-top: 20px;">新增或编辑 WebDAV 设定</h3>
+            <h3 style="margin-top: 20px;">新增或编辑 WebDAV 挂载点</h3>
             <form id="webdav-form">
                 <input type="hidden" id="webdav-id">
                 <div class="form-grid">
+                    <input type="text" id="webdav-name" placeholder="挂载名称 (例如 mydrive)" required>
                     <input type="url" id="webdav-url" placeholder="WebDAV URL" required>
                     <input type="text" id="webdav-username" placeholder="使用者名称" required>
                     <input type="password" id="webdav-password" placeholder="密码 (留空则不变更)">
@@ -96,11 +98,12 @@
             const newUsernameInput = document.getElementById('new-username');
             const newPasswordInput = document.getElementById('new-password');
             const userTableBody = document.getElementById('user-table-body');
+            const webdavSettingsCard = document.getElementById('webdav-settings-card');
             
-            // WebDAV elements
             const webdavTableBody = document.getElementById('webdav-table-body');
             const webdavForm = document.getElementById('webdav-form');
             const webdavIdInput = document.getElementById('webdav-id');
+            const webdavNameInput = document.getElementById('webdav-name');
             const webdavUrlInput = document.getElementById('webdav-url');
             const webdavUsernameInput = document.getElementById('webdav-username');
             const webdavPasswordInput = document.getElementById('webdav-password');
@@ -109,8 +112,9 @@
 
             function clearWebdavForm() {
                 webdavForm.reset();
-                webdavIdInput.value = '';
+                webdavIdInput.value = ''; // 使用隐藏的 ID 字段来区分新增和编辑
                 saveWebdavBtn.textContent = '储存设定';
+                webdavNameInput.disabled = false;
             }
 
             async function loadWebdavSettings() {
@@ -119,23 +123,24 @@
                     const configs = res.data;
                     webdavTableBody.innerHTML = '';
                     if (configs.length === 0) {
-                         webdavTableBody.innerHTML = '<tr><td colspan="3" style="text-align: center;">尚未设定 WebDAV。</td></tr>';
+                         webdavTableBody.innerHTML = '<tr><td colspan="4" style="text-align: center;">尚未设定任何 WebDAV 挂载点。</td></tr>';
                     } else {
                         configs.forEach(config => {
                             const row = document.createElement('tr');
                             row.innerHTML = `
+                                <td>${config.name}</td>
                                 <td>${config.url}</td>
                                 <td>${config.username}</td>
                                 <td class="actions">
-                                    <button class="edit-webdav-btn" data-id="${config.id}">编辑</button>
-                                    <button class="delete-webdav-btn" data-id="${config.id}" style="background-color: #dc3545;">删除</button>
+                                    <button class="edit-webdav-btn" data-name="${config.name}">编辑</button>
+                                    <button class="delete-webdav-btn" data-name="${config.name}" style="background-color: #dc3545;">删除</button>
                                 </td>
                             `;
                             webdavTableBody.appendChild(row);
                         });
                     }
                 } catch (error) {
-                     webdavTableBody.innerHTML = '<tr><td colspan="3" style="text-align: center;">加载 WebDAV 设定失败。</td></tr>';
+                     webdavTableBody.innerHTML = '<tr><td colspan="4" style="text-align: center;">加载 WebDAV 设定失败。</td></tr>';
                 }
             }
             
@@ -144,13 +149,18 @@
             webdavForm.addEventListener('submit', async (e) => {
                 e.preventDefault();
                 const id = webdavIdInput.value;
-                const url = webdavUrlInput.value;
-                const username = webdavUsernameInput.value;
-                const password = webdavPasswordInput.value;
+                const name = webdavNameInput.value.trim();
+                const url = webdavUrlInput.value.trim();
+                const username = webdavUsernameInput.value.trim();
+                const password = webdavPasswordInput.value; // 密码可以为空
+                
+                if (!name.match(/^[a-zA-Z0-9_-]+$/)) {
+                    alert('挂载名称只能包含字母、数字、底线和连字符。');
+                    return;
+                }
 
                 try {
-                    const payload = { url, username, password };
-                    if (id) payload.id = id;
+                    const payload = { name, url, username, password, originalName: id };
                     
                     await axios.post('/api/admin/webdav', payload);
                     alert('WebDAV 设定已储存!');
@@ -163,26 +173,28 @@
             
             webdavTableBody.addEventListener('click', async (e) => {
                 const target = e.target;
-                const id = target.dataset.id;
+                const name = target.dataset.name;
 
                 if (target.classList.contains('edit-webdav-btn')) {
                      const res = await axios.get('/api/admin/webdav');
-                     const config = res.data.find(c => String(c.id) === id);
+                     const config = res.data.find(c => c.name === name);
                      if (config) {
-                         webdavIdInput.value = config.id;
+                         webdavIdInput.value = config.name; // 使用 name 作为 ID
+                         webdavNameInput.value = config.name;
+                         webdavNameInput.disabled = true; // 编辑时不允许修改名称
                          webdavUrlInput.value = config.url;
                          webdavUsernameInput.value = config.username;
-                         webdavPasswordInput.value = ''; // Don't show old password
+                         webdavPasswordInput.value = ''; 
                          webdavPasswordInput.placeholder = "密码 (留空则不变更)";
                          saveWebdavBtn.textContent = '更新设定';
                      }
                 }
 
                 if (target.classList.contains('delete-webdav-btn')) {
-                    if (confirm('确定要删除此 WebDAV 设定吗？')) {
+                    if (confirm(`确定要删除挂载点 "${name}" 吗？这不会删除远端档案，但会使它们在本系统中无法存取。`)) {
                         try {
-                            await axios.delete(`/api/admin/webdav/${id}`);
-                            alert('设定已删除。');
+                            await axios.delete(`/api/admin/webdav/${name}`);
+                            alert('挂载点已删除。');
                             loadWebdavSettings();
                         } catch (error) {
                             alert('删除失败: ' + (error.response?.data?.message || '服务器错误'));
