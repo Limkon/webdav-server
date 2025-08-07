@@ -23,8 +23,8 @@ function log(level, message, ...args) {
     // 调试日志保持原样，按需开启
     if (level === 'debug') {
         // 要启用调试日志，请取消下面的注释
-        // const timestamp = new Date().toISOString();
-        // console.log(`[${timestamp}] [SERVER] [${level.toUpperCase()}] ${message}`, ...args);
+        const timestamp = new Date().toISOString();
+        console.log(`[${timestamp}] [SERVER] [${level.toUpperCase()}] ${message}`, ...args);
         return;
     }
     const timestamp = new Date().toISOString();
@@ -402,48 +402,52 @@ app.delete('/api/admin/webdav/:id', requireAdmin, async (req, res) => {
 });
 
 // --- *** 关键修正 开始 *** ---
-// 重构 /upload 路由以正确处理流
+// 采用 "先收集，后处理" 模式重构 /upload 路由
 app.post('/upload', requireLogin, (req, res) => {
     log('info', '收到文件上传请求，开始使用 busboy 处理...');
     const userId = req.session.userId;
     const storage = storageManager.getStorage();
+    
+    const fields = {};
+    const files = [];
     const processingPromises = [];
-    let fields = {};
 
     const busboy = Busboy({ headers: req.headers });
 
     busboy.on('field', (fieldname, val) => {
-        log('debug', `Busboy field [${fieldname}]: value: ${val}`);
-        if (fieldname === 'resolutions') {
-            fields[fieldname] = JSON.parse(val);
-        } else {
-            fields[fieldname] = val;
-        }
+        log('debug', `Busboy field [${fieldname}]: value: ${val.substring(0, 100)}`);
+        fields[fieldname] = val;
     });
 
     busboy.on('file', (fieldname, fileStream, { filename, mimeType }) => {
         const originalFilename = Buffer.from(filename, 'latin1').toString('utf8');
-        log('debug', `Busboy file: [${fieldname}], filename: ${originalFilename}, mimetype: ${mimeType}`);
-        
-        const filePromise = new Promise(async (resolve, reject) => {
-            // 等待所有字段被解析
-            busboy.on('fieldsLimit', () => reject(new Error('Fields limit reached')));
-            
-            // 将文件处理逻辑包装起来，以便在 'finish' 事件后执行
-            const processFile = async () => {
-                try {
-                    const initialFolderId = parseInt(fields.folderId, 10);
-                    if (isNaN(initialFolderId)) {
-                        throw new Error('无效的 folderId');
-                    }
-                    const resolutions = fields.resolutions || {};
+        log('debug', `Busboy: 收集文件: ${originalFilename}`);
+        // 将文件流和元数据暂存起来
+        files.push({ fileStream, originalFilename, mimeType });
+    });
+
+    busboy.on('finish', async () => {
+        log('info', `Busboy 解析完成。共收到 ${Object.keys(fields).length} 个字段和 ${files.length} 个文件。开始处理...`);
+
+        try {
+            const initialFolderId = parseInt(fields.folderId, 10);
+            if (isNaN(initialFolderId)) {
+                throw new Error('无效或缺失的 folderId');
+            }
+            const resolutions = fields.resolutions ? JSON.parse(fields.resolutions) : {};
+
+            for (const file of files) {
+                const { fileStream, originalFilename, mimeType } = file;
+                
+                // 为每个文件创建一个处理 Promise
+                const promise = (async () => {
                     const action = resolutions[originalFilename] || 'upload';
                     log('debug', `处理文件: fileName=${originalFilename}, action=${action}`);
 
                     if (action === 'skip') {
                         log('debug', `跳过文件: ${originalFilename}`);
-                        fileStream.resume(); // 消费掉流
-                        return resolve({ skipped: true });
+                        fileStream.resume(); // 必须消费掉流
+                        return { skipped: true };
                     }
 
                     const pathParts = originalFilename.split('/');
@@ -464,7 +468,7 @@ app.post('/upload', requireLogin, (req, res) => {
                         const conflict = await data.findItemInFolder(fileName, targetFolderId, userId);
                         if (conflict) {
                             fileStream.resume();
-                            return resolve({ skipped: true });
+                            return { skipped: true };
                         }
                     }
                     
@@ -472,39 +476,25 @@ app.post('/upload', requireLogin, (req, res) => {
                     const result = await storage.upload(fileStream, undefined, fileName, mimeType, userId, folderPathInfo);
                     await data.addFile(result.dbData, targetFolderId, userId, 'webdav');
                     log('debug', `文件 ${fileName} 处理成功。`);
-                    resolve({ success: true });
-                } catch (procError) {
-                    log('error', `处理文件 ${originalFilename} 时出错:`, procError);
-                    fileStream.resume(); // 确保流被消费
-                    reject(procError);
-                }
-            };
+                    return { success: true };
+                })();
 
-            // 使用一个标记来确保 processFile 只被调用一次
-            if (!fileStream.listenerAdded) {
-                fileStream.listenerAdded = true;
-                busboy.on('finish', processFile);
+                processingPromises.push(promise);
             }
-        });
-
-        processingPromises.push(filePromise);
-    });
-
-    busboy.on('finish', async () => {
-        log('info', `Busboy 解析完成，等待 ${processingPromises.length} 个文件处理承诺。`);
-        try {
+            
             const results = await Promise.all(processingPromises);
-            const skippedCount = results.filter(r => r && r.skipped).length;
-            const successCount = results.filter(r => r && r.success).length;
+            log('info', '所有文件处理承诺已完成。');
 
-            if (successCount === 0 && skippedCount > 0) {
+            const skippedCount = results.filter(r => r && r.skipped).length;
+            if (files.length > 0 && skippedCount === files.length) {
                 res.json({ success: true, skippedAll: true, message: '所有文件因冲突而被跳过。' });
             } else {
                 res.json({ success: true, message: '上传成功' });
             }
-            log('info', `所有文件处理完成，已发送响应。`);
+            log('info', '已发送最终响应。');
+
         } catch (error) {
-            log('error', '上传处理链发生严重错误:', error);
+            log('error', '处理上传队列时发生严重错误:', error);
             if (!res.headersSent) {
                 res.status(500).json({ success: false, message: '上传处理失败: ' + error.message });
             }
