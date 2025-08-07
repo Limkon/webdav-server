@@ -60,7 +60,7 @@
             <form id="webdav-form">
                 <input type="hidden" id="webdav-id">
                 <div class="form-grid">
-                    <input type="text" id="webdav-name" placeholder="挂载名称 (例如 mydrive)" required>
+                    <input type="text" id="webdav-name" placeholder="挂载名称 (可中文)" required>
                     <input type="url" id="webdav-url" placeholder="WebDAV URL" required>
                     <input type="text" id="webdav-username" placeholder="使用者名称" required>
                     <input type="password" id="webdav-password" placeholder="密码 (留空则不变更)">
@@ -154,10 +154,11 @@
                 const username = webdavUsernameInput.value.trim();
                 const password = webdavPasswordInput.value; // 密码可以为空
                 
-                if (!name.match(/^[a-zA-Z0-9_-]+$/)) {
-                    alert('挂载名称只能包含字母、数字、底线和连字符。');
-                    return;
-                }
+                // **功能修改**：移除对名称的正则验证，以支援中文
+                // if (!name.match(/^[a-zA-Z0-9_-]+$/)) {
+                //     alert('挂载名称只能包含字母、数字、底线和连字符。');
+                //     return;
+                // }
 
                 try {
                     const payload = { name, url, username, password, originalName: id };
@@ -193,7 +194,8 @@
                 if (target.classList.contains('delete-webdav-btn')) {
                     if (confirm(`确定要删除挂载点 "${name}" 吗？这不会删除远端档案，但会使它们在本系统中无法存取。`)) {
                         try {
-                            await axios.delete(`/api/admin/webdav/${name}`);
+                            // **功能修改**：对 URL 中的名称进行编码，以支援中文
+                            await axios.delete(`/api/admin/webdav/${encodeURIComponent(name)}`);
                             alert('挂载点已删除。');
                             loadWebdavSettings();
                         } catch (error) {
