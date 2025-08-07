@@ -77,7 +77,8 @@ async function createMountPointsForUser(userId) {
         return;
     }
     
-    const config = storageManager.readConfig();
+    // 使用 storageManager 中已快取的設定
+    const config = storageManager.readConfig(); 
     const webdavConfigs = config.webdav || [];
 
     if (webdavConfigs.length === 0) {
@@ -85,15 +86,17 @@ async function createMountPointsForUser(userId) {
         return;
     }
 
-    log('info', `找到 ${webdavConfigs.length} 個 WebDAV 設定，開始同步資料夾...`);
+    log('info', `找到 ${webdavConfigs.length} 個 WebDAV 設定，開始為使用者 ${userId} 同步資料夾...`);
 
     for (const mount of webdavConfigs) {
         if (mount.mount_name) {
             try {
                 const existing = await data.findFolderByName(mount.mount_name, rootFolder.id, userId);
                 if (!existing) {
-                    log('info', `為使用者 ${userId} 創建掛載點資料夾: ${mount.mount_name}`);
+                    log('info', `資料夾不存在，為使用者 ${userId} 創建掛載點: /${mount.mount_name}`);
                     await data.createFolder(mount.mount_name, rootFolder.id, userId);
+                } else {
+                    log('debug', `掛載點資料夾 /${mount.mount_name} 已為使用者 ${userId} 存在。`);
                 }
             } catch (error) {
                 log('error', `為使用者 ${userId} 處理掛載點 ${mount.mount_name} 時出錯:`, error);
@@ -315,37 +318,27 @@ app.post('/api/admin/webdav', requireAdmin, async (req, res) => {
         return res.status(409).json({ success: false, message: `挂载名称 "${mount_name}" 已被使用。` });
     }
 
-    let oldMountName = null;
-
     if (isEditing) {
         const index = config.webdav.findIndex(c => c.id === id);
         if (index > -1) {
-            oldMountName = config.webdav[index].mount_name;
             config.webdav[index] = { ...config.webdav[index], url, username, mount_name };
-            if (password) {
-                config.webdav[index].password = password;
-            }
-            log('info', `正在編輯 WebDAV 掛載點: ${oldMountName} -> ${mount_name}`);
+            if (password) config.webdav[index].password = password;
         } else {
              return res.status(404).json({ success: false, message: '找不到要更新的设置' });
         }
     } else {
         const newConfig = {
             id: crypto.randomBytes(4).toString('hex'),
-            mount_name,
-            url,
-            username,
-            password
+            mount_name, url, username, password
         };
         config.webdav.push(newConfig);
-        log('info', `正在新增 WebDAV 掛載點: ${mount_name}`);
     }
     
     if (storageManager.writeConfig(config)) {
         try {
             const users = await data.listAllUsers();
             for (const user of users) {
-                await createMountPointsForUser(user.id); // 直接调用更新函数
+                await createMountPointsForUser(user.id);
             }
              res.json({ success: true, message: 'WebDAV 设置已保存' });
         } catch(dbError) {
@@ -378,7 +371,6 @@ app.delete('/api/admin/webdav/:id', requireAdmin, async (req, res) => {
                 if (rootFolder) {
                     const mountFolder = await data.findFolderByName(mountNameToDelete, rootFolder.id, user.id);
                     if (mountFolder) {
-                        // 只删除数据库记录，不删除远程文件
                         await data.deleteFolder(mountFolder.id, user.id);
                     }
                 }
@@ -443,7 +435,7 @@ app.post('/upload', requireLogin, (req, res) => {
                 const targetFolderId = await data.resolvePathToFolderId(initialFolderId, folderPathParts, userId);
                 
                 const folderPathInfo = await data.getWebdavPathInfo(targetFolderId, userId);
-                const mountConfig = storageManager.getMountConfig(folderPathInfo.mountName); // 获取特定挂载点配置
+                const mountConfig = storageManager.getMountConfig(folderPathInfo.mountName);
                 if (!mountConfig) throw new Error(`找不到名为 ${folderPathInfo.mountName} 的挂载点配置`);
 
                 if (action === 'overwrite') {
@@ -665,7 +657,7 @@ app.post('/api/folder', requireLogin, async (req, res) => {
     
     try {
         const parentPathInfo = await data.getWebdavPathInfo(parentId, userId);
-        if (!parentPathInfo.isMount) { // 禁止在非挂载点下创建文件夹
+        if (!parentPathInfo.isMount) {
              return res.status(403).json({ success: false, message: '只能在挂载点根目录下创建文件夹。' });
         }
 
@@ -730,7 +722,6 @@ app.post('/delete-multiple', requireLogin, async (req, res) => {
     const userId = req.session.userId;
     log('info', `刪除請求: files=${messageIds.join(',')}, folders=${folderIds.join(',')} by user=${userId}`);
     try {
-        // 使用统一的删除入口
         for(const id of messageIds) { await data.unifiedDelete(id, 'file', userId); }
         for(const id of folderIds) { await data.unifiedDelete(id, 'folder', userId); }
         res.json({ success: true, message: '删除成功' });
@@ -803,7 +794,7 @@ app.get('/download/proxy/:message_id', requireLogin, async (req, res) => {
 
 app.get('/file/content/:message_id', requireLogin, async (req, res) => {
     try {
-        const messageId = parseInt(req.params.message_id, 10);
+        const messageId = parseInt(req.params.id, 10);
         const [fileInfo] = await data.getFilesByIds([messageId], req.session.userId);
 
         if (!fileInfo || !fileInfo.file_id) {
