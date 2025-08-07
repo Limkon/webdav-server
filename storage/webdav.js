@@ -1,6 +1,6 @@
 // storage/webdav.js
 const { createClient } = require('webdav');
-const crypto = 'crypto';
+const crypto = require('crypto'); // *** 关键修正 ***
 const fsp = require('fs').promises;
 const fs = require('fs');
 const path = require('path');
@@ -81,7 +81,7 @@ function getConfigForMount(mountName) {
     return config;
 }
 
-// --- *** 关键修正：修改 upload 函数以接收流并加入重试机制 *** ---
+// --- 上传函数 ---
 async function upload(fileStream, fileName, mimetype, userId, folderPathInfo) {
     const { mountName, remotePath: folderPath } = folderPathInfo;
     log('info', `开始流式上传到 WebDAV: mount=${mountName}, path=${folderPath}, file=${fileName}`);
@@ -111,14 +111,13 @@ async function upload(fileStream, fileName, mimetype, userId, folderPathInfo) {
         writeStream.on('finish', async () => {
             log('info', `文件 ${remoteFilePath} 已成功流式上传到 WebDAV。现在开始验证...`);
             
-            // --- *** 关键修正：加入重试逻辑 *** ---
             const maxRetries = 5;
             const retryDelay = 500; // ms
             let lastError = null;
 
             for (let i = 0; i < maxRetries; i++) {
                 try {
-                    await delay(retryDelay * (i + 1)); // 逐渐增加延迟
+                    await delay(retryDelay * (i + 1)); 
                     log('debug', `第 ${i + 1} 次尝试获取文件状态: ${remoteFilePath}`);
                     const stat = await client.stat(remoteFilePath);
                     
@@ -137,24 +136,22 @@ async function upload(fileStream, fileName, mimetype, userId, folderPathInfo) {
                         },
                         success: true
                     });
-                    return; // 成功，退出循环和函数
+                    return;
 
                 } catch (statError) {
                     lastError = statError;
                     if (statError.status === 404) {
                         log('warn', `第 ${i + 1} 次尝试获取状态失败 (404 Not Found)，将在 ${retryDelay * (i + 2)}ms 后重试...`);
                     } else {
-                        // 如果不是 404，可能是其他严重错误，直接失败
                         log('error', `获取文件状态时发生非 404 错误:`, statError);
                         reject(statError);
                         return;
                     }
                 }
             }
-            // --- *** 重试逻辑结束 *** ---
 
             log('error', `重试 ${maxRetries} 次后，仍无法获取文件状态: ${remoteFilePath}`, lastError);
-            reject(lastError); // 所有重试都失败了
+            reject(lastError);
         });
 
         writeStream.on('error', (err) => {
@@ -164,7 +161,7 @@ async function upload(fileStream, fileName, mimetype, userId, folderPathInfo) {
 
         fileStream.on('error', (err) => {
             log('error', `文件读取流错误: ${fileName}`, err);
-            writeStream.end(); // 确保WebDAV流被关闭
+            writeStream.end();
             reject(err);
         });
     });
