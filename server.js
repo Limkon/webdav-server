@@ -385,6 +385,7 @@ app.delete('/api/admin/webdav/:id', requireAdmin, async (req, res) => {
 
 app.post('/upload', requireLogin, async (req, res) => {
     try {
+        log('info', `[日志] 收到上传请求，正在初始化 busboy...`);
         const bb = busboy({ headers: req.headers });
         const userId = req.session.userId;
         const storage = storageManager.getStorage();
@@ -394,20 +395,33 @@ app.post('/upload', requireLogin, async (req, res) => {
         const filesToProcess = [];
         
         bb.on('field', (name, val) => {
+            log('debug', `[日志] Busboy 收到字段: ${name} = ${val}`);
             if (name === 'folderId') initialFolderId = parseInt(val, 10);
             if (name === 'resolutions') resolutions = JSON.parse(val);
         });
 
         bb.on('file', (name, fileStream, info) => {
             const { filename, encoding, mimeType } = info;
-            // busboy 会自动处理编码，这里我们得到的是解码后的 UTF-8 文件名
-            const decodedFilename = filename; 
+            const decodedFilename = filename;
+            log('info', `[日志] Busboy 收到文件流: ${decodedFilename}`);
             
+            fileStream.on('data', (data) => {
+                log('debug', `[日志] 正在接收文件 ${decodedFilename} 的数据块，长度: ${data.length}`);
+            });
+
+            fileStream.on('end', () => {
+                log('info', `[日志] 文件流 ${decodedFilename} 已接收完毕。`);
+            });
+
             filesToProcess.push(async () => {
+                log('info', `[日志] 开始处理文件: ${decodedFilename}`);
                 try {
                     const action = resolutions[decodedFilename] || 'upload';
 
                     if (action === 'skip') {
+                        log('info', `[日志] Action 'skip' for ${decodedFilename}, 跳过上传。`);
+                        // 需要消耗掉流，否则请求会挂起
+                        fileStream.resume(); 
                         return { skipped: true };
                     }
                     
@@ -416,32 +430,44 @@ app.post('/upload', requireLogin, async (req, res) => {
                     const folderPathParts = pathParts;
                     
                     const targetFolderId = await data.resolvePathToFolderId(initialFolderId, folderPathParts, userId);
+                    log('debug', `[日志] 解析路径后，目标文件夹ID: ${targetFolderId}`);
                     
                     if (action === 'overwrite') {
                         const existingItem = await data.findItemInFolder(fileName, targetFolderId, userId);
                         if (existingItem) {
+                            log('info', `[日志] Action 'overwrite' for ${fileName}, 正在删除旧项目...`);
                             await data.unifiedDelete(existingItem.id, existingItem.type, userId);
                         }
                     } else if (action === 'rename') {
+                        const oldName = fileName;
                         fileName = await data.findAvailableName(fileName, targetFolderId, userId, false);
+                        log('info', `[日志] Action 'rename' for ${oldName}, 新名称为 ${fileName}`);
                     } else {
                         const conflict = await data.findItemInFolder(fileName, targetFolderId, userId);
-                        if (conflict) return { skipped: true };
+                        if (conflict) {
+                             log('info', `[日志] 发现冲突 for ${fileName}, 跳过上传。`);
+                             fileStream.resume();
+                             return { skipped: true };
+                        }
                     }
 
                     const folderPathInfo = await data.getWebdavPathInfo(targetFolderId, userId);
+                    log('debug', `[日志] 获取到 WebDAV 路径信息:`, folderPathInfo);
                     const result = await storage.upload(fileStream, fileName, mimeType, userId, folderPathInfo);
+                    log('info', `[日志] storage.upload 完成 for ${fileName}`);
                     const dbResult = await data.addFile(result.dbData, targetFolderId, userId, 'webdav');
+                    log('info', `[日志] 文件 ${fileName} 已写入数据库，ID: ${dbResult.fileId}`);
                     return { ...result, fileId: dbResult.fileId };
                 } catch (uploadError) {
-                    log('error', `处理文件 ${decodedFilename} 时出错:`, uploadError);
+                    log('error', `[日志] 处理文件 ${decodedFilename} 时出错:`, uploadError);
+                    fileStream.resume(); // 确保消耗流
                     return { error: true, message: uploadError.message };
                 }
             });
         });
 
         bb.on('finish', async () => {
-            log('info', `接收到 ${filesToProcess.length} 个文件的流式上传请求。`);
+            log('info', `[日志] Busboy 'finish' 事件触发，所有字段和文件流已接收。开始处理 ${filesToProcess.length} 个文件。`);
             const results = [];
             let skippedCount = 0;
 
@@ -453,6 +479,8 @@ app.post('/upload', requireLogin, async (req, res) => {
                     results.push(result);
                 }
             }
+            
+            log('info', `[日志] 所有文件处理完毕。成功: ${results.length}, 跳过: ${skippedCount}。准备发送响应。`);
 
             if (results.length === 0 && skippedCount > 0) {
                 res.json({ success: true, skippedAll: true, message: '所有文件因冲突而被跳过。' });
@@ -461,10 +489,14 @@ app.post('/upload', requireLogin, async (req, res) => {
             }
         });
         
+        req.on('close', () => {
+            log('warn', '[日志] 请求在 busboy 完成前被客户端关闭。');
+        });
+
         req.pipe(bb);
 
     } catch (error) {
-        log('error', '处理 busboy 上传时发生错误:', error);
+        log('error', '处理 busboy 上传时发生严重错误:', error);
         res.status(500).json({ success: false, message: '处理上传时发生错误: ' + error.message });
     }
 });
