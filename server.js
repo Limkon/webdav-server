@@ -176,7 +176,6 @@ app.get('/admin', requireAdmin, (req, res) => res.sendFile(path.join(__dirname, 
 app.get('/scan', requireAdmin, (req, res) => res.sendFile(path.join(__dirname, 'views/scan.html')));
 
 // --- API Endpoints ---
-// ... (此處省略未變更的 API 路由，以節省篇幅)
 app.post('/api/user/change-password', requireLogin, async (req, res) => {
     const { oldPassword, newPassword } = req.body;
     log('info', `使用者 ${req.session.userId} 正在嘗試修改密碼。`);
@@ -402,26 +401,16 @@ app.delete('/api/admin/webdav/:id', requireAdmin, async (req, res) => {
     }
 });
 
-// --- 主要修改: 使用 busboy 實現流式上傳並解決中文檔名亂碼 ---
+// --- 主要修改: 使用 busboy 並修正中文檔名亂碼 ---
 app.post('/upload', requireLogin, (req, res) => {
     log('info', '接收到流式上傳請求...');
     
-    // --- 修復中文檔名亂碼的關鍵 ---
-    // busboy 需要正確的 headers，但 Express/Node 預設可能不會正確解碼帶有 UTF-8 filename* 的 header。
-    // 我們需要手動解碼 Content-Disposition header。
-    let contentDisposition = req.headers['content-disposition'];
-    if (contentDisposition) {
-        // 尋找 filename*=UTF-8''... 模式
-        const utf8FilenameMatch = /filename\*=UTF-8''([\w%\-.]+)(?:; |$)/i.exec(contentDisposition);
-        if (utf8FilenameMatch) {
-            const decodedFilename = decodeURIComponent(utf8FilenameMatch[1]);
-            // 將解碼後的檔名重新組合回 header，讓 busboy 可以正確解析
-            req.headers['content-disposition'] = `form-data; name="files"; filename="${decodedFilename}"`;
-            log('debug', `檢測到並解碼 UTF-8 檔名: ${decodedFilename}`);
-        }
-    }
-
-    const bb = busboy({ headers: req.headers });
+    // --- 關鍵修正: 設定 busboy 來正確解碼 UTF-8 檔名 ---
+    const bb = busboy({ 
+        headers: req.headers,
+        defCharset: 'utf8' 
+    });
+    
     const userId = req.session.userId;
     const storage = storageManager.getStorage();
     
@@ -436,14 +425,13 @@ app.post('/upload', requireLogin, (req, res) => {
 
     bb.on('file', (name, fileStream, info) => {
         const { filename, encoding, mimeType } = info;
-        // 經過上面的 header 修正，這裡的 filename 應該是正確的 UTF-8 字串
         log('info', `Busboy: 開始接收檔案流: ${filename}, MIME: ${mimeType}`);
 
         const fileData = {
             stream: fileStream,
-            filename: filename, // 直接使用 busboy 解析出的檔名
+            filename: filename,
             mimetype: mimeType,
-            relativePath: null 
+            relativePath: null
         };
         filesData.push(fileData);
 
@@ -455,7 +443,7 @@ app.post('/upload', requireLogin, (req, res) => {
                         if(fields.folderId !== undefined && fields.relativePaths !== undefined) {
                             resolve();
                         } else {
-                            setTimeout(checkFields, 50); // 短暫輪詢等待欄位
+                           setTimeout(checkFields, 50);
                         }
                     };
                     checkFields();
@@ -600,7 +588,7 @@ app.post('/api/text-file', requireLogin, async (req, res) => {
         log('error', `儲存文字檔案失敗:`, error);
         res.status(500).json({ success: false, message: '服务器内部错误' });
     } finally {
-        if (fsSync.existsSync(tempFilePath)) {
+        if (fs.existsSync(tempFilePath)) {
             await fsp.unlink(tempFilePath).catch(err => {});
         }
     }
