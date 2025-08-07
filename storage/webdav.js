@@ -9,7 +9,7 @@ const CONFIG_FILE = path.join(__dirname, '..', 'data', 'config.json');
 
 // --- 輔助函數：日誌記錄 ---
 function log(level, message, ...args) {
-    if (level === 'debug') return; // 移除调试日志
+    // 强制开启所有日志等级以便调试
     const timestamp = new Date().toISOString();
     console.log(`[${timestamp}] [WEBDAV] [${level.toUpperCase()}] ${message}`, ...args);
 }
@@ -77,14 +77,16 @@ function getConfigForMount(mountName) {
 
 async function upload(fileStream, fileName, mimetype, userId, folderPathInfo) {
     const { mountName, remotePath: folderPath } = folderPathInfo;
-    log('info', `開始流式上傳到 WebDAV: mount=${mountName}, path=${folderPath}, file=${fileName}`);
+    log('info', `[日志] 开始处理流式上传到 WebDAV: mount=${mountName}, path=${folderPath}, file=${fileName}`);
     const config = getConfigForMount(mountName);
     const client = getClient(config);
     const remoteFilePath = path.posix.join(folderPath, fileName);
 
     if (folderPath && folderPath !== "/") {
         try {
+            log('debug', `[日志] 检查/创建 WebDAV 目录: ${folderPath}`);
             await client.createDirectory(folderPath, { recursive: true });
+            log('debug', `[日志] WebDAV 目录已确认存在: ${folderPath}`);
         } catch (e) {
             if (e.response && (e.response.status !== 405 && e.response.status !== 501)) {
                  throw new Error(`创建 WebDAV 目录失败 (${e.response.status}): ${e.message}`);
@@ -92,13 +94,20 @@ async function upload(fileStream, fileName, mimetype, userId, folderPathInfo) {
         }
     }
     
-    const passThrough = fileStream; // 直接使用传入的流
-    await client.putFileContents(remoteFilePath, passThrough, { overwrite: true, onUploadProgress: (progress) => {
-        log('debug', `Uploading ${fileName}: ${Math.round(progress.loaded/progress.total * 100)}%`);
-    }});
-    log('info', `檔案 ${remoteFilePath} 已成功流式上傳到 WebDAV。`);
+    const passThrough = fileStream; 
+    log('info', `[日志] 即将开始执行 client.putFileContents, 目标路径: ${remoteFilePath}`);
+    await client.putFileContents(remoteFilePath, passThrough, { 
+        overwrite: true, 
+        onUploadProgress: (progress) => {
+            const percent = Math.round(progress.loaded / progress.total * 100);
+            log('debug', `[日志] 上传进度 for ${fileName}: ${progress.loaded}/${progress.total} (${percent}%)`);
+        }
+    });
+    log('info', `[日志] client.putFileContents Promise 已解决. 檔案 ${remoteFilePath} 已成功流式上傳到 WebDAV。`);
     
+    log('debug', `[日志] 正在获取文件状态: ${remoteFilePath}`);
     const stat = await client.stat(remoteFilePath);
+    log('info', `[日志] 成功获取文件状态，大小: ${stat.size}`);
     const messageId = Date.now() * 1000 + crypto.randomInt(1000);
     
     const fullDbPath = path.posix.join('/', mountName, remoteFilePath);
