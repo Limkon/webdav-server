@@ -68,11 +68,15 @@ function writeConfig(newConfig) {
 
 // 獲取當前儲存引擎的介面
 function getStorage() {
-    if (config.storage_type === 'webdav') {
+    // 修正: 確保即使 config.storage_type 不存在，也能正確處理
+    if (!config.storage_type || config.storage_type === 'webdav') {
+        if (!config.storage_type) {
+            log('warn', '設定檔中缺少 storage_type，將預設使用 WebDAV。');
+        }
         return webdav;
     }
-    log('warn', '未知的儲存類型，將預設使用 WebDAV。');
-    return webdav; // 預設返回 webdav
+    log('error', `不支援的儲存類型: ${config.storage_type}`);
+    return webdav; // 作為最終備用
 }
 
 // 新增：獲取特定掛載點設定的函數
