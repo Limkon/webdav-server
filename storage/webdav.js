@@ -4,10 +4,12 @@ const db = require('../database.js');
 const crypto = require('crypto');
 const fs = require('fs'); 
 const path = require('path');
-const storageManager = require('./index');
+// 移除顶部的循环依赖: const storageManager = require('./index');
 
 // 动态获取客户端
 function getClient(mountName) {
+    // **错误修复**: 将 require 移入函数内部，在使用时加载，打破循环依赖
+    const storageManager = require('./index'); 
     const webdavConfig = storageManager.getWebdavConfigByName(mountName);
     if (!webdavConfig) {
         throw new Error(`找不到名为 '${mountName}' 的 WebDAV 挂载点设定`);
@@ -25,7 +27,6 @@ async function upload(fileStream, fileName, mimetype, userId, folderId, caption 
     // [DEBUG] 日志：进入上传函数
     // console.log(`[DEBUG] [WebDAV] Starting upload for user ${userId}, folder ${folderId}, file "${fileName}"`);
 
-    // **新增**：在函数开头进行双重检查，防止上传到根目录
     const rootFolder = await data.getRootFolder(userId);
     if(folderId === rootFolder.id) {
          throw new Error("逻辑错误：无法上传到根目录。请选择一个挂载点内的资料夹。");
@@ -33,7 +34,6 @@ async function upload(fileStream, fileName, mimetype, userId, folderId, caption 
 
     const folderPathParts = await data.getFolderPath(folderId, userId);
     if (folderPathParts.length < 2) {
-        // 这个错误现在理论上不应该再被触发，但作为最后的防线保留
         throw new Error("无效的目标资料夹，无法确定挂载点。");
     }
     const mountName = folderPathParts[1].name;
@@ -141,7 +141,6 @@ async function remove(files, folders, userId) {
     return results;
 }
 
-// 流操作
 async function stream(file_id, userId) {
     const mountName = file_id.split('/')[0];
     const remotePath = file_id.substring(mountName.length);
@@ -160,7 +159,7 @@ async function getUrl(file_id, userId) {
 
 async function createDirectory(fullPath) {
     const mountName = fullPath.split('/')[0];
-    const remotePath = fullPath.substring(mountName.length);
+    const remotePath = '/' + fullPath.substring(mountName.length + 1);
     // [DEBUG] 日志：创建目录
     // console.log(`[DEBUG] [WebDAV] Creating directory '${remotePath}' on mount '${mountName}'`);
     const client = getClient(mountName);
