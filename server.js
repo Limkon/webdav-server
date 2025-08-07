@@ -6,7 +6,7 @@ const session = require('express-session');
 const path = require('path');
 const axios = require('axios');
 const archiver = require('archiver');
-const bcrypt = require('bcrypt');
+const bcrypt = 'bcrypt';
 const fs = require('fs');
 const fsp = require('fs').promises;
 const crypto = require('crypto');
@@ -24,7 +24,7 @@ function log(level, message, ...args) {
     console.log(`[${timestamp}] [SERVER] [${level.toUpperCase()}] ${message}`, ...args);
 }
 
-// --- Temp File Directory and Cleanup (for non-upload tasks if needed) ---
+// --- Temp File Directory and Cleanup ---
 const TMP_DIR = path.join(__dirname, 'data', 'tmp');
 
 async function cleanupTempDir() {
@@ -174,6 +174,7 @@ app.get('/folder/:id', requireLogin, (req, res) => res.sendFile(path.join(__dirn
 app.get('/shares-page', requireLogin, (req, res) => res.sendFile(path.join(__dirname, 'views/shares.html')));
 app.get('/admin', requireAdmin, (req, res) => res.sendFile(path.join(__dirname, 'views/admin.html')));
 app.get('/scan', requireAdmin, (req, res) => res.sendFile(path.join(__dirname, 'views/scan.html')));
+
 
 // --- API Endpoints ---
 app.post('/api/user/change-password', requireLogin, async (req, res) => {
@@ -401,6 +402,7 @@ app.delete('/api/admin/webdav/:id', requireAdmin, async (req, res) => {
     }
 });
 
+// --- 核心修正：上傳路由 ---
 app.post('/upload', requireLogin, (req, res) => {
     log('info', '接收到流式上傳請求...');
     
@@ -415,12 +417,14 @@ app.post('/upload', requireLogin, (req, res) => {
     let fields = {};
     let filePromises = [];
     let filesData = [];
+    let fieldProcessingDone = new Promise(resolve => bb.on('fieldsLimit', resolve));
 
     bb.on('field', (name, val) => {
         log('debug', `Busboy: 收到欄位: ${name}`);
-        if (name === 'relativePaths') {
-            if (!fields[name]) fields[name] = [];
-            fields[name].push(val);
+        // 處理多檔案上傳時， relativePaths 會是多個欄位
+        if (name === 'relativePaths' || name === 'relativePaths[]') {
+            if (!fields.relativePaths) fields.relativePaths = [];
+            fields.relativePaths.push(val);
         } else {
             fields[name] = val;
         }
@@ -436,44 +440,33 @@ app.post('/upload', requireLogin, (req, res) => {
             mimetype: mimeType,
             relativePath: null 
         };
+        filesData.push(fileData);
         
         const filePromise = new Promise(async (resolve, reject) => {
             try {
-                await new Promise(resolveFields => {
-                    const fieldsReady = () => fields.folderId !== undefined && fields.relativePaths !== undefined;
-                    if(fieldsReady()){
-                       resolveFields();
-                       return;
-                    }
-                    bb.on('fieldsLimit', resolveFields).on('finish', () => {
-                       // In case finish fires before fields are all processed
-                       if(!fieldsReady()) setTimeout(() => resolveFields(), 100);
-                       else resolveFields();
-                    });
-                });
+                // 等待所有非檔案欄位都處理完畢
+                await fieldProcessingDone;
                 
-                const fileIndex = filesData.length;
-                filesData.push(fileData);
-
-                let relativePaths = fields.relativePaths;
-                if(relativePaths && !Array.isArray(relativePaths)) relativePaths = [relativePaths];
-                
-                fileData.relativePath = relativePaths ? relativePaths[fileIndex] : fileData.filename;
+                // 找到這個檔案對應的相對路徑
+                const fileIndex = filesData.findIndex(fd => fd.stream === fileStream);
+                fileData.relativePath = (fields.relativePaths && fields.relativePaths[fileIndex]) ? fields.relativePaths[fileIndex] : fileData.filename;
 
                 const initialFolderId = parseInt(fields.folderId, 10);
                 const resolutions = fields.resolutions ? JSON.parse(fields.resolutions) : {};
                 const action = resolutions[fileData.relativePath] || 'upload';
                 log('debug', `處理檔案: ${fileData.relativePath}, Action: ${action}`);
 
+                const pathParts = (fileData.relativePath || fileData.filename).split('/');
+                let finalFilename = pathParts.pop() || fileData.filename;
+                const folderPathParts = pathParts;
+
+                // 如果操作是跳過，則必須消耗掉這個檔案的流，否則會阻塞
                 if (action === 'skip') {
                     log('info', `跳過檔案: ${fileData.relativePath}`);
                     fileStream.resume(); 
                     return resolve({ skipped: true });
                 }
 
-                const pathParts = (fileData.relativePath || fileData.filename).split('/');
-                let finalFilename = pathParts.pop() || fileData.filename;
-                const folderPathParts = pathParts;
                 const targetFolderId = await data.resolvePathToFolderId(initialFolderId, folderPathParts, userId);
                 
                 if (action === 'overwrite') {
@@ -489,12 +482,13 @@ app.post('/upload', requireLogin, (req, res) => {
                     const conflict = await data.findItemInFolder(finalFilename, targetFolderId, userId);
                     if (conflict) {
                         log('info', `檔案衝突，跳過: ${finalFilename}`);
-                        fileStream.resume();
+                        fileStream.resume(); // 同樣，必須消耗掉流
                         return resolve({ skipped: true });
                     }
                 }
                 
                 const folderPathInfo = await data.getWebdavPathInfo(targetFolderId, userId);
+                log('debug', `準備將檔案流傳遞給 storage.uploadStream: ${finalFilename}`);
                 const result = await storage.uploadStream(fileStream, finalFilename, fileData.mimetype, userId, folderPathInfo);
                 const dbResult = await data.addFile(result.dbData, targetFolderId, userId, 'webdav');
                 log('info', `檔案 ${finalFilename} 已成功流式上傳並存入資料庫。`);
@@ -502,7 +496,7 @@ app.post('/upload', requireLogin, (req, res) => {
 
             } catch (err) {
                 log('error', `處理檔案流 ${fileData.filename} 時出錯:`, err);
-                fileStream.resume(); 
+                fileStream.resume(); // 確保在任何錯誤情況下都消耗掉流
                 reject(err);
             }
         });
@@ -525,7 +519,9 @@ app.post('/upload', requireLogin, (req, res) => {
             }
         } catch (error) {
             log('error', '完成上傳處理時發生錯誤:', error);
-            res.status(500).json({ success: false, message: '处理上传时发生错误: ' + error.message });
+            if (!res.headersSent) {
+                res.status(500).json({ success: false, message: '处理上传时发生错误: ' + error.message });
+            }
         }
     });
     
@@ -565,6 +561,7 @@ app.post('/api/text-file', requireLogin, async (req, res) => {
                 if (fileName !== originalFile.fileName) {
                     const conflict = await data.checkFullConflict(fileName, finalFolderId, userId);
                     if (conflict) {
+                        await fsp.unlink(tempFilePath).catch(err => {});
                         return res.status(409).json({ success: false, message: '同目录下已存在同名文件或文件夹。' });
                     }
                 }
@@ -982,7 +979,7 @@ app.post('/api/scan/webdav', requireAdmin, async (req, res) => {
                     const fileIdToFind = path.posix.join('/', mountConfig.mount_name, item.filename);
                     const existing = await data.findFileByFileId(fileIdToFind, userId);
                      if (existing) {
-                        log.push({ message: `已存在: ${fileIdToFind}，跳過。`, type: 'info' });
+                        log.push({ message: `已存在: ${fileIdToFind}，跳过。`, type: 'info' });
                     } else {
                         const folderPathInDb = path.posix.join('/', mountConfig.mount_name, path.dirname(item.filename));
                         const folderId = await data.findOrCreateFolderByPath(folderPathInDb, userId);
