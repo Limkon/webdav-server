@@ -459,7 +459,7 @@ app.post('/upload', requireLogin, (req, res) => {
             
             const folderPathInfo = await data.getWebdavPathInfo(targetFolderId, userId);
             const result = await storage.upload(fileStream, undefined, fileName, mimeType, userId, folderPathInfo);
-            await data.addFile(result.dbData, targetFolderId, userId, storage.type);
+            await data.addFile(result.dbData, targetFolderId, userId, 'webdav');
             log('info', `文件 ${fileName} 已成功上传并处理。`);
             return { success: true };
         })();
