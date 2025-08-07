@@ -412,8 +412,10 @@ app.post('/upload', requireLogin, (req, res) => {
     });
 
     bb.on('file', (name, fileStream, info) => {
-        const { filename, encoding, mimeType } = info;
-        // busboy 会自动处理 utf-8 文件名
+        // --- *** 文件名乱码修复 *** ---
+        const { filename: rawFilename, encoding, mimeType } = info;
+        const filename = Buffer.from(rawFilename, 'latin1').toString('utf8');
+        // --- *** 修复结束 *** ---
         log('debug', `Busboy: 开始接收文件流: ${filename} (mimetype: ${mimeType})`);
 
         const processFile = async () => {
