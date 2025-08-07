@@ -11,14 +11,14 @@ const bcrypt = require('bcrypt');
 const fs = require('fs');
 const fsp = require('fs').promises;
 const crypto = require('crypto');
-const db = require('./database.js'); 
+const db = require('./database.js');
 
 const data = require('./data.js');
-const storageManager = require('./storage'); 
+const storageManager = require('./storage');
 
 const app = express();
 
-// --- 輔助函數：日誌記錄 ---
+// --- 辅助函数：日志记录 ---
 function log(level, message, ...args) {
     // 调试日志现在将被打印
     const timestamp = new Date().toISOString();
@@ -402,30 +402,36 @@ app.post('/upload', requireLogin, (req, res) => {
     const storage = storageManager.getStorage();
     
     const fields = {};
-    const fileQueue = [];
     const filePromises = [];
-    
     let allFilesSkipped = true;
+    let fieldsLoaded = false;
+    let fieldResolve;
+    const fieldsLoadedPromise = new Promise(resolve => fieldResolve = resolve);
 
     bb.on('field', (name, val) => {
         log('debug', `Busboy: 收到字段: ${name} = ${val}`);
         fields[name] = val;
+        // 一旦收到必要的 folderId，就解决 promise
+        if (name === 'folderId') {
+            fieldsLoaded = true;
+            fieldResolve();
+        }
     });
 
     bb.on('file', (name, fileStream, info) => {
-        const { filename: rawFilename, encoding, mimeType } = info;
+        const { filename: rawFilename, mimeType } = info;
         const filename = Buffer.from(rawFilename, 'latin1').toString('utf8');
         log('debug', `Busboy: 开始接收文件流: ${filename} (mimetype: ${mimeType})`);
-        
-        // 先将文件流和信息存入队列
-        fileQueue.push({ fileStream, filename, mimeType });
-    });
 
-    bb.on('finish', async () => {
-        log('debug', 'Busboy: 所有文件和字段已接收完毕');
-        
-        const processFile = async ({ fileStream, filename, mimeType }) => {
+        const processFile = async () => {
             try {
+                // 等待所有字段被解析
+                if (!fieldsLoaded) {
+                    log('debug', `文件 ${filename}: 等待字段解析...`);
+                    await fieldsLoadedPromise;
+                    log('debug', `文件 ${filename}: 字段已解析，继续处理。`);
+                }
+                
                 const initialFolderId = parseInt(fields.folderId, 10);
                 const resolutions = fields.resolutions ? JSON.parse(fields.resolutions) : {};
                 
@@ -436,7 +442,7 @@ app.post('/upload', requireLogin, (req, res) => {
 
                 if (action === 'skip') {
                     log('info', `跳过文件: ${filename}`);
-                    fileStream.resume(); 
+                    fileStream.resume(); // 消耗掉流
                     return;
                 }
                 
@@ -468,19 +474,23 @@ app.post('/upload', requireLogin, (req, res) => {
                 log('info', `成功处理并保存文件: ${finalFileName}`);
             } catch (err) {
                 log('error', `处理文件 ${filename} 时发生错误:`, err);
-                fileStream.resume();
-                throw err;
+                fileStream.resume(); // 确保流被消费掉
+                throw err; // 将错误往上传递
             }
         };
-        
-        for(const file of fileQueue) {
-            filePromises.push(processFile(file));
-        }
+        log('debug', `将文件 ${filename} 的处理程序推入队列`);
+        filePromises.push(processFile());
+    });
 
+    bb.on('finish', async () => {
+        log('debug', 'Busboy: 所有文件和字段已接收完毕');
+        if (!fieldsLoaded) fieldResolve(); // 确保即使没有文件上传，promise 也能解决
+
+        log('debug', `等待 ${filePromises.length} 个文件处理承诺完成...`);
         try {
             await Promise.all(filePromises);
             log('info', '所有文件处理完成');
-            if (allFilesSkipped && fileQueue.length > 0) {
+            if (allFilesSkipped && filePromises.length > 0) {
                  res.json({ success: true, skippedAll: true, message: '所有文件因冲突而被跳过。' });
             } else {
                 res.json({ success: true, message: '上传成功！' });
