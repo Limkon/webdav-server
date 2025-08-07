@@ -62,7 +62,7 @@ document.addEventListener('DOMContentLoaded', () => {
     let selectedItems = new Map();
     let moveTargetFolderId = null;
     let isSearchMode = false;
-    const MAX_TELEGRAM_SIZE = 5000 * 1024 * 1024;
+    const MAX_TELEGRAM_SIZE = 50 * 1024 * 1024;
     let foldersLoaded = false;
     let currentView = 'grid';
     // --- 新增：判断是否为根目录 ---
@@ -1171,4 +1171,3 @@ document.addEventListener('DOMContentLoaded', () => {
         window.addEventListener('resize', checkScreenWidthAndCollapse);
     }
 });
-
