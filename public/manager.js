@@ -142,7 +142,13 @@ document.addEventListener('DOMContentLoaded', () => {
             showNotification('请选择文件或文件夹。', 'error', !isDrag ? uploadNotificationArea : null);
             return;
         }
-        if (currentFolderId === userRootId) {
+
+        if (parseInt(targetFolderId, 10) === userRootId) {
+            showNotification('无法直接上传到根目录，请选择一个挂载点内的资料夹。', 'error', !isDrag ? uploadNotificationArea : null);
+            return;
+        }
+
+        if (currentFolderId === userRootId && isDrag) {
              showNotification('无法直接上传到根目录，请先进入一个挂载点。', 'error', !isDrag ? uploadNotificationArea : null);
             return;
         }
@@ -202,13 +208,12 @@ document.addEventListener('DOMContentLoaded', () => {
             if (searchInput) searchInput.value = '';
             currentFolderId = folderId;
 
-            // 如果是根目录，则加载挂载点
             if (folderId === userRootId) {
-                const res = await axios.get('/api/mounts');
-                webdavMounts = res.data.mounts;
-                currentFolderContents = { folders: res.data.mounts, files: [] };
+                const res = await axios.get(`/api/folder/${folderId}`);
+                webdavMounts = res.data.contents.folders;
+                currentFolderContents = { folders: res.data.contents.folders, files: [] };
                 renderBreadcrumb(res.data.path);
-                renderItems(res.data.mounts, []);
+                renderItems(res.data.contents.folders, []);
             } else {
                 const res = await axios.get(`/api/folder/${folderId}`);
                 currentFolderContents = res.data.contents;
@@ -216,7 +221,6 @@ document.addEventListener('DOMContentLoaded', () => {
                 renderItems(currentFolderContents.folders, currentFolderContents.files);
             }
 
-            // 清理已不存在的选择项
             const currentIds = new Set([...currentFolderContents.folders.map(f => String(f.id)), ...currentFolderContents.files.map(f => String(f.id))]);
             selectedItems.forEach((_, key) => {
                 if (!currentIds.has(key)) {
@@ -230,7 +234,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 window.location.href = '/login';
             }
             itemGrid.innerHTML = '<p>加载内容失败。</p>';
-            itemListBody.innerHTML = '<p>加载内容失败。</p>';
+            itemListBody.innerHTML = '<tr><td colspan="4">加载内容失败。</td></tr>';
         }
     };
     
@@ -266,7 +270,7 @@ document.addEventListener('DOMContentLoaded', () => {
             updateActionBar();
         } catch (error) {
             itemGrid.innerHTML = '<p>搜寻失败。</p>';
-            itemListBody.innerHTML = '<p>搜寻失败。</p>';
+            itemListBody.innerHTML = '<tr><td colspan="4">搜寻失败。</td></tr>';
         }
     };
     const renderBreadcrumb = (path) => {
@@ -307,7 +311,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 message = '这个资料夾是空的。';
             }
             if (currentView === 'grid') parentGrid.innerHTML = `<p>${message}</p>`;
-            else parentList.innerHTML = `<div class="list-item"><p>${message}</p></div>`;
+            else parentList.innerHTML = `<tr><td colspan="4" class="empty-folder-message">${message}</td></tr>`;
             return;
         }
 
@@ -347,29 +351,28 @@ document.addEventListener('DOMContentLoaded', () => {
     };
 
     const createListItem = (item) => {
-        const itemDiv = document.createElement('div');
-        itemDiv.className = 'list-item';
-        itemDiv.dataset.id = item.id;
-        itemDiv.dataset.type = item.type;
-        itemDiv.dataset.name = item.name === '/' ? '根目录' : item.name;
+        const itemRow = document.createElement('tr');
+        itemRow.className = 'list-item-row';
+        itemRow.dataset.id = item.id;
+        itemRow.dataset.type = item.type;
+        itemRow.dataset.name = item.name === '/' ? '根目录' : item.name;
 
         const icon = item.type === 'folder' ? 'fa-folder' : getFileIconClass(item.mimetype);
         const name = item.name === '/' ? '根目录' : item.name;
         const size = item.type === 'file' && item.size ? formatBytes(item.size) : '—';
         const date = item.date ? new Date(item.date).toLocaleDateString() : '—';
 
-        itemDiv.innerHTML = `
-            <div class="list-icon"><i class="fas ${icon}"></i></div>
-            <div class="list-name" title="${name}">${name}</div>
-            <div class="list-size">${size}</div>
-            <div class="list-date">${date}</div>
+        itemRow.innerHTML = `
+            <td><div class="list-item-cell name-cell"><i class="fas ${icon}"></i><span title="${name}">${name}</span></div></td>
+            <td><div class="list-item-cell">${size}</div></td>
+            <td><div class="list-item-cell">${date}</div></td>
         `;
 
         if (selectedItems.has(String(item.id))) {
-            itemDiv.classList.add('selected');
+            itemRow.classList.add('selected');
         }
 
-        return itemDiv;
+        return itemRow;
     };
 
     const getFileIconClass = (mimetype) => {
@@ -385,9 +388,6 @@ document.addEventListener('DOMContentLoaded', () => {
     async function getMountNameForFolder(folderId) {
         if (folderId === userRootId) return null;
         try {
-            const path = await data.getFolderPath(folderId, req.session.userId); // This won't work client-side
-            // On client-side, we need to fetch this info or deduce it.
-            // Let's make an API call.
             const response = await axios.get(`/api/folder-path/${folderId}`);
             const pathParts = response.data;
             return pathParts.length > 1 ? pathParts[1].name : null;
@@ -403,9 +403,8 @@ document.addEventListener('DOMContentLoaded', () => {
         
         const isRoot = currentFolderId === userRootId;
         
-        // Disable most actions in root
         createFolderBtn.disabled = isRoot || isSearchMode;
-        showUploadModalBtn.disabled = isSearchMode; // Upload button in header
+        showUploadModalBtn.disabled = isRoot || isSearchMode;
 
         downloadBtn.disabled = count === 0 || isRoot;
 
@@ -419,18 +418,18 @@ document.addEventListener('DOMContentLoaded', () => {
         renameBtn.disabled = count !== 1 || isRoot;
         deleteBtn.disabled = count === 0 || isRoot;
 
-        // Check for cross-mount move
         let moveIsDisabled = count === 0 || isSearchMode || isRoot;
         if (!moveIsDisabled && count > 0) {
             const mountNames = new Set();
-            for (const id of selectedItems.keys()) {
-                const item = currentFolderContents.files.find(f => String(f.id) === id) || currentFolderContents.folders.find(f => String(f.id) === id);
-                if (item && item.parent_id) { // Ensure it's not a mount point itself
-                    const path = await axios.get(`/api/folder-path/${item.parent_id}`);
-                    if(path.data.length > 1) {
-                        mountNames.add(path.data[1].name);
-                    }
-                }
+            for (const item of selectedItems.values()) {
+                 const fullItem = currentFolderContents.files.find(f => String(f.id) === item.id) || currentFolderContents.folders.find(f => String(f.id) === item.id);
+                 if (fullItem) {
+                     const pathResponse = await axios.get(`/api/folder-path/${fullItem.parent_id}`);
+                     const pathData = pathResponse.data;
+                     if(pathData.length > 1) {
+                         mountNames.add(pathData[1].name);
+                     }
+                 }
             }
             if (mountNames.size > 1) {
                 moveIsDisabled = true;
@@ -445,29 +444,27 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     };
     const rerenderSelection = () => {
-        document.querySelectorAll('.item-card, .list-item').forEach(el => {
+        document.querySelectorAll('.item-card, .list-item-row').forEach(el => {
             el.classList.toggle('selected', selectedItems.has(el.dataset.id));
         });
     };
     
     const loadFoldersForSelect = async () => {
-        if (foldersLoaded) return;
         try {
-            const res = await axios.get('/api/folders');
-            const folders = res.data;
+            const allFoldersRes = await axios.get('/api/folders');
+            const folders = allFoldersRes.data;
+            
+            const rootId = userRootId;
+            const mountPointFolders = folders.filter(f => f.parent_id === rootId);
             const folderMap = new Map(folders.map(f => [f.id, { ...f, children: [] }]));
-            
-            // Build the tree including mount points
+
             const tree = [];
-            webdavMounts.forEach(mount => {
-                 const mountNode = folders.find(f => f.name === mount.name && f.parent_id === userRootId);
-                 if(mountNode) {
-                    tree.push(folderMap.get(mountNode.id));
-                 }
+            mountPointFolders.forEach(mountFolder => {
+                tree.push(folderMap.get(mountFolder.id));
             });
-            
-            folderMap.forEach(f => {
-                 if (f.parent_id && folderMap.has(f.parent_id)) {
+
+            folders.forEach(f => {
+                if (f.parent_id && folderMap.has(f.parent_id) && f.parent_id !== rootId) {
                     const parent = folderMap.get(f.parent_id);
                     if (parent) parent.children.push(f);
                 }
@@ -478,12 +475,12 @@ document.addEventListener('DOMContentLoaded', () => {
             const buildOptions = (node, prefix = '') => {
                 const option = document.createElement('option');
                 option.value = node.id;
-                option.textContent = prefix + (node.name === '/' ? '根目录' : node.name);
+                option.textContent = prefix + node.name;
                 folderSelect.appendChild(option);
-                node.children.sort((a,b) => a.name.localeCompare(b.name)).forEach(child => buildOptions(child, prefix + '　'));
+                node.children.sort((a, b) => a.name.localeCompare(b.name)).forEach(child => buildOptions(child, prefix + '　'));
             };
             
-            tree.sort((a,b) => a.name.localeCompare(b.name)).forEach(node => buildOptions(node));
+            tree.sort((a, b) => a.name.localeCompare(b.name)).forEach(node => buildOptions(node));
 
             foldersLoaded = true;
         } catch (error) {
@@ -499,7 +496,7 @@ document.addEventListener('DOMContentLoaded', () => {
             currentView = 'grid';
         } else {
             itemGrid.style.display = 'none';
-            itemListView.style.display = 'block';
+            itemListView.style.display = 'table';
             viewSwitchBtn.innerHTML = '<i class="fas fa-th"></i>';
             currentView = 'list';
         }
@@ -726,7 +723,7 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
     const handleItemClick = (e) => {
-        const target = e.target.closest('.item-card, .list-item');
+        const target = e.target.closest('.item-card, .list-item-row');
         if (!target) return;
         const id = target.dataset.id;
         const type = target.dataset.type;
@@ -736,13 +733,13 @@ document.addEventListener('DOMContentLoaded', () => {
             if (selectedItems.has(id)) {
                 selectedItems.delete(id);
             } else {
-                selectedItems.set(id, { type, name });
+                selectedItems.set(id, { id, type, name });
             }
         } else {
             const isSelected = selectedItems.has(id);
             selectedItems.clear();
             if (!isSelected) {
-                selectedItems.set(id, { type, name });
+                selectedItems.set(id, { id, type, name });
             }
         }
         rerenderSelection();
@@ -750,7 +747,7 @@ document.addEventListener('DOMContentLoaded', () => {
     };
 
     const handleItemDblClick = (e) => {
-        const target = e.target.closest('.item-card, .list-item');
+        const target = e.target.closest('.item-card, .list-item-row');
         if (target && target.dataset.type === 'folder') {
             const folderId = parseInt(target.dataset.id, 10);
             window.history.pushState({folderId: folderId}, '', `/folder/${folderId}`);
@@ -835,7 +832,7 @@ document.addEventListener('DOMContentLoaded', () => {
             if (isAllSelected) {
                 selectedItems.clear();
             } else {
-                allVisibleItems.forEach(item => selectedItems.set(String(item.id), { type: item.type, name: item.name }));
+                allVisibleItems.forEach(item => selectedItems.set(String(item.id), { id: item.id, type: item.type, name: item.name }));
             }
             rerenderSelection();
             updateActionBar();
@@ -963,27 +960,24 @@ document.addEventListener('DOMContentLoaded', () => {
 
             const res = await axios.get(`/api/folder-path/${currentFolderId}`);
             const currentPath = res.data;
-            if (currentPath.length < 2) return; // Cannot determine mount point
+            if (currentPath.length < 2) return;
             const currentMountName = currentPath[1].name;
 
             try {
-                const res = await axios.get('/api/folders');
-                const folders = res.data;
+                const allFoldersRes = await axios.get('/api/folders');
+                const folders = allFoldersRes.data;
                 folderTree.innerHTML = '';
 
                 const folderMap = new Map(folders.map(f => [f.id, { ...f, children: [] }]));
                 const tree = [];
-                 webdavMounts.forEach(mount => {
-                     if (mount.name === currentMountName) {
-                        const mountNode = folders.find(f => f.name === mount.name && f.parent_id === userRootId);
-                        if(mountNode) {
-                           tree.push(folderMap.get(mountNode.id));
-                        }
-                     }
-                });
+
+                const mountNode = folders.find(f => f.name === currentMountName && f.parent_id === userRootId);
+                if (mountNode) {
+                    tree.push(folderMap.get(mountNode.id));
+                }
                 
-                folderMap.forEach(f => {
-                    if (f.parent_id && folderMap.has(f.parent_id)) {
+                folders.forEach(f => {
+                    if (f.parent_id && folderMap.has(f.parent_id) && f.parent_id !== userRootId) {
                         const parent = folderMap.get(f.parent_id);
                         if (parent) parent.children.push(f);
                     }
