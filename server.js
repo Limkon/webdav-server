@@ -10,18 +10,17 @@ const bcrypt = require('bcrypt');
 const fs = require('fs');
 const fsp = require('fs').promises;
 const crypto = require('crypto');
-const busboy = require('busboy'); // --- 新增：引入 busboy ---
-const db = require('./database.js'); 
+const busboy = require('busboy');
+const db = require('./database.js');
 
 const data = require('./data.js');
-const storageManager = require('./storage'); 
+const storageManager = require('./storage');
 
 const app = express();
 
 // --- 輔助函數：日誌記錄 ---
 function log(level, message, ...args) {
     const timestamp = new Date().toISOString();
-    // 為了調試，暫時打開 debug 日誌
     console.log(`[${timestamp}] [SERVER] [${level.toUpperCase()}] ${message}`, ...args);
 }
 
@@ -90,7 +89,6 @@ async function createMountPointsForUser(userId) {
     if (config.webdav && Array.isArray(config.webdav)) {
         for (const mount of config.webdav) {
             if (mount.mount_name) {
-                // 檢查文件夹是否已存在
                 const existing = await data.findFolderByName(mount.mount_name, rootFolder.id, userId);
                 if (!existing) {
                     log('info', `為使用者 ${userId} 創建掛載點資料夾: ${mount.mount_name}`);
@@ -177,8 +175,8 @@ app.get('/shares-page', requireLogin, (req, res) => res.sendFile(path.join(__dir
 app.get('/admin', requireAdmin, (req, res) => res.sendFile(path.join(__dirname, 'views/admin.html')));
 app.get('/scan', requireAdmin, (req, res) => res.sendFile(path.join(__dirname, 'views/scan.html')));
 
-
 // --- API Endpoints ---
+// ... (此處省略未變更的 API 路由，以節省篇幅)
 app.post('/api/user/change-password', requireLogin, async (req, res) => {
     const { oldPassword, newPassword } = req.body;
     log('info', `使用者 ${req.session.userId} 正在嘗試修改密碼。`);
@@ -404,16 +402,32 @@ app.delete('/api/admin/webdav/:id', requireAdmin, async (req, res) => {
     }
 });
 
-// --- 主要修改: 使用 busboy 實現流式上傳 ---
+// --- 主要修改: 使用 busboy 實現流式上傳並解決中文檔名亂碼 ---
 app.post('/upload', requireLogin, (req, res) => {
     log('info', '接收到流式上傳請求...');
+    
+    // --- 修復中文檔名亂碼的關鍵 ---
+    // busboy 需要正確的 headers，但 Express/Node 預設可能不會正確解碼帶有 UTF-8 filename* 的 header。
+    // 我們需要手動解碼 Content-Disposition header。
+    let contentDisposition = req.headers['content-disposition'];
+    if (contentDisposition) {
+        // 尋找 filename*=UTF-8''... 模式
+        const utf8FilenameMatch = /filename\*=UTF-8''([\w%\-.]+)(?:; |$)/i.exec(contentDisposition);
+        if (utf8FilenameMatch) {
+            const decodedFilename = decodeURIComponent(utf8FilenameMatch[1]);
+            // 將解碼後的檔名重新組合回 header，讓 busboy 可以正確解析
+            req.headers['content-disposition'] = `form-data; name="files"; filename="${decodedFilename}"`;
+            log('debug', `檢測到並解碼 UTF-8 檔名: ${decodedFilename}`);
+        }
+    }
+
     const bb = busboy({ headers: req.headers });
     const userId = req.session.userId;
     const storage = storageManager.getStorage();
     
     let fields = {};
-    let filesData = [];
     let filePromises = [];
+    let filesData = [];
 
     bb.on('field', (name, val) => {
         log('debug', `Busboy: 收到欄位: ${name} = ${val.substring(0, 100)}...`);
@@ -422,24 +436,34 @@ app.post('/upload', requireLogin, (req, res) => {
 
     bb.on('file', (name, fileStream, info) => {
         const { filename, encoding, mimeType } = info;
+        // 經過上面的 header 修正，這裡的 filename 應該是正確的 UTF-8 字串
         log('info', `Busboy: 開始接收檔案流: ${filename}, MIME: ${mimeType}`);
 
         const fileData = {
             stream: fileStream,
-            filename: Buffer.from(filename, 'latin1').toString('utf8'), // 處理中文檔名
+            filename: filename, // 直接使用 busboy 解析出的檔名
             mimetype: mimeType,
-            relativePath: null // 將在 field 事件中填充
+            relativePath: null 
         };
         filesData.push(fileData);
 
-        // 為每個檔案创建一个 promise，以便稍後處理
         const filePromise = new Promise(async (resolve, reject) => {
             try {
                 // 等待所有欄位都被解析
-                await new Promise(resolve => bb.on('fieldsLimit', resolve));
+                await new Promise(resolve => {
+                    const checkFields = () => {
+                        if(fields.folderId !== undefined && fields.relativePaths !== undefined) {
+                            resolve();
+                        } else {
+                            setTimeout(checkFields, 50); // 短暫輪詢等待欄位
+                        }
+                    };
+                    checkFields();
+                });
                 
                 let relativePaths = fields.relativePaths;
                 if(relativePaths && !Array.isArray(relativePaths)) relativePaths = [relativePaths];
+                
                 const fileIndex = filesData.findIndex(f => f.stream === fileStream);
                 fileData.relativePath = relativePaths ? relativePaths[fileIndex] : fileData.filename;
 
@@ -450,7 +474,7 @@ app.post('/upload', requireLogin, (req, res) => {
 
                 if (action === 'skip') {
                     log('info', `跳過檔案: ${fileData.relativePath}`);
-                    fileStream.resume(); // 消耗掉數據流
+                    fileStream.resume(); 
                     return resolve({ skipped: true });
                 }
 
@@ -485,7 +509,7 @@ app.post('/upload', requireLogin, (req, res) => {
 
             } catch (err) {
                 log('error', `處理檔案流 ${fileData.filename} 時出錯:`, err);
-                fileStream.resume(); // 確保流被消耗以防請求掛起
+                fileStream.resume(); 
                 reject(err);
             }
         });
@@ -511,7 +535,7 @@ app.post('/upload', requireLogin, (req, res) => {
             res.status(500).json({ success: false, message: '处理上传时发生错误: ' + error.message });
         }
     });
-
+    
     bb.on('error', (err) => {
         log('error', 'Busboy 發生錯誤:', err);
         req.unpipe(bb);
@@ -548,7 +572,6 @@ app.post('/api/text-file', requireLogin, async (req, res) => {
                 if (fileName !== originalFile.fileName) {
                     const conflict = await data.checkFullConflict(fileName, finalFolderId, userId);
                     if (conflict) {
-                        await fsp.unlink(tempFilePath).catch(err => {});
                         return res.status(409).json({ success: false, message: '同目录下已存在同名文件或文件夹。' });
                     }
                 }
@@ -577,7 +600,7 @@ app.post('/api/text-file', requireLogin, async (req, res) => {
         log('error', `儲存文字檔案失敗:`, error);
         res.status(500).json({ success: false, message: '服务器内部错误' });
     } finally {
-        if (fs.existsSync(tempFilePath)) {
+        if (fsSync.existsSync(tempFilePath)) {
             await fsp.unlink(tempFilePath).catch(err => {});
         }
     }
@@ -937,7 +960,6 @@ app.post('/api/cancel-share', requireLogin, async (req, res) => {
 
 // --- Scanner Endpoints ---
 app.post('/api/scan/webdav', requireAdmin, async (req, res) => {
-    // --- *** 关键修正 开始 *** ---
     const { userId, mountId } = req.body;
     const log = [];
     try {
@@ -990,7 +1012,6 @@ app.post('/api/scan/webdav', requireAdmin, async (req, res) => {
         log.push({ message: `挂载点 ${mountConfig.mount_name} 扫描完成。`, type: 'success' });
         
         res.json({ success: true, log });
-    // --- *** 关键修正 结束 *** ---
     } catch (error) {
         let errorMessage = error.message;
         if (error.response && error.response.status === 403) {
@@ -1010,20 +1031,14 @@ app.get('/share/view/file/:token', async (req, res) => {
         if (fileInfo) {
             const downloadUrl = `/share/download/file/${token}`;
             
-            // --- *** 关键修正 开始 *** ---
-            // 检查是否为纯文字文件
             if (fileInfo.mimetype && fileInfo.mimetype.startsWith('text/')) {
                 const storage = storageManager.getStorage();
                 const stream = await storage.stream(fileInfo.file_id);
-                
-                // 直接以纯文字形式输出，不渲染 HTML
                 res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-                handleStream(stream, res); // 使用已有的 handleStream 函数处理流
-                return; // 结束执行，防止后续代码渲染模板
+                handleStream(stream, res);
+                return;
             }
-            // --- *** 关键修正 结束 *** ---
 
-            // 对于非文字文件，保持原有的预览页面逻辑
             res.render('share-view', { file: fileInfo, downloadUrl, textContent: null });
         } else {
             res.status(404).render('share-error', { message: '此分享链接无效或已过期。' });
@@ -1054,7 +1069,7 @@ function handleStream(stream, res) {
         if (!res.headersSent) {
             res.status(500).send('读取文件流时发生错误');
         }
-        res.end(); // 确保响应结束
+        res.end();
     }).pipe(res);
 }
 
