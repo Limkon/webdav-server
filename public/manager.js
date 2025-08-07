@@ -56,14 +56,15 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // 状态
     let isMultiSelectMode = false;
-    let currentFolderId = 1;
+    let currentFolderId = null; // 初始设为 null，由 loadInitialData 设定
+    let userRootId = null; // 储存使用者的根目录 ID
     let currentFolderContents = { folders: [], files: [] };
     let selectedItems = new Map();
     let moveTargetFolderId = null;
     let isSearchMode = false;
-    const MAX_TELEGRAM_SIZE = 1000 * 1024 * 1024;
     let foldersLoaded = false;
     let currentView = 'grid';
+    let webdavMounts = [];
 
     const formatBytes = (bytes, decimals = 2) => {
         if (!bytes || bytes === 0) return '0 Bytes';
@@ -141,15 +142,12 @@ document.addEventListener('DOMContentLoaded', () => {
             showNotification('请选择文件或文件夹。', 'error', !isDrag ? uploadNotificationArea : null);
             return;
         }
-
-        const notificationContainer = isDrag ? null : uploadNotificationArea;
-
-        const oversizedFiles = Array.from(files).filter(file => file.size > MAX_TELEGRAM_SIZE);
-        if (oversizedFiles.length > 0) {
-            const fileNames = oversizedFiles.map(f => `"${f.name}"`).join(', ');
-            showNotification(`文件 ${fileNames} 过大，超过 ${formatBytes(MAX_TELEGRAM_SIZE)} 的限制。`, 'error', notificationContainer);
+        if (currentFolderId === userRootId) {
+             showNotification('无法直接上传到根目录，请先进入一个挂载点。', 'error', !isDrag ? uploadNotificationArea : null);
             return;
         }
+
+        const notificationContainer = isDrag ? null : uploadNotificationArea;
 
         const filesToCheck = Array.from(files).map(file => ({
             relativePath: file.webkitRelativePath || file.name 
@@ -186,7 +184,6 @@ document.addEventListener('DOMContentLoaded', () => {
         
         formData.append('folderId', targetFolderId);
         formData.append('resolutions', JSON.stringify(resolutions));
-        // --- *** 关键修正：发送单个 JSON 字符串而不是多个字段 *** ---
         formData.append('relativePathsJSON', JSON.stringify(relativePathsArray));
 
         if (!isDrag) {
@@ -204,17 +201,29 @@ document.addEventListener('DOMContentLoaded', () => {
             isSearchMode = false;
             if (searchInput) searchInput.value = '';
             currentFolderId = folderId;
-            const res = await axios.get(`/api/folder/${folderId}`);
-            currentFolderContents = res.data.contents;
+
+            // 如果是根目录，则加载挂载点
+            if (folderId === userRootId) {
+                const res = await axios.get('/api/mounts');
+                webdavMounts = res.data.mounts;
+                currentFolderContents = { folders: res.data.mounts, files: [] };
+                renderBreadcrumb(res.data.path);
+                renderItems(res.data.mounts, []);
+            } else {
+                const res = await axios.get(`/api/folder/${folderId}`);
+                currentFolderContents = res.data.contents;
+                renderBreadcrumb(res.data.path);
+                renderItems(currentFolderContents.folders, currentFolderContents.files);
+            }
+
             // 清理已不存在的选择项
-            const currentIds = new Set([...res.data.contents.folders.map(f => String(f.id)), ...res.data.contents.files.map(f => String(f.id))]);
+            const currentIds = new Set([...currentFolderContents.folders.map(f => String(f.id)), ...currentFolderContents.files.map(f => String(f.id))]);
             selectedItems.forEach((_, key) => {
                 if (!currentIds.has(key)) {
                     selectedItems.delete(key);
                 }
             });
-            renderBreadcrumb(res.data.path);
-            renderItems(currentFolderContents.folders, currentFolderContents.files);
+
             updateActionBar();
         } catch (error) {
             if (error.response && error.response.status === 401) {
@@ -224,6 +233,28 @@ document.addEventListener('DOMContentLoaded', () => {
             itemListBody.innerHTML = '<p>加载内容失败。</p>';
         }
     };
+    
+    async function loadInitialData() {
+        try {
+            const res = await axios.get('/api/initial-data');
+            userRootId = res.data.rootId;
+            const pathParts = window.location.pathname.split('/');
+            const lastPart = pathParts.filter(p => p).pop();
+            let folderIdToLoad = parseInt(lastPart, 10);
+            
+            if (isNaN(folderIdToLoad) || window.location.pathname === '/') {
+                folderIdToLoad = userRootId;
+            }
+            
+            window.history.replaceState({ folderId: folderIdToLoad }, '', `/folder/${folderIdToLoad}`);
+            loadFolderContents(folderIdToLoad);
+
+        } catch(e) {
+            window.location.href = '/login';
+        }
+    }
+
+
     const executeSearch = async (query) => {
         try {
             isSearchMode = true;
@@ -243,7 +274,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if(!path || path.length === 0) return;
         path.forEach((p, index) => {
             if (index > 0) breadcrumb.innerHTML += '<span class="separator">/</span>';
-            if (p.id === null) {
+            if (p.id === null || p.id === 'search-result') { // Search result is not a link
                 breadcrumb.innerHTML += `<span>${p.name}</span>`;
                 return;
             }
@@ -267,8 +298,16 @@ document.addEventListener('DOMContentLoaded', () => {
         const allItems = [...folders, ...files];
         
         if (allItems.length === 0) {
-            if (currentView === 'grid') parentGrid.innerHTML = isSearchMode ? '<p>找不到符合条件的文件。</p>' : '<p>这个资料夾是空的。</p>';
-            else parentList.innerHTML = isSearchMode ? '<div class="list-item"><p>找不到符合条件的文件。</p></div>' : '<div class="list-item"><p>这个资料夾是空的。</p></div>';
+            let message = '';
+            if (isSearchMode) {
+                message = '找不到符合条件的文件。';
+            } else if (currentFolderId === userRootId) {
+                message = '没有已配置的 WebDAV 挂载点。请前往管理后台新增。';
+            } else {
+                message = '这个资料夾是空的。';
+            }
+            if (currentView === 'grid') parentGrid.innerHTML = `<p>${message}</p>`;
+            else parentList.innerHTML = `<div class="list-item"><p>${message}</p></div>`;
             return;
         }
 
@@ -291,9 +330,7 @@ document.addEventListener('DOMContentLoaded', () => {
         let iconHtml = '';
         if (item.type === 'file') {
             const fullFile = currentFolderContents.files.find(f => f.id === item.id) || item;
-            if (fullFile.storage_type === 'telegram' && fullFile.thumb_file_id) {
-                iconHtml = `<img src="/thumbnail/${item.id}" alt="缩图" loading="lazy">`;
-            } else if (fullFile.mimetype && fullFile.mimetype.startsWith('image/')) {
+            if (fullFile.mimetype && fullFile.mimetype.startsWith('image/')) {
                  iconHtml = `<img src="/download/proxy/${item.id}" alt="图片" loading="lazy">`;
             } else if (fullFile.mimetype && fullFile.mimetype.startsWith('video/')) {
                 iconHtml = `<video src="/download/proxy/${item.id}#t=0.1" preload="metadata" muted></video>`;
@@ -344,28 +381,63 @@ document.addEventListener('DOMContentLoaded', () => {
         if (mimetype.includes('archive') || mimetype.includes('zip')) return 'fa-file-archive';
         return 'fa-file-alt';
     };
-    const updateActionBar = () => {
+    
+    async function getMountNameForFolder(folderId) {
+        if (folderId === userRootId) return null;
+        try {
+            const path = await data.getFolderPath(folderId, req.session.userId); // This won't work client-side
+            // On client-side, we need to fetch this info or deduce it.
+            // Let's make an API call.
+            const response = await axios.get(`/api/folder-path/${folderId}`);
+            const pathParts = response.data;
+            return pathParts.length > 1 ? pathParts[1].name : null;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    const updateActionBar = async () => {
         if (!actionBar) return;
         const count = selectedItems.size;
         selectionCountSpan.textContent = `已选择 ${count} 个项目`;
+        
+        const isRoot = currentFolderId === userRootId;
+        
+        // Disable most actions in root
+        createFolderBtn.disabled = isRoot || isSearchMode;
+        showUploadModalBtn.disabled = isSearchMode; // Upload button in header
 
-        if (downloadBtn) downloadBtn.disabled = count === 0;
+        downloadBtn.disabled = count === 0 || isRoot;
 
-        const isSingleTextFile = count === 1 && selectedItems.values().next().value.name.endsWith('.txt');
-        if (textEditBtn) {
-            textEditBtn.disabled = !(count === 0 || isSingleTextFile);
-            textEditBtn.innerHTML = count === 0 ? '<i class="fas fa-file-alt"></i>' : '<i class="fas fa-edit"></i>';
-            textEditBtn.title = count === 0 ? '新建文字档' : '编辑文字档';
+        const isSingleTextFile = count === 1 && selectedItems.values().next().value.type === 'file' && selectedItems.values().next().value.name.endsWith('.txt');
+        textEditBtn.disabled = isRoot || !(count === 0 || isSingleTextFile);
+        textEditBtn.innerHTML = (count === 0 && !isRoot) ? '<i class="fas fa-file-alt"></i>' : '<i class="fas fa-edit"></i>';
+        textEditBtn.title = (count === 0 && !isRoot) ? '新建文字档' : '编辑文字档';
+
+        previewBtn.disabled = count !== 1 || (count === 1 && selectedItems.values().next().value.type === 'folder');
+        shareBtn.disabled = count !== 1 || isRoot;
+        renameBtn.disabled = count !== 1 || isRoot;
+        deleteBtn.disabled = count === 0 || isRoot;
+
+        // Check for cross-mount move
+        let moveIsDisabled = count === 0 || isSearchMode || isRoot;
+        if (!moveIsDisabled && count > 0) {
+            const mountNames = new Set();
+            for (const id of selectedItems.keys()) {
+                const item = currentFolderContents.files.find(f => String(f.id) === id) || currentFolderContents.folders.find(f => String(f.id) === id);
+                if (item && item.parent_id) { // Ensure it's not a mount point itself
+                    const path = await axios.get(`/api/folder-path/${item.parent_id}`);
+                    if(path.data.length > 1) {
+                        mountNames.add(path.data[1].name);
+                    }
+                }
+            }
+            if (mountNames.size > 1) {
+                moveIsDisabled = true;
+            }
         }
-
-        if (previewBtn) previewBtn.disabled = count !== 1 || (count === 1 && selectedItems.values().next().value.type === 'folder');
-
-        if (shareBtn) shareBtn.disabled = count !== 1;
-
-        if (renameBtn) renameBtn.disabled = count !== 1;
-        if (moveBtn) moveBtn.disabled = count === 0 || isSearchMode;
-        if (deleteBtn) deleteBtn.disabled = count === 0;
-
+        moveBtn.disabled = moveIsDisabled;
+        
         actionBar.classList.toggle('visible', true);
 
         if (!isMultiSelectMode && multiSelectBtn) {
@@ -377,19 +449,32 @@ document.addEventListener('DOMContentLoaded', () => {
             el.classList.toggle('selected', selectedItems.has(el.dataset.id));
         });
     };
+    
     const loadFoldersForSelect = async () => {
         if (foldersLoaded) return;
         try {
             const res = await axios.get('/api/folders');
             const folders = res.data;
             const folderMap = new Map(folders.map(f => [f.id, { ...f, children: [] }]));
+            
+            // Build the tree including mount points
             const tree = [];
+            webdavMounts.forEach(mount => {
+                 const mountNode = folders.find(f => f.name === mount.name && f.parent_id === userRootId);
+                 if(mountNode) {
+                    tree.push(folderMap.get(mountNode.id));
+                 }
+            });
+            
             folderMap.forEach(f => {
-                if (f.parent_id && folderMap.has(f.parent_id)) folderMap.get(f.parent_id).children.push(f);
-                else tree.push(f);
+                 if (f.parent_id && folderMap.has(f.parent_id)) {
+                    const parent = folderMap.get(f.parent_id);
+                    if (parent) parent.children.push(f);
+                }
             });
 
             folderSelect.innerHTML = '';
+            
             const buildOptions = (node, prefix = '') => {
                 const option = document.createElement('option');
                 option.value = node.id;
@@ -397,7 +482,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 folderSelect.appendChild(option);
                 node.children.sort((a,b) => a.name.localeCompare(b.name)).forEach(child => buildOptions(child, prefix + '　'));
             };
-            tree.sort((a,b) => a.name.localeCompare(b.name)).forEach(buildOptions);
+            
+            tree.sort((a,b) => a.name.localeCompare(b.name)).forEach(node => buildOptions(node));
 
             foldersLoaded = true;
         } catch (error) {
@@ -561,7 +647,6 @@ document.addEventListener('DOMContentLoaded', () => {
                     fileListContainer.appendChild(li);
                 }
                 uploadSubmitBtn.style.display = 'block';
-                 // 确保文件夹输入框被清空
                 folderInput.value = '';
             }
         });
@@ -574,7 +659,6 @@ document.addEventListener('DOMContentLoaded', () => {
                 const folderName = files[0].webkitRelativePath.split('/')[0];
                 fileListContainer.innerHTML = `<li>已选择文件夹: <b>${folderName}</b> (包含 ${files.length} 个文件)</li>`;
                 uploadSubmitBtn.style.display = 'block';
-                // 确保文件输入框被清空，这样我们只处理文件夹
                 fileInput.value = '';
             }
         });
@@ -583,7 +667,6 @@ document.addEventListener('DOMContentLoaded', () => {
     if (uploadForm) {
         uploadForm.addEventListener('submit', (e) => {
             e.preventDefault();
-            // 优先处理文件夹上传，如果文件夹有文件，则忽略单文件选择
             const filesToProcess = folderInput.files.length > 0 ? folderInput.files : fileInput.files;
             const targetFolderId = folderSelect.value;
             uploadFiles(Array.from(filesToProcess), targetFolderId, false);
@@ -599,7 +682,9 @@ document.addEventListener('DOMContentLoaded', () => {
         });
 
         ['dragenter', 'dragover'].forEach(eventName => {
-            dropZone.addEventListener(eventName, () => dropZone.classList.add('dragover'));
+            dropZone.addEventListener(eventName, () => {
+                if (currentFolderId !== userRootId) dropZone.classList.add('dragover');
+            });
         });
 
         ['dragleave', 'drop'].forEach(eventName => {
@@ -607,6 +692,10 @@ document.addEventListener('DOMContentLoaded', () => {
         });
 
         dropZone.addEventListener('drop', (e) => {
+             if (currentFolderId === userRootId) {
+                showNotification('无法直接上传到根目录，请先进入一个挂载点。', 'error');
+                return;
+            }
             const files = Array.from(e.dataTransfer.files);
              let hasFolder = false;
             if (e.dataTransfer.items) {
@@ -632,8 +721,8 @@ document.addEventListener('DOMContentLoaded', () => {
     if (homeLink) {
         homeLink.addEventListener('click', (e) => {
             e.preventDefault();
-            window.history.pushState(null, '', '/');
-            window.location.href = '/';
+            window.history.pushState({folderId: userRootId}, '', `/folder/${userRootId}`);
+            loadFolderContents(userRootId);
         });
     }
     const handleItemClick = (e) => {
@@ -664,7 +753,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const target = e.target.closest('.item-card, .list-item');
         if (target && target.dataset.type === 'folder') {
             const folderId = parseInt(target.dataset.id, 10);
-            window.history.pushState(null, '', `/folder/${folderId}`);
+            window.history.pushState({folderId: folderId}, '', `/folder/${folderId}`);
             loadFolderContents(folderId);
         }
     };
@@ -690,25 +779,20 @@ document.addEventListener('DOMContentLoaded', () => {
             const link = e.target.closest('a');
             if (link && link.dataset.folderId) {
                 const folderId = parseInt(link.dataset.folderId, 10);
-                window.history.pushState(null, '', `/folder/${folderId}`);
+                window.history.pushState({folderId: folderId}, '', `/folder/${folderId}`);
                 loadFolderContents(folderId);
             }
         });
     }
-    window.addEventListener('popstate', () => {
+    window.addEventListener('popstate', (e) => {
         if (document.getElementById('itemGrid')) {
-            const pathParts = window.location.pathname.split('/');
-            const lastPart = pathParts.filter(p => p).pop();
-            let folderId = parseInt(lastPart, 10);
-            if (isNaN(folderId)) {
-                const rootFolderLink = document.querySelector('.breadcrumb a');
-                folderId = rootFolderLink ? parseInt(rootFolderLink.dataset.folderId) : 1;
-            }
+            const folderId = e.state ? e.state.folderId : userRootId;
             loadFolderContents(folderId);
         }
     });
     if (createFolderBtn) {
         createFolderBtn.addEventListener('click', async () => {
+            if (createFolderBtn.disabled) return;
             const name = prompt('请输入新资料夾的名称：');
             if (name && name.trim()) {
                 try {
@@ -742,6 +826,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     if (selectAllBtn) {
         selectAllBtn.addEventListener('click', () => {
+            if (currentFolderId === userRootId) return;
             isMultiSelectMode = true;
             if (multiSelectBtn) multiSelectBtn.classList.add('active');
             const allVisibleItems = [...currentFolderContents.folders, ...currentFolderContents.files];
@@ -758,6 +843,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     if (showUploadModalBtn) {
         showUploadModalBtn.addEventListener('click', async () => {
+            if (showUploadModalBtn.disabled) return;
             await loadFoldersForSelect();
             folderSelect.value = currentFolderId;
             uploadNotificationArea.innerHTML = '';
@@ -873,7 +959,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
     if (moveBtn) {
         moveBtn.addEventListener('click', async () => {
-            if (selectedItems.size === 0) return;
+            if (moveBtn.disabled) return;
+
+            const res = await axios.get(`/api/folder-path/${currentFolderId}`);
+            const currentPath = res.data;
+            if (currentPath.length < 2) return; // Cannot determine mount point
+            const currentMountName = currentPath[1].name;
+
             try {
                 const res = await axios.get('/api/folders');
                 const folders = res.data;
@@ -881,11 +973,19 @@ document.addEventListener('DOMContentLoaded', () => {
 
                 const folderMap = new Map(folders.map(f => [f.id, { ...f, children: [] }]));
                 const tree = [];
+                 webdavMounts.forEach(mount => {
+                     if (mount.name === currentMountName) {
+                        const mountNode = folders.find(f => f.name === mount.name && f.parent_id === userRootId);
+                        if(mountNode) {
+                           tree.push(folderMap.get(mountNode.id));
+                        }
+                     }
+                });
+                
                 folderMap.forEach(f => {
                     if (f.parent_id && folderMap.has(f.parent_id)) {
-                        folderMap.get(f.parent_id).children.push(f);
-                    } else {
-                        tree.push(f);
+                        const parent = folderMap.get(f.parent_id);
+                        if (parent) parent.children.push(f);
                     }
                 });
 
@@ -909,17 +1009,14 @@ document.addEventListener('DOMContentLoaded', () => {
 
                 const buildTree = (node, prefix = '') => {
                     const isDisabled = disabledFolderIds.has(node.id) || node.id === currentFolderId;
-
                     const item = document.createElement('div');
                     item.className = 'folder-item';
                     item.dataset.folderId = node.id;
                     item.textContent = prefix + (node.name === '/' ? '根目录' : node.name);
-
                     if (isDisabled) {
                         item.style.color = '#ccc';
                         item.style.cursor = 'not-allowed';
                     }
-
                     folderTree.appendChild(item);
                     node.children.sort((a,b) => a.name.localeCompare(b.name)).forEach(child => buildTree(child, prefix + '　'));
                 };
@@ -1102,16 +1199,7 @@ document.addEventListener('DOMContentLoaded', () => {
     });
     
     // 初始化
-    if (document.getElementById('itemGrid')) {
-        const pathParts = window.location.pathname.split('/');
-        const lastPart = pathParts.filter(p => p).pop();
-        let folderId = parseInt(lastPart, 10);
-        if (isNaN(folderId)) {
-            const rootFolderLink = document.querySelector('.breadcrumb a');
-            folderId = rootFolderLink ? parseInt(rootFolderLink.dataset.folderId) : 1;
-        }
-        loadFolderContents(folderId);
-        checkScreenWidthAndCollapse();
-        window.addEventListener('resize', checkScreenWidthAndCollapse);
-    }
+    loadInitialData();
+    checkScreenWidthAndCollapse();
+    window.addEventListener('resize', checkScreenWidthAndCollapse);
 });
