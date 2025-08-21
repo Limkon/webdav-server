@@ -35,6 +35,8 @@ document.addEventListener('DOMContentLoaded', () => {
     const folderConflictModal = document.getElementById('folderConflictModal');
     const folderConflictName = document.getElementById('folderConflictName');
     const folderConflictOptions = document.getElementById('folderConflictOptions');
+    const applyToAllFoldersContainer = document.getElementById('applyToAllFoldersContainer');
+    const applyToAllFoldersCheckbox = document.getElementById('applyToAllFoldersCheckbox');
     const shareModal = document.getElementById('shareModal');
     const uploadModal = document.getElementById('uploadModal');
     const showUploadModalBtn = document.getElementById('showUploadModalBtn');
@@ -503,9 +505,11 @@ document.addEventListener('DOMContentLoaded', () => {
         renderItems(currentFolderContents.folders, currentFolderContents.files);
     };
 
-    async function handleFolderConflict(folderName) {
+    async function handleFolderConflict(folderName, totalConflicts) {
         return new Promise((resolve) => {
             folderConflictName.textContent = folderName;
+            applyToAllFoldersContainer.style.display = totalConflicts > 1 ? 'block' : 'none';
+            applyToAllFoldersCheckbox.checked = false;
             folderConflictModal.style.display = 'flex';
 
             folderConflictOptions.onclick = (e) => {
@@ -514,7 +518,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
                 folderConflictModal.style.display = 'none';
                 folderConflictOptions.onclick = null;
-                resolve(action);
+                resolve({
+                    action,
+                    applyToAll: applyToAllFoldersCheckbox.checked
+                });
             };
         });
     }
@@ -688,29 +695,62 @@ document.addEventListener('DOMContentLoaded', () => {
             dropZone.addEventListener(eventName, () => dropZone.classList.remove('dragover'));
         });
 
-        dropZone.addEventListener('drop', (e) => {
-             if (currentFolderId === userRootId) {
-                showNotification('无法直接上传到根目录，请先进入一个挂载点。', 'error');
-                return;
-            }
-            const files = Array.from(e.dataTransfer.files);
-             let hasFolder = false;
-            if (e.dataTransfer.items) {
-                for(let i=0; i<e.dataTransfer.items.length; i++) {
-                    const item = e.dataTransfer.items[i];
-                    if (typeof item.webkitGetAsEntry === "function" && item.webkitGetAsEntry().isDirectory) {
-                        hasFolder = true;
-                        break;
+        dropZone.addEventListener('drop', async (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            dropZone.classList.remove('dragover');
+    
+            const items = e.dataTransfer.items;
+            if (!items || items.length === 0) return;
+    
+            const getFileWithRelativePath = (entry) => {
+                return new Promise((resolve, reject) => {
+                    if (entry.isFile) {
+                        entry.file(file => {
+                            const relativePath = entry.fullPath.startsWith('/') ? entry.fullPath.substring(1) : entry.fullPath;
+                            resolve([{
+                                relativePath: relativePath,
+                                file: file
+                            }]);
+                        }, err => reject(err));
+                    } else if (entry.isDirectory) {
+                        const dirReader = entry.createReader();
+                        let allEntries = [];
+                        const readEntries = () => {
+                            dirReader.readEntries(async (entries) => {
+                                if (entries.length === 0) {
+                                    try {
+                                        const filesDataArrays = await Promise.all(allEntries.map(getFileWithRelativePath));
+                                        resolve(filesDataArrays.flat());
+                                    } catch (error) {
+                                        reject(error);
+                                    }
+                                } else {
+                                    allEntries.push(...entries);
+                                    readEntries();
+                                }
+                            }, err => reject(err));
+                        };
+                        readEntries();
+                    } else {
+                        resolve([]);
                     }
+                });
+            };
+        
+            try {
+                const entries = Array.from(items).map(item => item.webkitGetAsEntry());
+                const filesDataPromises = entries.map(getFileWithRelativePath);
+                const filesDataArrays = await Promise.all(filesDataPromises);
+                const allFilesData = filesDataArrays.flat().filter(Boolean);
+                
+                if (allFilesData.length > 0) {
+                    uploadFiles(allFilesData, currentFolderId, true);
+                } else {
+                    showNotification('找不到可上传的文件。', 'warn');
                 }
-            }
-
-            if (hasFolder) {
-                showNotification('不支援拖拽资料夹上传，请使用上传按钮选择资料夹。', 'error');
-                return;
-            }
-            if (files.length > 0) {
-                uploadFiles(files, currentFolderId, true);
+            } catch (error) {
+                showNotification('读取拖放的文件夹时出错。', 'error');
             }
         });
     }
@@ -1041,7 +1081,8 @@ document.addEventListener('DOMContentLoaded', () => {
     
             const resolutions = {};
             let isAborted = false;
-    
+            let applyToAllFolderAction = null;
+
             async function resolveConflictsRecursively(itemsToMove, currentTargetFolderId, pathPrefix = '') {
                 if (isAborted) return;
     
@@ -1056,8 +1097,18 @@ document.addEventListener('DOMContentLoaded', () => {
     
                 for (const folderName of folderConflicts) {
                     const fullPath = pathPrefix ? `${pathPrefix}/${folderName}` : folderName;
-                    const action = await handleFolderConflict(fullPath);
-    
+                    
+                    let action;
+                    if(applyToAllFolderAction) {
+                        action = applyToAllFolderAction;
+                    } else {
+                        const result = await handleFolderConflict(fullPath, folderConflicts.length);
+                        action = result.action;
+                        if(result.applyToAll) {
+                            applyToAllFolderAction = action;
+                        }
+                    }
+
                     if (action === 'abort') {
                         isAborted = true;
                         return;
