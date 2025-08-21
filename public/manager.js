@@ -689,30 +689,69 @@ document.addEventListener('DOMContentLoaded', () => {
         });
 
         dropZone.addEventListener('drop', (e) => {
-             if (currentFolderId === userRootId) {
-                showNotification('无法直接上传到根目录，请先进入一个挂载点。', 'error');
-                return;
-            }
-            const files = Array.from(e.dataTransfer.files);
-             let hasFolder = false;
-            if (e.dataTransfer.items) {
-                for(let i=0; i<e.dataTransfer.items.length; i++) {
-                    const item = e.dataTransfer.items[i];
-                    if (typeof item.webkitGetAsEntry === "function" && item.webkitGetAsEntry().isDirectory) {
-                        hasFolder = true;
-                        break;
-                    }
-                }
-            }
+            if (currentFolderId === userRootId) {
+               showNotification('无法直接上传到根目录，请先进入一个挂载点。', 'error');
+               return;
+           }
+           const items = e.dataTransfer.items;
+           const promises = [];
 
-            if (hasFolder) {
-                showNotification('不支援拖拽资料夹上传，请使用上传按钮选择资料夹。', 'error');
-                return;
-            }
-            if (files.length > 0) {
-                uploadFiles(files, currentFolderId, true);
-            }
-        });
+           if (items) {
+               for (let i = 0; i < items.length; i++) {
+                   const item = items[i].webkitGetAsEntry();
+                   if (item) {
+                       promises.push(traverseFileTree(item));
+                   }
+               }
+           }
+
+           Promise.all(promises).then(fileEntries => {
+               const allFiles = fileEntries.flat(Infinity);
+                if (allFiles.length > 0) {
+                   uploadFiles(allFiles, currentFolderId, true);
+               }
+           }).catch(err => {
+               showNotification('处理拖放的文件时出错: ' + err.message, 'error');
+           });
+
+           async function traverseFileTree(item, path = '') {
+               return new Promise((resolve, reject) => {
+                   if (item.isFile) {
+                       item.file(file => {
+                           try {
+                               Object.defineProperty(file, 'webkitRelativePath', {
+                                   value: path + file.name
+                               });
+                           } catch (e) {
+                               // ignore
+                           }
+                           resolve([file]);
+                       }, reject);
+                   } else if (item.isDirectory) {
+                       const dirReader = item.createReader();
+                       let allEntries = [];
+
+                       const readEntries = () => {
+                           dirReader.readEntries(entries => {
+                               if (!entries.length) {
+                                   Promise.all(allEntries).then(files => {
+                                       resolve(files.flat());
+                                   }).catch(reject);
+                               } else {
+                                   const entryPromises = [];
+                                   for (let i = 0; i < entries.length; i++) {
+                                       entryPromises.push(traverseFileTree(entries[i], path + item.name + '/'));
+                                   }
+                                   allEntries.push(...entryPromises);
+                                   readEntries();
+                               }
+                           }, reject);
+                       };
+                       readEntries();
+                   }
+               });
+           }
+       });
     }
 
     if (homeLink) {
