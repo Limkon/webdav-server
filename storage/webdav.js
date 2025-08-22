@@ -1,13 +1,14 @@
+// limkon/webdav-server/webdav-server-c537b63a2d01ddbeb66471106304717d5eb7ad03/storage/webdav.js
 const { createClient } = require('webdav');
 const data = require('../data.js');
 const db = require('../database.js');
 const crypto = require('crypto');
 const fs = require('fs'); 
 const path = require('path');
-const storageManager = require('./index');
 
 // 动态获取客户端
 function getClient(mountName) {
+    const storageManager = require('./index');
     const webdavConfig = storageManager.getWebdavConfigByName(mountName);
     if (!webdavConfig) {
         throw new Error(`找不到名为 '${mountName}' 的 WebDAV 挂载点设定`);
@@ -20,6 +21,7 @@ function getClient(mountName) {
 
 // 上传逻辑
 async function upload(fileStream, fileName, mimetype, userId, folderId, caption = '') {
+    const storageManager = require('./index');
     const rootFolder = await data.getRootFolder(userId);
     if(folderId === rootFolder.id) {
          throw new Error("逻辑错误：无法上传到根目录。请选择一个挂载点内的资料夹。");
@@ -84,6 +86,7 @@ async function upload(fileStream, fileName, mimetype, userId, folderId, caption 
 
 
 async function remove(files, folders, userId) {
+    const storageManager = require('./index');
     const itemsByMount = {};
 
     for (const file of files) {
