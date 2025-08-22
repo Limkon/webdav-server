@@ -12,7 +12,8 @@
             padding: 10px 0;
             box-sizing: border-box;
             display: flex;
-            position: relative; /* 新增，为行号定位 */
+            position: relative;
+            min-height: 0; /* 新增：确保在flex布局中可以正确缩小，防止溢出 */
         }
         /* --- 新增行号样式 --- */
         .line-numbers {
@@ -47,6 +48,12 @@
         #editor:focus {
             outline: none;
         }
+        /* --- 新增：禁用按钮样式 --- */
+        #saveBtn:disabled {
+            background-color: #6c757d;
+            cursor: not-allowed;
+            opacity: 0.65;
+        }
     </style>
 </head>
 <body>
@@ -56,7 +63,7 @@
             <div class="header-buttons">
                 <span id="saveStatus" style="color: var(--success-color); font-weight: bold; margin-right: 15px;"></span>
                 <button id="saveBtn" class="upload-link-btn">保存</button>
-                <button id="backBtn" class="upload-link-btn" style="background-color: #6c757d;">关闭</button>
+                <button id="backBtn" class="upload-link-btn" style="background-color: #6c757d;">返回</button>
             </div>
         </header>
         <div class="editor-container">
