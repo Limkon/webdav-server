@@ -6,6 +6,48 @@
     <title>文字编辑器</title>
     <link rel="stylesheet" href="/vendor/fontawesome/css/all.min.css">
     <link rel="stylesheet" href="/manager.css">
+    <style>
+        .editor-container {
+            flex-grow: 1;
+            padding: 10px 0;
+            box-sizing: border-box;
+            display: flex;
+            position: relative; /* 新增，为行号定位 */
+        }
+        /* --- 新增行号样式 --- */
+        .line-numbers {
+            width: 40px;
+            padding: 15px 5px 15px 0;
+            box-sizing: border-box;
+            text-align: right;
+            font-family: 'Courier New', Courier, monospace;
+            font-size: 14px; /* 缩小字体 */
+            line-height: 1.4; /* 缩小行间距 */
+            color: #aaa;
+            background-color: #f8f9fa;
+            border-right: 1px solid var(--border-color);
+            user-select: none;
+            overflow: hidden;
+            white-space: pre;
+        }
+        #editor {
+            width: 100%;
+            height: 100%;
+            border: 1px solid var(--border-color);
+            border-left: none; /* 移除左边框 */
+            border-radius: 0 4px 4px 0; /* 调整圆角 */
+            padding: 15px;
+            box-sizing: border-box;
+            font-family: 'Courier New', Courier, monospace;
+            font-size: 14px; /* 缩小字体 */
+            line-height: 1.4; /* 缩小行间距 */
+            letter-spacing: -0.5px; /* 缩细字间距 */
+            resize: none;
+        }
+        #editor:focus {
+            outline: none;
+        }
+    </style>
 </head>
 <body>
     <div class="container">
@@ -14,11 +56,12 @@
             <div class="header-buttons">
                 <span id="saveStatus" style="color: var(--success-color); font-weight: bold; margin-right: 15px;"></span>
                 <button id="saveBtn" class="upload-link-btn">保存</button>
-                <button id="backBtn" class="upload-link-btn" style="background-color: #6c757d;">返回</button>
+                <button id="backBtn" class="upload-link-btn" style="background-color: #6c757d;">关闭</button>
             </div>
         </header>
-        <div class="editor-container" style="flex-grow: 1; padding: 10px 0; box-sizing: border-box; display: flex;">
-            <textarea id="editor" spellcheck="false" style="width: 100%; height: 100%; border: 1px solid var(--border-color); border-radius: 4px; padding: 15px; box-sizing: border-box; font-family: 'Courier New', Courier, monospace; font-size: 16px; line-height: 1.5; resize: none;"></textarea>
+        <div class="editor-container">
+            <div id="lineNumbers" class="line-numbers">1</div>
+            <textarea id="editor" spellcheck="false"></textarea>
         </div>
     </div>
     <script src="/vendor/axios/axios.min.js"></script>
@@ -29,6 +72,7 @@
             const saveBtn = document.getElementById('saveBtn');
             const backBtn = document.getElementById('backBtn');
             const saveStatus = document.getElementById('saveStatus');
+            const lineNumbers = document.getElementById('lineNumbers'); // 获取行号元素
 
             const urlParams = new URLSearchParams(window.location.search);
             let mode = urlParams.get('mode');
@@ -38,7 +82,14 @@
             let initialFileName = '';
             let initialContent = '';
 
-            // 检查内容是否有变更并更新按钮状态
+            // --- 新增：更新行号的函数 ---
+            const updateLineNumbers = () => {
+                const lines = editor.value.split('\n').length;
+                lineNumbers.innerHTML = Array.from({ length: lines }, (_, i) => i + 1).join('\n');
+                // 同步滚动
+                lineNumbers.scrollTop = editor.scrollTop;
+            };
+
             const checkForChanges = () => {
                 const nameChanged = fileNameInput.value !== initialFileName;
                 const contentChanged = editor.value !== initialContent;
@@ -46,7 +97,7 @@
             };
 
             async function loadFileContent() {
-                saveBtn.disabled = true; // 初始禁用保存按钮
+                saveBtn.disabled = true;
                 if (mode === 'edit' && fileId) {
                     try {
                         const fileInfoRes = await axios.get(`/api/file-info/${fileId}`);
@@ -65,7 +116,7 @@
                     fileNameInput.value = '';
                     initialFileName = '';
                 }
-                // 新建文件时，按钮初始也是禁用的，直到用户输入内容
+                updateLineNumbers(); // 初始载入时更新行号
             }
 
             saveBtn.addEventListener('click', async () => {
@@ -76,7 +127,7 @@
                 }
 
                 const content = editor.value;
-                saveBtn.disabled = true; // 点击后立刻禁用，防止重复点击
+                saveBtn.disabled = true;
                 saveBtn.textContent = '储存中...';
                 saveStatus.textContent = '';
 
@@ -98,7 +149,6 @@
                         saveStatus.textContent = '';
                     }, 2000);
 
-                    // 更新初始状态为当前已保存的状态
                     initialFileName = fileName;
                     initialContent = content;
 
@@ -111,7 +161,6 @@
                     }
                 } catch (error) {
                     alert('储存失败：' + (error.response?.data?.message || '伺服器错误'));
-                    // 储存失败时，根据当前内容重新判断按钮是否可用
                     checkForChanges();
                 } finally {
                     saveBtn.textContent = '保存';
@@ -121,10 +170,18 @@
             backBtn.addEventListener('click', () => {
                 window.close();
             });
-
-            // 监听输入变化
+            
+            // --- 修改：监听输入和滚动事件以更新行号 ---
             fileNameInput.addEventListener('input', checkForChanges);
-            editor.addEventListener('input', checkForChanges);
+            editor.addEventListener('input', () => {
+                checkForChanges();
+                updateLineNumbers();
+            });
+            editor.addEventListener('scroll', () => {
+                lineNumbers.scrollTop = editor.scrollTop;
+            });
+            // 当视窗大小改变时也可能需要重新计算
+            window.addEventListener('resize', updateLineNumbers);
 
             loadFileContent();
         });
