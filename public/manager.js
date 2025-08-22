@@ -1,3 +1,4 @@
+// limkon/webdav-server/webdav-server-c537b63a2d01ddbeb66471106304717d5eb7ad03/public/manager.js
 document.addEventListener('DOMContentLoaded', () => {
     // DOM 元素
     const homeLink = document.getElementById('homeLink');
@@ -65,6 +66,9 @@ document.addEventListener('DOMContentLoaded', () => {
     let foldersLoaded = false;
     let currentView = 'grid';
     let webdavMounts = [];
+    // 新增：可线上编辑的副档名列表
+    const editableExtensions = ['.txt', '.md', '.js', '.css', '.html', '.json', '.xml', '.yaml', '.yml', '.sh', '.py', '.log'];
+
 
     const formatBytes = (bytes, decimals = 2) => {
         if (!bytes || bytes === 0) return '0 Bytes';
@@ -408,10 +412,11 @@ document.addEventListener('DOMContentLoaded', () => {
 
         downloadBtn.disabled = count === 0 || isRoot;
 
-        const isSingleTextFile = count === 1 && selectedItems.values().next().value.type === 'file' && selectedItems.values().next().value.name.endsWith('.txt');
-        textEditBtn.disabled = isRoot || !(count === 0 || isSingleTextFile);
+        const isSingleEditableFile = count === 1 && selectedItems.values().next().value.type === 'file' && editableExtensions.some(ext => selectedItems.values().next().value.name.toLowerCase().endsWith(ext));
+        textEditBtn.disabled = isRoot || !(count === 0 || isSingleEditableFile);
         textEditBtn.innerHTML = (count === 0 && !isRoot) ? '<i class="fas fa-file-alt"></i>' : '<i class="fas fa-edit"></i>';
-        textEditBtn.title = (count === 0 && !isRoot) ? '新建文字档' : '编辑文字档';
+        textEditBtn.title = (count === 0 && !isRoot) ? '新建档案' : '编辑档案';
+
 
         previewBtn.disabled = count !== 1 || (count === 1 && selectedItems.values().next().value.type === 'folder');
         shareBtn.disabled = count !== 1 || isRoot;
