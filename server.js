@@ -335,7 +335,7 @@ app.post('/api/text-file', requireLogin, async (req, res) => {
     } catch (error) {
         res.status(500).json({ success: false, message: '伺服器内部错误: ' + error.message });
     } finally {
-        if (fsSync.existsSync(tempFilePath)) {
+        if (fs.existsSync(tempFilePath)) {
             await fsp.unlink(tempFilePath).catch(err => {});
         }
     }
