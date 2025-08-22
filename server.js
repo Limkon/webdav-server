@@ -290,8 +290,8 @@ app.post('/api/text-file', requireLogin, async (req, res) => {
          return res.status(400).json({ success: false, message: '无法在根目录建立档案。' });
     }
 
-    if (!fileName || !fileName.endsWith('.txt')) {
-        return res.status(400).json({ success: false, message: '档名无效或不是 .txt 档案' });
+    if (!fileName) {
+        return res.status(400).json({ success: false, message: '档名不能为空' });
     }
 
     const tempFilePath = path.join(TMP_DIR, `${Date.now()}-${crypto.randomBytes(8).toString('hex')}.txt`);
@@ -336,6 +336,7 @@ app.post('/api/text-file', requireLogin, async (req, res) => {
         }
     }
 });
+
 app.get('/api/file-info/:id', requireLogin, async (req, res) => {
     try {
         const fileId = parseInt(req.params.id, 10);
