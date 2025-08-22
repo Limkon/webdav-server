@@ -128,10 +128,40 @@ body {
 .list-item { cursor: pointer; transition: background-color 0.2s; }
 .list-item:hover { background-color: #f1f3f5; }
 .list-item.selected { background-color: #cfe2ff; border-left: 4px solid var(--primary-color); padding-left: 6px; }
-.list-icon { width: 30px; text-align: center; margin-right: 15px; font-size: 1.2em; }
-.list-icon .fa-folder { color: #ffc107; }
-.list-name { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.list-size, .list-date { width: 150px; text-align: right; color: #6c757d; font-size: 0.9em; flex-shrink: 0; }
+
+/* --- Start of Column Fix --- */
+.list-icon {
+    width: 30px;
+    text-align: center;
+    margin-right: 15px;
+    font-size: 1.2em;
+    flex-shrink: 0; /* 确保图标列不会被压缩 */
+}
+.list-name {
+    width: 55%; /* 分配一个基础的百分比宽度 */
+    min-width: 200px; /* 确保在窄屏下不会过窄 */
+    padding-right: 1em; /* 增加与下一列的间距 */
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.list-size {
+    width: 120px; /* 调整为一个更合适的大小 */
+    text-align: right;
+    color: #6c757d;
+    font-size: 0.9em;
+    flex-shrink: 0;
+    padding-right: 1em; /* 增加与下一列的间距 */
+}
+.list-date {
+    width: 160px; /* 为日期和时间保留足够宽度 */
+    text-align: right;
+    color: #6c757d;
+    font-size: 0.9em;
+    flex-shrink: 0;
+}
+/* --- End of Column Fix --- */
+
 .action-bar {
   position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
   width: 90%; max-width: 700px; background-color: #212529; color: white;
