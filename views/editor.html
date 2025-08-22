@@ -61,6 +61,9 @@
                         alert('载入档案失败！');
                         window.close();
                     }
+                } else {
+                    fileNameInput.value = '';
+                    initialFileName = '';
                 }
                 // 新建文件时，按钮初始也是禁用的，直到用户输入内容
             }
@@ -71,9 +74,7 @@
                     alert('档名不能为空！');
                     return;
                 }
-                if (!fileName.endsWith('.txt')) {
-                    fileName += '.txt';
-                }
+
                 const content = editor.value;
                 saveBtn.disabled = true; // 点击后立刻禁用，防止重复点击
                 saveBtn.textContent = '储存中...';
