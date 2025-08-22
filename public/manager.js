@@ -65,11 +65,6 @@ document.addEventListener('DOMContentLoaded', () => {
     let foldersLoaded = false;
     let currentView = 'grid';
     let webdavMounts = [];
-    const editableExtensions = [
-        '.txt', '.md', '.markdown', '.js', '.json', '.css', '.html', '.htm', '.xml', 
-        '.yaml', '.yml', '.ini', '.cfg', '.log', '.sh', '.bat', '.py', '.rb', '.php'
-    ];
-
 
     const formatBytes = (bytes, decimals = 2) => {
         if (!bytes || bytes === 0) return '0 Bytes';
@@ -412,12 +407,9 @@ document.addEventListener('DOMContentLoaded', () => {
         showUploadModalBtn.disabled = isRoot || isSearchMode;
 
         downloadBtn.disabled = count === 0 || isRoot;
-        
-        const isSingleEditableFile = count === 1 && 
-            selectedItems.values().next().value.type === 'file' &&
-            editableExtensions.some(ext => selectedItems.values().next().value.name.endsWith(ext));
 
-        textEditBtn.disabled = isRoot || !(count === 0 || isSingleEditableFile);
+        const isSingleTextFile = count === 1 && selectedItems.values().next().value.type === 'file' && selectedItems.values().next().value.name.endsWith('.txt');
+        textEditBtn.disabled = isRoot || !(count === 0 || isSingleTextFile);
         textEditBtn.innerHTML = (count === 0 && !isRoot) ? '<i class="fas fa-file-alt"></i>' : '<i class="fas fa-edit"></i>';
         textEditBtn.title = (count === 0 && !isRoot) ? '新建文字档' : '编辑文字档';
 
@@ -912,14 +904,12 @@ document.addEventListener('DOMContentLoaded', () => {
             previewModal.style.display = 'flex';
             modalContent.innerHTML = '正在加载预览...';
             const downloadUrl = `/download/proxy/${messageId}`;
-            
-            const isTextPreviewable = editableExtensions.some(ext => file.name.endsWith(ext)) || (file.mimetype && file.mimetype.startsWith('text/'));
 
             if (file.mimetype && file.mimetype.startsWith('image/')) {
                 modalContent.innerHTML = `<img src="${downloadUrl}" alt="图片预览">`;
             } else if (file.mimetype && file.mimetype.startsWith('video/')) {
                 modalContent.innerHTML = `<video src="${downloadUrl}" controls autoplay></video>`;
-            } else if (isTextPreviewable) {
+            } else if (file.mimetype && (file.mimetype.startsWith('text/') || file.name.endsWith('.txt'))) {
                 try {
                     const res = await axios.get(`/file/content/${messageId}`);
                     const escapedContent = res.data.replace(/&/g, "&amp;").replace(/</g, "&lt;");
@@ -962,12 +952,10 @@ document.addEventListener('DOMContentLoaded', () => {
             if (downloadBtn.disabled) return;
             const messageIds = [];
             const folderIds = [];
-            // --- *** 关键修正 开始 *** ---
             selectedItems.forEach((item, id) => {
-                if (item.type === 'file') messageIds.push(id);
+                if (item.type === 'file') messageIds.push(parseInt(id));
                 else folderIds.push(parseInt(id));
             });
-            // --- *** 关键修正 结束 *** ---
             if (messageIds.length === 0 && folderIds.length === 0) return;
             if (messageIds.length === 1 && folderIds.length === 0) {
                 window.location.href = `/download/proxy/${messageIds[0]}`;
@@ -994,12 +982,10 @@ document.addEventListener('DOMContentLoaded', () => {
             if (selectedItems.size === 0) return;
             if (!confirm(`确定要删除这 ${selectedItems.size} 个项目吗？\n注意：删除资料夾将会一并删除其所有内容！`)) return;
             const filesToDelete = [], foldersToDelete = [];
-             // --- *** 关键修正 开始 *** ---
             selectedItems.forEach((item, id) => {
-                if (item.type === 'file') filesToDelete.push(id);
+                if (item.type === 'file') filesToDelete.push(parseInt(id));
                 else foldersToDelete.push(parseInt(id));
             });
-             // --- *** 关键修正 结束 *** ---
             try {
                 await axios.post('/delete-multiple', { messageIds: filesToDelete, folderIds: foldersToDelete });
                 loadFolderContents(currentFolderId);
@@ -1149,13 +1135,8 @@ document.addEventListener('DOMContentLoaded', () => {
             }
     
             try {
-                // --- *** 关键修正 开始 *** ---
-                const topLevelItems = Array.from(selectedItems.entries()).map(([id, { type, name }]) => ({ 
-                    id: (type === 'file' ? id : parseInt(id)), 
-                    type, 
-                    name 
-                }));
-                // --- *** 关键修正 结束 *** ---
+                const topLevelItems = Array.from(selectedItems.entries()).map(([id, { type, name }]) => ({ id: parseInt(id), type, name }));
+                
                 await resolveConflictsRecursively(topLevelItems, moveTargetFolderId);
     
                 if (isAborted) {

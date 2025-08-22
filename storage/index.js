@@ -14,17 +14,12 @@ function readConfig() {
             if (!config.webdav || !Array.isArray(config.webdav)) {
                 config.webdav = [];
             }
-            // 新增：确保熔断器物件存在
-            if (!config.circuitBreaker) {
-                config.circuitBreaker = {};
-            }
             return config;
         }
     } catch (error) {
         // console.error("读取设定档失败:", error);
     }
-    // 返回包含预设空熔断器物件的设定
-    return { webdav: [], circuitBreaker: {} };
+    return { webdav: [] };
 }
 
 function writeConfig(config) {
@@ -50,48 +45,10 @@ function getWebdavConfigByName(name) {
     return config.webdav.find(c => c.name === name);
 }
 
-/**
- * 修改：标记一个挂载点为容量已满 (熔断)，并持久化到 config.json
- * @param {string} mountName - 挂载点名称
- * @param {boolean} isFull - 是否已满
- */
-function setMountFull(mountName, isFull) {
-    const config = readConfig();
-    config.circuitBreaker[mountName] = isFull;
-    writeConfig(config);
-    // console.log(`[熔断机制] ${mountName} 状态已更新并持久化: ${isFull ? '已熔断 (容量满)' : '正常'}`);
-}
-
-/**
- * 修改：从 config.json 检查一个挂载点是否已熔断
- * @param {string} mountName - 挂载点名称
- * @returns {boolean} - 如果已满则返回 true
- */
-function isMountFull(mountName) {
-    const config = readConfig();
-    return config.circuitBreaker[mountName] || false;
-}
-
-/**
- * 修改：清除一个挂载点的熔断状态，并持久化到 config.json
- * @param {string} mountName - 挂载点名称
- */
-function clearMountStatus(mountName) {
-    const config = readConfig();
-    if (config.circuitBreaker && config.circuitBreaker[mountName]) {
-        config.circuitBreaker[mountName] = false;
-        writeConfig(config);
-        // console.log(`[熔断机制] ${mountName} 的熔断状态已被清除并持久化。`);
-    }
-}
-
 
 module.exports = {
     getStorage,
     readConfig,
     writeConfig,
-    getWebdavConfigByName,
-    setMountFull,
-    isMountFull,
-    clearMountStatus
+    getWebdavConfigByName
 };
