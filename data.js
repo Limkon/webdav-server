@@ -720,8 +720,8 @@ async function renameFolder(folderId, newFolderName, userId) {
         const descendantFiles = await getFilesRecursive(folderId, userId);
         for (const file of descendantFiles) {
             const updatedFileId = file.file_id.replace(
-                path.posix.join(mountName, oldRelativePath),
-                path.posix.join(mountName, newRelativePath)
+                path.posix.join(sourceMountName, oldRelativePath),
+                path.posix.join(targetMountName, newRelativePath)
             );
             await new Promise((res, rej) => db.run('UPDATE files SET file_id = ? WHERE message_id = ?', [updatedFileId, file.message_id], (e) => e ? rej(e) : res()));
         }
