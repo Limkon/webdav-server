@@ -4,18 +4,14 @@ const db = require('../database.js');
 const crypto = require('crypto');
 const fs = require('fs'); 
 const path = require('path');
-// 移除顶部的循环依赖: const storageManager = require('./index');
+const storageManager = require('./index');
 
 // 动态获取客户端
 function getClient(mountName) {
-    // **错误修复**: 将 require 移入函数内部，在使用时加载，打破循环依赖
-    const storageManager = require('./index'); 
     const webdavConfig = storageManager.getWebdavConfigByName(mountName);
     if (!webdavConfig) {
         throw new Error(`找不到名为 '${mountName}' 的 WebDAV 挂载点设定`);
     }
-    // [DEBUG] 日志：显示正在使用的 WebDAV 客户端设定
-    // console.log(`[DEBUG] [WebDAV] Creating client for mount: '${mountName}' with URL: ${webdavConfig.url}`);
     return createClient(webdavConfig.url, {
         username: webdavConfig.username,
         password: webdavConfig.password
@@ -24,9 +20,6 @@ function getClient(mountName) {
 
 // 上传逻辑
 async function upload(fileStream, fileName, mimetype, userId, folderId, caption = '') {
-    // [DEBUG] 日志：进入上传函数
-    // console.log(`[DEBUG] [WebDAV] Starting upload for user ${userId}, folder ${folderId}, file "${fileName}"`);
-
     const rootFolder = await data.getRootFolder(userId);
     if(folderId === rootFolder.id) {
          throw new Error("逻辑错误：无法上传到根目录。请选择一个挂载点内的资料夹。");
@@ -37,13 +30,16 @@ async function upload(fileStream, fileName, mimetype, userId, folderId, caption 
         throw new Error("无效的目标资料夹，无法确定挂载点。");
     }
     const mountName = folderPathParts[1].name;
+
+    // --- 熔断机制：检查点 ---
+    if (storageManager.isMountFull(mountName)) {
+        throw new Error(`WebDAV [${mountName}] 容量已满，上传操作已熔断。`);
+    }
+
     const client = getClient(mountName);
 
     const remoteFolderPath = '/' + folderPathParts.slice(2).map(p => p.name).join('/');
     const remotePath = (remoteFolderPath === '/' ? '' : remoteFolderPath) + '/' + fileName;
-
-    // [DEBUG] 日志：显示最终的远端路径
-    // console.log(`[DEBUG] [WebDAV] Calculated remote path: '${remotePath}' on mount '${mountName}'`);
 
     if (remoteFolderPath && remoteFolderPath !== "/") {
         try {
@@ -55,10 +51,18 @@ async function upload(fileStream, fileName, mimetype, userId, folderId, caption 
         }
     }
     
-    const success = await client.putFileContents(remotePath, fileStream, { overwrite: true });
-
-    if (!success) {
-        throw new Error('WebDAV putFileContents 操作失败');
+    try {
+        const success = await client.putFileContents(remotePath, fileStream, { overwrite: true });
+        if (!success) {
+            throw new Error('WebDAV putFileContents 操作失败');
+        }
+    } catch (error) {
+        // --- 熔断机制：触发点 ---
+        if (error.response && error.response.status === 507) { // HTTP 507 Insufficient Storage
+            storageManager.setMountFull(mountName, true);
+            throw new Error(`WebDAV [${mountName}] 容量已满，上传失败。熔断机制已启动。`);
+        }
+        throw error; // 重新抛出其他错误
     }
 
     const stats = await client.stat(remotePath);
@@ -75,8 +79,6 @@ async function upload(fileStream, fileName, mimetype, userId, folderId, caption 
         date: Date.now(),
     }, folderId, userId, 'webdav');
     
-    // [DEBUG] 日志：上传成功
-    // console.log(`[DEBUG] [WebDAV] Upload successful for file "${fileName}", DB ID: ${dbResult.id}`);
     return { success: true, message: '档案已上传至 WebDAV。', fileId: dbResult.fileId };
 }
 
@@ -103,8 +105,6 @@ async function remove(files, folders, userId) {
     const results = { success: true, errors: [] };
 
     for (const mountName in itemsByMount) {
-        // [DEBUG] 日志：删除操作
-        // console.log(`[DEBUG] [WebDAV] Performing delete on mount '${mountName}'`);
         const client = getClient(mountName);
         const { files, folders } = itemsByMount[mountName];
         
@@ -122,19 +122,26 @@ async function remove(files, folders, userId) {
         });
         
         allItemsToDelete.sort((a, b) => b.path.length - a.path.length);
+        let successfullyDeleted = false;
 
         for (const item of allItemsToDelete) {
             try {
-                // [DEBUG] 日志：删除单个项目
-                // console.log(`[DEBUG] [WebDAV] Deleting item: ${item.path}`);
                 await client.deleteFile(item.path);
+                successfullyDeleted = true;
             } catch (error) {
                 if (!(error.response && error.response.status === 404)) {
                     const errorMessage = `删除 WebDAV [${mountName}${item.path}] 失败: ${error.message}`;
                     results.errors.push(errorMessage);
                     results.success = false;
+                } else {
+                    successfullyDeleted = true; // 如果档案本就不存在，也视为成功，以便清除资料库
                 }
             }
+        }
+        
+        // --- 熔断机制：重置点 ---
+        if (successfullyDeleted) {
+            storageManager.clearMountStatus(mountName);
         }
     }
 
@@ -144,8 +151,6 @@ async function remove(files, folders, userId) {
 async function stream(file_id, userId) {
     const mountName = file_id.split('/')[0];
     const remotePath = file_id.substring(mountName.length);
-    // [DEBUG] 日志：创建读取流
-    // console.log(`[DEBUG] [WebDAV] Creating read stream for '${remotePath}' on mount '${mountName}'`);
     const client = getClient(mountName);
     return client.createReadStream(remotePath);
 }
@@ -160,8 +165,6 @@ async function getUrl(file_id, userId) {
 async function createDirectory(fullPath) {
     const mountName = fullPath.split('/')[0];
     const remotePath = '/' + fullPath.substring(mountName.length + 1);
-    // [DEBUG] 日志：创建目录
-    // console.log(`[DEBUG] [WebDAV] Creating directory '${remotePath}' on mount '${mountName}'`);
     const client = getClient(mountName);
     try {
         if (await client.exists(remotePath)) {
