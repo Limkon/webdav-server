@@ -13,6 +13,7 @@ const crypto = require('crypto');
 const db = require('./database.js');
 const data = require('./data.js');
 const storageManager = require('./storage');
+const mime = require('mime-types');
 
 const app = express();
 
@@ -295,7 +296,6 @@ app.post('/api/text-file', requireLogin, async (req, res) => {
         return res.status(400).json({ success: false, message: '档名无效' });
     }
     
-    const mime = require('mime-types');
     const mimeType = mime.lookup(fileName) || 'text/plain';
 
     const tempFilePath = path.join(TMP_DIR, `${Date.now()}-${crypto.randomBytes(8).toString('hex')}.txt`);
@@ -335,7 +335,7 @@ app.post('/api/text-file', requireLogin, async (req, res) => {
     } catch (error) {
         res.status(500).json({ success: false, message: '伺服器内部错误: ' + error.message });
     } finally {
-        if (fs.existsSync(tempFilePath)) {
+        if (fsSync.existsSync(tempFilePath)) {
             await fsp.unlink(tempFilePath).catch(err => {});
         }
     }
