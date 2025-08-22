@@ -33,14 +33,17 @@
     
     <div id="dropZone">
         <div class="item-grid" id="itemGrid"></div>
-        <div class="item-list-view" id="itemListView" style="display: none;">
-            <div class="list-header">
-                <div class="list-name">名称</div>
-                <div class="list-size">大小</div>
-                <div class="list-date">修改日期</div>
-            </div>
-            <div class="list-body" id="itemListBody"></div>
-        </div>
+        <table class="item-list-table" id="itemListView" style="display: none;">
+            <thead>
+                <tr>
+                    <th class="list-name-col">名称</th>
+                    <th class="list-size-col">大小</th>
+                    <th class="list-date-col">修改日期</th>
+                </tr>
+            </thead>
+            <tbody id="itemListBody">
+            </tbody>
+        </table>
         <div id="dropZoneOverlay">
             <span>将拖到此处以上传</span>
         </div>
