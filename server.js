@@ -1,3 +1,4 @@
+// limkon/webdav-server/webdav-server-c537b63a2d01ddbeb66471106304717d5eb7ad03/server.js
 require('dotenv').config();
 const express = require('express');
 const session = require('express-session');
@@ -290,9 +291,12 @@ app.post('/api/text-file', requireLogin, async (req, res) => {
          return res.status(400).json({ success: false, message: '无法在根目录建立档案。' });
     }
 
-    if (!fileName || !fileName.endsWith('.txt')) {
-        return res.status(400).json({ success: false, message: '档名无效或不是 .txt 档案' });
+    if (!fileName) {
+        return res.status(400).json({ success: false, message: '档名无效' });
     }
+    
+    const mime = require('mime-types');
+    const mimeType = mime.lookup(fileName) || 'text/plain';
 
     const tempFilePath = path.join(TMP_DIR, `${Date.now()}-${crypto.randomBytes(8).toString('hex')}.txt`);
 
@@ -314,7 +318,7 @@ app.post('/api/text-file', requireLogin, async (req, res) => {
                 }
                 
                 await data.unifiedDelete(originalFile.message_id, 'file', userId);
-                result = await storage.upload(fileStream, fileName, 'text/plain', userId, originalFile.folder_id);
+                result = await storage.upload(fileStream, fileName, mimeType, userId, originalFile.folder_id);
             } else {
                 return res.status(404).json({ success: false, message: '找不到要编辑的原始档案' });
             }
@@ -323,7 +327,7 @@ app.post('/api/text-file', requireLogin, async (req, res) => {
             if (conflict) {
                 return res.status(409).json({ success: false, message: '同目录下已存在同名档案或资料夾。' });
             }
-            result = await storage.upload(fileStream, fileName, 'text/plain', userId, folderId);
+            result = await storage.upload(fileStream, fileName, mimeType, userId, folderId);
         } else {
             return res.status(400).json({ success: false, message: '请求参数无效' });
         }
