@@ -339,7 +339,7 @@ app.post('/api/text-file', requireLogin, async (req, res) => {
 
 app.get('/api/file-info/:id', requireLogin, async (req, res) => {
     try {
-        const fileId = parseInt(req.params.id, 10);
+        const fileId = req.params.id; // 修正：直接使用字串ID
         const [fileInfo] = await data.getFilesByIds([fileId], req.session.userId);
         if (fileInfo) {
             res.json(fileInfo);
@@ -593,7 +593,7 @@ app.post('/rename', requireLogin, async (req, res) => {
 
 app.get('/thumbnail/:message_id', requireLogin, async (req, res) => {
     try {
-        const messageId = parseInt(req.params.message_id, 10);
+        const messageId = req.params.message_id; // 修正：直接使用字串ID
         const [fileInfo] = await data.getFilesByIds([messageId], req.session.userId);
 
         const placeholder = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
@@ -605,7 +605,7 @@ app.get('/thumbnail/:message_id', requireLogin, async (req, res) => {
 
 app.get('/download/proxy/:message_id', requireLogin, async (req, res) => {
     try {
-        const messageId = parseInt(req.params.message_id, 10);
+        const messageId = req.params.message_id; // 修正：直接使用字串ID
         const [fileInfo] = await data.getFilesByIds([messageId], req.session.userId);
         
         if (!fileInfo || !fileInfo.file_id) {
@@ -628,7 +628,7 @@ app.get('/download/proxy/:message_id', requireLogin, async (req, res) => {
 
 app.get('/file/content/:message_id', requireLogin, async (req, res) => {
     try {
-        const messageId = parseInt(req.params.message_id, 10);
+        const messageId = req.params.message_id; // 修正：直接使用字串ID
         const [fileInfo] = await data.getFilesByIds([messageId], req.session.userId);
 
         if (!fileInfo || !fileInfo.file_id) {
@@ -856,7 +856,7 @@ app.get('/share/download/file/:token', async (req, res) => {
 app.get('/share/thumbnail/:folderToken/:fileId', async (req, res) => {
     try {
         const { folderToken, fileId } = req.params;
-        const fileInfo = await data.findFileInSharedFolder(parseInt(fileId, 10), folderToken);
+        const fileInfo = await data.findFileInSharedFolder(fileId, folderToken);
 
         const placeholder = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
         res.writeHead(200, { 'Content-Type': 'image/gif', 'Content-Length': placeholder.length });
@@ -870,7 +870,7 @@ app.get('/share/thumbnail/:folderToken/:fileId', async (req, res) => {
 app.get('/share/download/:folderToken/:fileId', async (req, res) => {
     try {
         const { folderToken, fileId } = req.params;
-        const fileInfo = await data.findFileInSharedFolder(parseInt(fileId, 10), folderToken);
+        const fileInfo = await data.findFileInSharedFolder(fileId, folderToken);
         
         if (!fileInfo || !fileInfo.file_id) {
              return res.status(404).send('文件信息未找到或权限不足');
