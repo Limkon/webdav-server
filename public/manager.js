@@ -65,6 +65,14 @@ document.addEventListener('DOMContentLoaded', () => {
     let foldersLoaded = false;
     let currentView = 'grid';
     let webdavMounts = [];
+    // --- *** 关键修正 开始 *** ---
+    // 定义可线上编辑和预览的纯文字文件类型
+    const editableExtensions = [
+        '.txt', '.md', '.markdown', '.js', '.json', '.css', '.html', '.htm', '.xml', 
+        '.yaml', '.yml', '.ini', '.cfg', '.log', '.sh', '.bat', '.py', '.rb', '.php'
+    ];
+    // --- *** 关键修正 结束 *** ---
+
 
     const formatBytes = (bytes, decimals = 2) => {
         if (!bytes || bytes === 0) return '0 Bytes';
@@ -408,10 +416,15 @@ document.addEventListener('DOMContentLoaded', () => {
 
         downloadBtn.disabled = count === 0 || isRoot;
 
-        const isSingleTextFile = count === 1 && selectedItems.values().next().value.type === 'file' && selectedItems.values().next().value.name.endsWith('.txt');
-        textEditBtn.disabled = isRoot || !(count === 0 || isSingleTextFile);
+        // --- *** 关键修正 开始 *** ---
+        const isSingleEditableFile = count === 1 && 
+            selectedItems.values().next().value.type === 'file' &&
+            editableExtensions.some(ext => selectedItems.values().next().value.name.endsWith(ext));
+
+        textEditBtn.disabled = isRoot || !(count === 0 || isSingleEditableFile);
         textEditBtn.innerHTML = (count === 0 && !isRoot) ? '<i class="fas fa-file-alt"></i>' : '<i class="fas fa-edit"></i>';
         textEditBtn.title = (count === 0 && !isRoot) ? '新建文字档' : '编辑文字档';
+        // --- *** 关键修正 结束 *** ---
 
         previewBtn.disabled = count !== 1 || (count === 1 && selectedItems.values().next().value.type === 'folder');
         shareBtn.disabled = count !== 1 || isRoot;
@@ -904,12 +917,16 @@ document.addEventListener('DOMContentLoaded', () => {
             previewModal.style.display = 'flex';
             modalContent.innerHTML = '正在加载预览...';
             const downloadUrl = `/download/proxy/${messageId}`;
+            
+            // --- *** 关键修正 开始 *** ---
+            const isTextPreviewable = editableExtensions.some(ext => file.name.endsWith(ext)) || (file.mimetype && file.mimetype.startsWith('text/'));
 
             if (file.mimetype && file.mimetype.startsWith('image/')) {
                 modalContent.innerHTML = `<img src="${downloadUrl}" alt="图片预览">`;
             } else if (file.mimetype && file.mimetype.startsWith('video/')) {
                 modalContent.innerHTML = `<video src="${downloadUrl}" controls autoplay></video>`;
-            } else if (file.mimetype && (file.mimetype.startsWith('text/') || file.name.endsWith('.txt'))) {
+            } else if (isTextPreviewable) {
+            // --- *** 关键修正 结束 *** ---
                 try {
                     const res = await axios.get(`/file/content/${messageId}`);
                     const escapedContent = res.data.replace(/&/g, "&amp;").replace(/</g, "&lt;");
