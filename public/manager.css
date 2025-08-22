@@ -80,14 +80,25 @@ body {
     margin-bottom: 20px;
     font-size: 16px;
 }
+
+/* --- 关键修正：加粗加深面包屑导航文字 --- */
 .breadcrumb a, .breadcrumb span {
     text-decoration: none;
-    color: var(--primary-color);
-    font-weight: 500;
+    color: #0056b3; /* 加深链接颜色 */
+    font-weight: 700; /* 加粗字体 */
 }
-.breadcrumb a:hover { text-decoration: underline; }
-.breadcrumb span { color: #6c757d; font-weight: normal; }
-.breadcrumb .separator { margin: 0 10px; color: #6c757d; }
+.breadcrumb a:hover {
+    text-decoration: underline;
+}
+.breadcrumb span {
+    color: #343a40; /* 当前目录使用更深的颜色 */
+}
+.breadcrumb .separator {
+    margin: 0 10px;
+    color: #6c757d;
+}
+/* --- 修正结束 --- */
+
 #dropZone.dragover { border-color: var(--primary-color); background-color: #f0f8ff; }
 #dropZoneOverlay {
     position: absolute; top: 0; left: 0; width: 100%; height: 100%;
